@@ -257,6 +257,13 @@ them — a stale cache is reused, never rejected:
 bash build_develop.bash -DSS_BACKEND=vulkan
 ```
 
+To build only the standalone SfM executable, use a separate build tree:
+
+```bash
+bash build_develop.bash -DSS_BACKEND=vulkan -DSS_SFM_ONLY=ON
+./build_vulkan/spirula-sfm --help
+```
+
 `SS_BUILD_SFM` defaults ON for the Vulkan backend and OFF for CUDA (where
 it can still be turned on if the Vulkan SDK is present). Shaders compile at
 build time and are embedded, so nothing needs to sit next to the binary.

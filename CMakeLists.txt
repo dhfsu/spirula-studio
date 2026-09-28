@@ -28,35 +28,40 @@ include(SsSources)
 # test binaries link a backend without the engine.
 include(SsI18n)
 
-# The web viewer's browser client is compiled into the engine library
-# (app/webviewer/Viewer.cpp), so it must be embedded before either backend
-# module defines its targets -- not alongside the app targets.
-include(SsEmbed)
-ss_embed_file(
-    ${SS_SRC}/app/webviewer/viewer.html
-    ${CMAKE_BINARY_DIR}/app_generated/viewer_html.h
-    ViewerHtml)
-
-if(SS_BACKEND STREQUAL "vulkan")
-    include(SsBackendVulkan)
-else()
-    include(SsBackendCuda)
-endif()
-
-# Before SsApps: the app links the ss_sfm target.
-if(SS_BUILD_SFM)
+if(SS_SFM_ONLY)
     include(SsSfm)
+    include(SsSfmApp)
+else()
+    # The web viewer's browser client is compiled into the engine library
+    # (app/webviewer/Viewer.cpp), so it must be embedded before either backend
+    # module defines its targets -- not alongside the app targets.
+    include(SsEmbed)
+    ss_embed_file(
+        ${SS_SRC}/app/webviewer/viewer.html
+        ${CMAKE_BINARY_DIR}/app_generated/viewer_html.h
+        ViewerHtml)
+
+    if(SS_BACKEND STREQUAL "vulkan")
+        include(SsBackendVulkan)
+    else()
+        include(SsBackendCuda)
+    endif()
+
+    # Before SsApps: the app links the ss_sfm target.
+    if(SS_BUILD_SFM)
+        include(SsSfm)
+    endif()
+
+    # Likewise for `spirula sam` and the GUI's built-in masking.
+    if(SS_BUILD_SAM)
+        include(SsNn)
+    endif()
+
+    include(SsApps)
+
+    # After SsApps: the packaging targets depend on the `spirula` target.
+    include(SsPackage)
 endif()
-
-# Likewise for `spirula sam` and the GUI's built-in masking.
-if(SS_BUILD_SAM)
-    include(SsNn)
-endif()
-
-include(SsApps)
-
-# After SsApps: the packaging targets depend on the `spirula` target.
-include(SsPackage)
 
 # Last: every target above gains a dependency on the lints.
 include(SsChecks)

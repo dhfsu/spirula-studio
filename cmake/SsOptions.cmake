@@ -118,6 +118,8 @@ endif()
 # not run reconstruction, which is this binary re-running itself.
 option(SS_SEPARATE_TOOLS "Also build spirula-sfm / spirula-sam standalone" OFF)
 
+option(SS_SFM_ONLY "Build only the standalone Vulkan SfM tool" OFF)
+
 # Debug symbols / line info are OFF by default: they bloat the binaries
 # massively (nvcc host -g, CUDA cubin lineinfo/source-in-ptx, and slangc -g2
 # in the embedded SPIR-V). Turn on for profiling/debugging builds.
@@ -260,6 +262,16 @@ if(SS_ENABLE_PATENTED AND NOT SS_BUILD_SAM)
     message(FATAL_ERROR
         "SS_ENABLE_PATENTED=ON needs SS_BUILD_SAM=ON: the video "
         "decoder is built on the inference layer's Vulkan runtime (src/nn/vk).")
+endif()
+
+if(SS_SFM_ONLY)
+    if(NOT SS_BACKEND STREQUAL "vulkan")
+        message(FATAL_ERROR "SS_SFM_ONLY requires SS_BACKEND=vulkan")
+    endif()
+    set(SS_BUILD_GUI OFF CACHE BOOL "" FORCE)
+    set(SS_BUILD_SAM OFF CACHE BOOL "" FORCE)
+    set(SS_BUILD_BACKEND_TESTS OFF CACHE BOOL "" FORCE)
+    set(SS_ENABLE_PATENTED OFF CACHE BOOL "" FORCE)
 endif()
 
 # ---------------------------------------------------------------------------
