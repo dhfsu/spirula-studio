@@ -1,9 +1,9 @@
 #pragma once
 
 // Gamut matrices and the sRGB transfer, shared by everything that has to move
-// pixels between a capture colour space and sRGB: the trainer's seed colours,
-// the SfM front end, and the AI models. Header-only so `src/sfm/` and `src/nn/`
-// can use it without depending on the app layer.
+// pixels between a capture colour space and sRGB.
+// All SfM stages share one conversion path.
+
 //
 // Matrices are row-major 3x3, source primaries -> Rec.709, chromatically
 // adapted (white maps to white).

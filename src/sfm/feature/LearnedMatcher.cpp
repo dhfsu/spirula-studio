@@ -205,7 +205,7 @@ std::unique_ptr<IFeatureMatcher> createFeatureMatcher(const std::string& type,
 #else
         throw std::runtime_error(
             "this build has no learned matcher: --matcher lightglue needs the "
-            "inference layer, which is SS_BUILD_SAM=ON");
+            "not available in this standalone SfM build");
 #endif
     }
     if (isLomaType(type)) {
@@ -218,7 +218,7 @@ std::unique_ptr<IFeatureMatcher> createFeatureMatcher(const std::string& type,
         (void)loma_opt;
         throw std::runtime_error(
             "this build has no learned matcher: --matcher " + type +
-            " needs the inference layer, which is SS_BUILD_SAM=ON");
+            " needs the not available in this standalone SfM build");
 #endif
     }
     (void)loma_opt;

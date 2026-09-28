@@ -25,7 +25,7 @@
 #ifdef _WIN32
 #include <io.h>
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>   // NOMINMAX comes from cmake/SsOptions.cmake
+#include <windows.h>   // NOMINMAX comes from CMakeLists.txt
 #define isatty _isatty
 #define fileno _fileno
 #else

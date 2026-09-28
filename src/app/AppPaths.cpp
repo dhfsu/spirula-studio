@@ -33,7 +33,7 @@ fs::path ensure(fs::path dir) {
 
 // <base>/spirula-studio, or an existing spirulae-splat/ from before the rename,
 // adopted where it is so recents and cached models survive the upgrade. Drop it
-// with the other compatibility shims (cmake/SsOptions.cmake, src/core/Env.h).
+// with the other compatibility shims (CMakeLists.txt, src/core/Env.h).
 fs::path app_dir(const fs::path& base) {
     std::error_code ec;
     const fs::path current = base / "spirula-studio";

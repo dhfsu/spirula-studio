@@ -65,9 +65,7 @@ function(_ss_fetch_moltenvk lib_var include_var)
     set(${include_var} ${_inc} PARENT_SCOPE)
 endfunction()
 
-# src/video/ compiles against VK_KHR_video_decode_av1, which appeared in header
-# 277; Ubuntu 24.04 ships 275. The extension declares no commands, only structs
-# and enums, so newer headers build fine against an older loader.
+# SfM requires Vulkan headers new enough for its device capability queries.
 set(SS_VULKAN_HEADERS_MIN 277)
 set(SS_VULKAN_HEADERS_VERSION "1.4.357")
 

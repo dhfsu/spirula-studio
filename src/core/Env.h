@@ -4,7 +4,7 @@
 //
 // Every knob is SS_<suffix>. The old SSPLAT_<suffix> spelling still works and
 // warns once per run; delete the fallback below together with the CMake option
-// aliases in cmake/SsOptions.cmake.
+// aliases in CMakeLists.txt.
 //
 //   if (const char* d = spirula::env("VK_DEVICE")) ...
 //

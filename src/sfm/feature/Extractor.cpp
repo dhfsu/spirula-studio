@@ -225,7 +225,7 @@ std::unique_ptr<IFeatureExtractor> createFeatureExtractor(const std::string& typ
 #else
         throw std::runtime_error(
             "this build has no learned frontend: '" + type +
-            "' needs the inference layer, which is SS_BUILD_SAM=ON");
+            "' is not available in this standalone SfM build");
 #endif
     }
     if (isLomaType(type)) {
@@ -245,7 +245,7 @@ std::unique_ptr<IFeatureExtractor> createFeatureExtractor(const std::string& typ
         (void)loma_opt;
         throw std::runtime_error(
             "this build has no learned frontend: '" + type +
-            "' needs the inference layer, which is SS_BUILD_SAM=ON");
+            "' is not available in this standalone SfM build");
 #endif
     }
     (void)loma_opt;

@@ -39,7 +39,7 @@ sfm/ba/
 src/app/cli/sfm_ba.cpp   the `spirula sfm ba` subcommand: a model's global BA, or a BAL problem
 ```
 
-`spirv_tool nocontract` (src/backend/vulkan/shaders/) is the SPIR-V post-pass
+`spirv_tool nocontract` (src/sfm/vk/) is the SPIR-V post-pass
 the `df` config requires -- see "Scalar configs" below. `tools/sfm/genpoly.py`
 regenerates the minimax transcendental coefficients in `df.slang` /
 `dmath.slang` (`--survey` for error tables).

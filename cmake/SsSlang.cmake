@@ -1,7 +1,7 @@
 # Locating slangc (the Slang -> SPIR-V compiler) for the Vulkan backend.
 #
 # SPIR-V blobs are never committed; they are compiled at build time (one slangc
-# edge per blob, see src/backend/vulkan/shaders/SpirvShaders.cmake) and embedded into the
+# edge per blob, see the SfM shader build) and embedded into the
 # binary. No Python is required for the Vulkan build.
 
 set(SS_SLANG_VERSION "2026.12.0.1")
@@ -101,17 +101,17 @@ endfunction()
 
 # ss_build_spirv_tool(<out_var>)
 #
-# Compiles src/backend/vulkan/shaders/spirv_tool.cpp once with the project
+# Compiles src/sfm/vk/spirv_tool.cpp once with the project
 # toolchain (try_compile + COPY_FILE, so it is portable across Windows / Linux /
 # macOS and needs neither Python nor spirv-tools) and returns the executable.
 #
 # One tool for the whole repository: the Vulkan backend uses its `discover` and
 # `embed` modes, the SfM module its `nocontract` and `embed --sfm` modes. It
-# lives under backend/vulkan/shaders/ because that is its main consumer; it is a
+# lives under src/sfm/vk/ because it is the SfM shader build tool; it is a
 # pure host program and pulls in no Vulkan headers, so a CUDA build with
-# SS_BUILD_SFM=ON can compile it too.
+# the standalone SfM build compiles it directly.
 function(ss_build_spirv_tool out_var)
-    set(tool_src ${SS_SRC}/backend/vulkan/shaders/spirv_tool.cpp)
+    set(tool_src ${SS_SRC}/sfm/vk/spirv_tool.cpp)
     set(tool_exe ${CMAKE_BINARY_DIR}/spirv_tool${CMAKE_EXECUTABLE_SUFFIX})
 
     # Rebuilt only when its source is newer than the copied executable.

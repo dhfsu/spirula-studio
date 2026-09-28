@@ -1,8 +1,6 @@
 // Telemetry.cpp -- see Telemetry.h.
 //
-// The ISO-BMFF walk here overlaps src/video/Mp4Demuxer.cpp on purpose: that
-// one is compiled only with SS_ENABLE_PATENTED and hands out coded pictures,
-// this one must exist in every build and never touches a picture.
+// The ISO-BMFF walk reads telemetry metadata and never decodes video pictures.
 
 #include "sfm/core/Telemetry.h"
 

@@ -377,7 +377,7 @@ DeDoDe's are not. One matcher cannot mix widths, and says so.
 
 `--features` picks the frontend: `sift`, `aliked-n16rot`, `aliked-n32`,
 `loma-b128` or `loma-b`. The learned ones need the inference layer
-(`SS_BUILD_SAM=ON`) and fetch a checkpoint on first use; `--matcher` then takes
+(`the full application`) and fetch a checkpoint on first use; `--matcher` then takes
 `lightglue` for the ALIKED ones and `loma-b128` / `loma-b` / `loma-r` /
 `loma-l` / `loma-g` for the LoMa ones. The families do not mix -- a learned
 matcher only reads the descriptors it was trained on, and `auto` says so rather
@@ -959,7 +959,7 @@ command's worth of fields to show.
 ## Tests
 
 Each `tests/*.cpp` builds to an executable of the same name that prints
-PASS/FAIL and returns 0/1 — the same convention as `src/backend/tests/`.
+PASS/FAIL and returns 0/1 — the same convention as `standalone test targets`.
 
 | binary | covers | needs a GPU |
 |---|---|---|

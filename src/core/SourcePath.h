@@ -13,7 +13,7 @@
 
 #include <cstddef>
 
-// The repository root, no trailing separator (cmake/SsOptions.cmake). Empty
+// The repository root, no trailing separator (CMakeLists.txt). Empty
 // leaves __FILE__ alone, so a build that does not set it still compiles.
 #ifndef SS_SOURCE_ROOT
 #define SS_SOURCE_ROOT ""

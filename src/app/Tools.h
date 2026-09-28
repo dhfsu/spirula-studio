@@ -15,7 +15,7 @@
 // pure command-line binary that needs no display and no GL.
 //
 // Which of these exist is decided at compile time by the SS_TOOL_* macros
-// the build sets; see cmake/SsApps.cmake.
+// the build sets; see CMakeLists.txt.
 
 #include <string>
 

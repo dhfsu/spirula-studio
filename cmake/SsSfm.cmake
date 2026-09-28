@@ -1,16 +1,15 @@
-# SS_BUILD_SFM: the Structure-from-Motion module (src/sfm/), a Vulkan-only
+# The Structure-from-Motion module (src/sfm/), a Vulkan-only
 # subsystem that replaces the COLMAP subprocess. See src/sfm/README.md.
 #
 # Defines:
-#   ss_sfm       the static library (SfM pipeline + embedded SPIR-V)
-#   sfm_*_test       one executable per src/sfm/tests/*.cpp
+#   ss_sfm          static library (SfM pipeline + embedded SPIR-V)
+#   sfm_*_test      one executable per src/sfm/tests/*.cpp
 #
-# The `spirula-sfm` CLI lives with the other app targets, in SsApps.cmake.
+# The `spirula-sfm` CLI is defined by the standalone app module.
 #
 # This module needs Vulkan and slangc but NOT the compute backend: it carries
 # its own Vulkan context (src/sfm/vk/) and its own SPIR-V blobs, so it builds
-# identically under either SS_BACKEND. Converging it onto the engine's
-# device is a later step (docs/notes/sfm-port-plan.md phase 6).
+# as a standalone Vulkan module.
 
 include(SsVulkan)
 ss_vulkan_lib()
@@ -150,13 +149,12 @@ add_custom_command(OUTPUT ${_sfm_embed_cpp}
 # ---------------------------------------------------------------------------
 file(GLOB_RECURSE SS_SFM_SOURCES CONFIGURE_DEPENDS ${SS_SFM_SRC}/*.cpp)
 list(FILTER SS_SFM_SOURCES EXCLUDE REGEX "/tests/")
+list(FILTER SS_SFM_SOURCES EXCLUDE REGEX "/vk/spirv_tool\.cpp$")
 
 add_library(ss_sfm STATIC
     ${SS_SFM_SOURCES}
     ${_sfm_embed_cpp}
-    # Instantiated once for the repository. As archive members these are only
-    # pulled in when nothing else provides them, so spirula-gui -- which links
-    # the engine, and with it the same TUs -- sees no duplicate definition.
+    # Image and compression implementations are part of this standalone library.
     ${SS_SRC}/external/stb_image_impl.cpp
     ${SS_SRC}/external/stb_image_write_impl.cpp
     ${SS_SRC}/core/ExrImage.cpp
@@ -166,29 +164,20 @@ add_library(ss_sfm STATIC
 target_include_directories(ss_sfm PUBLIC ${SS_SRC})
 target_link_libraries(ss_sfm PUBLIC ss_vulkan Threads::Threads ss_i18n)
 
-# The learned frontend (src/aliked/) is optional: it sits on the inference
-# layer, which is SS_BUILD_SAM. Without it `--features aliked-*` is a
-# usage error that says so, and nothing else changes -- SfM keeps building on
-# a machine that only wants SIFT. PUBLIC because sfm/feature/Extractor.h's
-# factory is compiled into whatever links this.
-if(SS_BUILD_SAM)
-    target_link_libraries(ss_sfm PUBLIC ss_aliked ss_loma)
-    target_compile_definitions(ss_sfm PUBLIC SS_HAVE_ALIKED=1 SS_HAVE_LOMA=1)
-else()
-    target_compile_definitions(ss_sfm PUBLIC SS_HAVE_ALIKED=0 SS_HAVE_LOMA=0)
-endif()
+# The learned frontends are disabled in this standalone build; their option
+# names remain parseable and report a clear runtime error.
+target_compile_definitions(ss_sfm PUBLIC SS_HAVE_ALIKED=0 SS_HAVE_LOMA=0)
 target_compile_options(ss_sfm PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>
     $<$<COMPILE_LANGUAGE:C>:${SPLAT_C_FLAGS}>)
 set_property(TARGET ss_sfm PROPERTY CXX_STANDARD 17)
 
-# Most of the pipeline is still header-only (the split into translation units is
-# port plan phase 3). List the headers so IDEs and `ninja -t deps` see them.
+# Most of the pipeline is header-only; list headers so IDEs and Ninja see them.
 file(GLOB_RECURSE SS_SFM_HEADERS CONFIGURE_DEPENDS ${SS_SFM_SRC}/*.h)
 target_sources(ss_sfm PRIVATE ${SS_SFM_HEADERS})
 
 # ---------------------------------------------------------------------------
-# Tests -- one executable per file, as in src/backend/tests/
+# Tests -- one executable per file.
 # ---------------------------------------------------------------------------
 file(GLOB SS_SFM_TESTS CONFIGURE_DEPENDS ${SS_SFM_SRC}/tests/*.cpp)
 foreach(test_src ${SS_SFM_TESTS})

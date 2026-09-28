@@ -67,7 +67,7 @@
 int cmdBa(int argc, char** argv);
 void printBaHelp(FILE* out);
 
-// Set by the build (cmake/SsOptions.cmake reads it from pyproject.toml).
+// Set by the build (CMakeLists.txt provides it).
 #ifndef SS_VERSION
 #define SS_VERSION "dev"
 #endif

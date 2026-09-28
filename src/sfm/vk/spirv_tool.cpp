@@ -17,14 +17,11 @@
 //       Read the compiled .spv blobs named in <listfile>, drop the .noint64
 //       variants whose base does not actually declare the Int64 capability,
 //       verify no capability leaks, and emit the C++ translation unit
-//       consumed by VulkanPipelines.cpp.
+//       consumed by sfm/vk/VkContext.h.
 //
 //   embed --nn <tag> <out.cpp> --list <listfile>
-//       The same, for a library of the inference layer (cmake/SsNn.cmake).
-//       Emits a blob table named after <tag>, which the owning library hands
-//       to the process registry nn/vk/EmbeddedSpirv.h declares -- so src/nn/,
-//       src/sam/ and src/video/ can each contribute shaders to one pipeline
-//       cache, and <tag> keeps their symbols distinct.
+//       The same embedding format is available for other shader libraries.
+//       The standalone SfM build uses the --sfm mode below.
 //
 //   embed --sfm <out.cpp> --list <listfile>
 //       The same, for the SfM module (cmake/SsSfm.cmake). Its blobs are
@@ -57,7 +54,7 @@
 namespace {
 
 // ---- feature variants (canonical suffix order must match kFeatureSuffixes in
-// src/backend/vulkan/VulkanPipelines.cpp) --------------------------------
+// src/sfm/vk/VkContext.h) --------------------------------
 struct Feature { const char* suffix; const char* define; };
 const Feature ATOMIC{".atomicadd", "-DSS_NATIVE_F32_ATOMIC_ADD"};
 const Feature INT8{".int8", "-DSS_NATIVE_INT8"};
