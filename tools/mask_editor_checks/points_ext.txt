@@ -1,5 +1,0 @@
-# Chosen by eye from plain_<f>.jpg (photo only, no masks), before any run. 2026-09-22.
-# frame  frame_x frame_y  screen(x,y) = (356 + fx*888/15520, 92 + fy*444/7760)
-f00024 11373 6198 1007,447
-f00025 11426 6189 1010,446
-f00026 11292 6289 1002,452
