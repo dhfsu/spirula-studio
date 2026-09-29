@@ -1,6 +1,4 @@
-// The three consumers of SFM_CONFIG_FIELDS: the flag parser, the preset
-// appliers, and the `--help` printer. Each is one macro expansion over the
-// table in SfmConfig.h, so a new knob is one row and never a fourth edit.
+// 参数解析、预设与帮助均通过 SfmConfig.h 的 SFM_CONFIG_FIELDS 展开，新增选项只需一条定义。
 #include "sfm/SfmConfig.h"
 
 #include "sfm/core/Log.h"
@@ -16,9 +14,7 @@
 namespace sfm {
 namespace {
 
-// ---------------------------------------------------------------------------
-// Value <-> string, one overload set per field type
-// ---------------------------------------------------------------------------
+// ---------------- 各字段类型的值与字符串转换 ----------------
 
 std::string valueString(bool v) { return v ? "on" : "off"; }
 std::string valueString(const std::string& v) { return v.empty() ? "none" : v; }
@@ -39,9 +35,7 @@ std::enable_if_t<std::is_floating_point<T>::value, std::string> valueString(T v)
     return buf;
 }
 
-// ---------------------------------------------------------------------------
-// Parsing one token into one field
-// ---------------------------------------------------------------------------
+// ---------------- 单参数到字段的解析 ----------------
 
 std::string rangeText(double lo, double hi) {
     char buf[64];
@@ -113,9 +107,7 @@ bool parseValue(std::string& out, const std::string& s, double, double, const ch
     return true;
 }
 
-// A bool field is a switch, never a value: `--name` / `--no-name`. Keeping it
-// valueless is what lets `spirula-sfm map --no-manage matches.bin feats/` parse
-// -- a positional right after a switch must stay a positional.
+// 布尔字段只使用 --name / --no-name，不消耗后续值，保证开关后的路径仍是位置参数。
 FieldResult trySetField(bool& out, const std::string& key, const char* name, int, char**, int&,
                         double, double, const char*, std::set<std::string>& seen, std::string&) {
     if (key == name) out = true;
@@ -144,8 +136,7 @@ FieldResult trySetField(T& out, const std::string& key, const char* name, int ar
     return FieldResult::Ok;
 }
 
-// "--Max_Error" and "--max-error" are the same flag; '_' is accepted because
-// the GUI and the config table spell ids either way.
+// --Max_Error 与 --max-error 等价，兼容 GUI 和配置字段中的下划线形式。
 std::string normalizeKey(const std::string& arg) {
     std::string s = arg;
     while (!s.empty() && s[0] == '-') s.erase(s.begin());
@@ -153,26 +144,20 @@ std::string normalizeKey(const std::string& arg) {
     return s;
 }
 
-// ---------------------------------------------------------------------------
-// Help formatting
-// ---------------------------------------------------------------------------
+// ---------------- 帮助格式 ----------------
 
-// Long choice lists do not fit the flag column; they move into the help text.
+// 过长的候选值列表移到说明文本，不挤占选项列。
 constexpr size_t kInlineChoices = 26;
 
 std::string metavarFor(bool, const char*, const char*) { return ""; }
 std::string metavarFor(const std::string&, const char* name, const char* choices) {
     if (choices && *choices) {
-        // A field WITH choices never takes a path, whatever it is called --
-        // `--features` is a directory on `map` and a frontend name on
-        // `extract`, and only the latter has choices. Long lists do not fit
-        // the flag column and are printed in the help text instead.
+        // 有候选值的字段不接受路径；例如 features 在 map 中是目录，在 extract 中是前端名称，只有后者有候选列表。
         return std::string(choices).size() <= kInlineChoices
                    ? "{" + std::string(choices) + "}"
                    : "VALUE";
     }
-    // No metavar column in the table: the flag name says what it takes, and
-    // "DIR" reads better than "VALUE" on the handful that take a path.
+    // 根据字段名生成参数占位说明，路径采用 DIR，无需另设配置表列。
     std::string n = name;
     if (n.find("dir") != std::string::npos || n == "masks" || n == "images" ||
         n == "features" || n == "resume")
@@ -191,8 +176,7 @@ std::enable_if_t<std::is_floating_point<T>::value, std::string> metavarFor(T, co
     return "X";
 }
 
-// A bool is offered in the direction that changes it, which is how it is
-// written on a real command line (`--no-verify`, not `--verify 0`).
+// 布尔选项显示能改变默认值的开关，如 --no-verify，而非 --verify 0。
 std::string flagFor(bool v, const char* name) {
     return v ? "--no-" + std::string(name) : "--" + std::string(name);
 }
@@ -201,21 +185,16 @@ std::string flagFor(const T&, const char* name) {
     return "--" + std::string(name);
 }
 
-constexpr int kFlagCol = 42;  // flag column width; the widest flag+metavar fits
+constexpr int kFlagCol = 42;  // 选项列宽，容纳最长选项及参数占位符
 constexpr int kWidth = 96;
 
-// Wrapping is i18n::wrap's job rather than a find(' ') loop: it measures in
-// terminal columns instead of bytes, and it breaks between characters where a
-// language has no spaces to break at -- without which a Japanese help string
-// is one line four hundred columns wide.
+// 使用 i18n::wrap 按终端列宽换行，支持无空格的中日文按字符断行，不能仅按字节和空格处理。
 void printWrapped(FILE* out, const std::string& text, int indent) {
     for (const std::string& line : spirula::i18n::wrap(text, kWidth - indent))
         std::fprintf(out, "%*s%s\n", indent, "", line.c_str());
 }
 
-// The heading a block of options is printed under. Keyed by the same string
-// the table carries, so a group added there without an entry here still
-// prints -- as itself, which is the honest fallback for a heading.
+// 分组标题按配置表字符串查找；缺少译名时沿用原始标识符。
 const char* groupLabel(const char* group) {
     namespace F = spirula::i18n::msg::sfmfield;
     struct Row { const char* key; const spirula::i18n::Msg* msg; };
@@ -252,11 +231,9 @@ void printOption(FILE* out, const std::string& flag, const std::string& metavar,
     printWrapped(out, h, 6);
 }
 
-}  // namespace
+}  // 匿名命名空间
 
-// ---------------------------------------------------------------------------
-// setConfigField
-// ---------------------------------------------------------------------------
+// ---------------- 配置字段赋值 ----------------
 
 FieldResult setConfigField(SfmConfig& cfg, uint32_t cmd, const std::string& arg, int argc,
                            char** argv, int& i, std::set<std::string>& seen, std::string& error) {
@@ -277,14 +254,10 @@ FieldResult setConfigField(SfmConfig& cfg, uint32_t cmd, const std::string& arg,
     return FieldResult::Unknown;
 }
 
-// ---------------------------------------------------------------------------
-// Presets
-// ---------------------------------------------------------------------------
+// ---------------- 预设 ----------------
 
 namespace {
-// Move a field unless the command line already claimed it, and say so. The
-// report is what tells a user why `--quality low` produced a 1000 px pipeline,
-// and it is the same list the GUI highlights as modified.
+// 仅修改未被命令行声明的字段，并记录修改项供日志与 GUI 展示。
 template <class T, class V>
 void presetSet(std::set<std::string> const& seen, std::vector<PresetChange>& moved,
                const char* flag, T& member, V value) {
@@ -294,20 +267,12 @@ void presetSet(std::set<std::string> const& seen, std::vector<PresetChange>& mov
     moved.push_back({flag, valueString(member), valueString(next)});
     member = next;
 }
-}  // namespace
+}  // 匿名命名空间
 
 std::string applyPresets(SfmConfig& cfg, const std::set<std::string>& seen,
                          std::vector<PresetChange>& moved) {
-    // Quality mirrors COLMAP's OptionManager::ModifyFor*Quality() as fractions
-    // of the extractor's 3200 px default. Pair-selection breadth follows it too
-    // (D42): `prefilter-neighbors` is the one selection parameter that trades
-    // match time against how much of the view graph verification even sees.
-    // The learned frontend runs on its own resolution ladder, roughly two
-    // thirds of SIFT's -- COLMAP does the same (1600 against 3200 at the
-    // default), and for the same reason: ALIKED aggregates 128 channels at
-    // FULL resolution, so working size is what its memory is spent on. Its
-    // feature counts are lower too, which is the detector's design rather
-    // than a budget: it emits fewer, better-localized points.
+    // 质量预设参考 COLMAP，按 SIFT 默认 3200 px 分级，同时调整 prefilter-neighbors 以权衡匹配耗时与图连通性。
+    // 学习前端使用更低分辨率阶梯：全分辨率多通道特征图占用大量内存，检测器也天然输出更少但定位更准的点。
     const bool learned = isAlikedType(cfg.features) || isLomaType(cfg.features);
     if (cfg.quality == "low") {
         presetSet(seen, moved, "max-image-size", cfg.max_image_size, learned ? 800 : 1000);
@@ -336,63 +301,33 @@ std::string applyPresets(SfmConfig& cfg, const std::set<std::string>& seen,
         return "unknown --quality '" + cfg.quality + "' (low, medium, high or extreme)";
     }
 
-    // A learned descriptor needs a looser ratio than SIFT's 0.8, because its
-    // second-best distance sits much closer to its best: measured on a
-    // 20-image capture, the median mutual-nearest match has a distance ratio
-    // of 0.826, i.e. just the wrong side of SIFT's threshold. The whole point
-    // of the ratio test -- that a true match stands out from the runner-up --
-    // is weaker for descriptors trained to be smooth, which is also why
-    // LightGlue exists.
-    //
-    // 0.92 is where the measurement put it, on 190 exhaustive pairs:
-    //
-    //   ratio   0.80   0.85   0.90   0.92   0.95
-    //   pairs   65/190 79     111    172    190
-    //   inliers 6331   8426   11487  13633  16249
-    //   inlier% 90     79     54     44     29
-    //
-    // Past 0.92 the pair count is bought with junk. For reference, GPU SIFT on
-    // the same images at 4x the feature budget managed 68/190 and 7703
-    // inliers, so this is not a concession -- it is where the learned frontend
-    // wins.
-    //
-    // COLMAP's own ALIKED defaults (ratio off, min_cossim 0.85) were tried
-    // first and are NOT used: on this data an absolute 0.85 cosine rejects
-    // ~70% of mutual-nearest matches (their median cosine is 0.726) and left
-    // 24/190 pairs. --min-similarity still exists for anyone who wants that
-    // shape of test.
+    // 学习描述子的最近邻距离更接近：20 图、190 对数据的互为最近邻距离比中位数为 0.826，需放宽 SIFT 的 0.8 阈值。
+    // 比值 0.80/0.85/0.90/0.92/0.95 对应有效图像对 65/79/111/172/190，内点 6331/8426/11487/13633/16249，占比 90/79/54/44/29%；选择 0.92，继续放宽会引入大量错误。
+    // 同数据 SIFT 以四倍特征预算仅得 68 对、7703 内点；余弦 0.85 阈值会拒绝约 70% 互近邻并仅保留 24 对，故不采用，仍提供 --min-similarity。
     if (learned && !isLearnedMatcher(cfg.matcher))
         presetSet(seen, moved, "ratio", cfg.match.max_ratio, 0.92f);
 
-    // A learned matcher decides its own assignment, so the ratio test and the
-    // cross-check are not merely unnecessary -- they are a second filter on a
-    // quantity it does not produce. Its own confidence is the only threshold.
+    // 学习匹配器自行决定对应关系，仅使用自身置信度阈值；距离比与交叉检查不适用于其输出。
     if (isLearnedMatcher(cfg.matcher)) {
         presetSet(seen, moved, "ratio", cfg.match.max_ratio, 1.0f);
         presetSet(seen, moved, "min-similarity", cfg.match.min_similarity, 0.0f);
-        // Exhaustive matching with it is hours on a capture where pair
-        // selection is minutes, and the shortlist is what it was built for.
+        // 学习匹配器应处理筛选后的候选，穷举可能耗时数小时，而配对筛选只需数分钟。
         presetSet(seen, moved, "pairs", cfg.pairs, std::string("prefilter"));
     }
 
     if (cfg.data_type == "individual") {
-        // Nothing: the defaults are written for a set of individual photos.
+        // 默认配置已适用于独立照片集合，无需调整。
     } else if (cfg.data_type == "video") {
-        // Only binding below `auto`'s 100-image cutoff: cmdAuto retires it for
-        // pair selection above that, because a capture that long revisits
-        // places a temporal window cannot pair (see the comment there).
+        // 仅在 auto 的 100 图阈值以下采用视频时序预设；超过阈值改用内容筛选以捕获回访连接。
         presetSet(seen, moved, "pairs", cfg.pairs, std::string("sequential"));
-        // COLMAP ModifyForVideoData: consecutive frames subtend far less angle,
-        // so the seed pair cannot be held to the photo-collection threshold.
+        // 参考 COLMAP 的 ModifyForVideoData，视频相邻帧视差小，初始对不能沿用照片集的三角化角度阈值。
         presetSet(seen, moved, "init-min-tri-angle", cfg.mapper.init_min_tri_angle_deg,
                   cfg.mapper.init_min_tri_angle_deg / 2);
     } else if (cfg.data_type == "internet") {
-        // Two Flickr uploads that happen to be 1024x768 are two cameras that
-        // were each downscaled, so grouping on resolution fuses unrelated
-        // intrinsics. Give every image its own (D20).
+        // 网络图片分辨率相同不代表相机相同，可能是不同设备缩放后的结果；每张图独立内参（D20）。
         presetSet(seen, moved, "camera-mode", cfg.camera_mode, std::string("image"));
         cfg.camera_mode_pinned = true;
-        // Downloaded photos are in no order, so their file order links nothing.
+        // 下载图片的文件顺序没有拍摄时序意义。
         presetSet(seen, moved, "prefilter-sequential", cfg.prefilter_sequential, false);
     } else {
         return "unknown --data-type '" + cfg.data_type + "' (individual, video or internet)";
@@ -400,9 +335,7 @@ std::string applyPresets(SfmConfig& cfg, const std::set<std::string>& seen,
     return "";
 }
 
-// ---------------------------------------------------------------------------
-// finalize
-// ---------------------------------------------------------------------------
+// ---------------- 配置定稿 ----------------
 
 std::string SfmConfig::finalize(uint32_t cmd) {
     if (!parseCamModelName(camera_model, camera.model))
@@ -413,19 +346,16 @@ std::string SfmConfig::finalize(uint32_t cmd) {
     camera.focal = focal;
     if (!distortion.empty() && !parseDistortion(distortion, camera.extra))
         return "bad --distortion '" + distortion + "' (k1,k2,... or PREFIX=k1,k2,...)";
-    // The free intrinsics are a prefix of (focal, distortion, principal point):
-    // holding the middle holds the tail (D50, D72). Two explicit flags saying
-    // otherwise is an error; the finishing pass's default gives way instead.
+    // 可优化内参必须为（焦距、畸变、主点）的前缀，固定中间项也固定后续项；显式冲突报错，收尾默认设置则让步（D50/D72）。
     if (mapper.refine_principal_point && !mapper.refine_extra_params)
         return "--refine-principal-point cannot be combined with "
                "--no-refine-extra-params: bundle adjustment frees a prefix of "
                "(focal, distortion, principal point)";
     if (!final_extra_params) final_principal_point = false;
-    // The model a group with no explicit entry falls back to, which is the same
-    // question --camera-model answers for the ones that have entries.
+    // 没有独立覆盖项的相机组使用此默认模型。
     mapper.camera_model = camera.model;
 
-    // One tolerance, two fields (D47).
+    // 同一容差同步到两个字段（D47）。
     twoview.ransac.max_error = max_error;
     mapper.max_reproj_error = max_error;
     // mapper.sequence_window = overlap;
@@ -436,39 +366,32 @@ std::string SfmConfig::finalize(uint32_t cmd) {
     if (matcher != "bruteforce" && !isLearnedMatcher(matcher))
         return "unknown --matcher '" + matcher +
                "' (bruteforce, lightglue or loma-b128)";
-    // Matching SIFT with a learned matcher would run and return nonsense.
-    // Only `auto` can check it here; `match` reads features off disk, so its
-    // guard is on the descriptors themselves, in LearnedMatcher.cpp.
+    // auto 提前拒绝 SIFT 与学习匹配器组合；独立 match 从磁盘读取后由 LearnedMatcher 检查实际描述子。
     if ((cmd & (CMD_AUTO | CMD_EXTRACT)) && isLearnedMatcher(matcher) &&
         !isAlikedType(features) && !isLomaType(features))
         return "--matcher " + matcher + " needs learned descriptors; add "
                "--features aliked-n16rot";
-    // The two families do not mix either: LightGlue reads ALIKED's descriptors
-    // and a LoMa matcher reads DeDoDe's, and each would run on the other's and
-    // return nonsense rather than fail.
+    // LightGlue 使用 ALIKED 描述子，LoMa 使用 DeDoDe；两类不能混用，否则可能静默产生错误结果。
     if ((cmd & (CMD_AUTO | CMD_EXTRACT)) && isLomaType(matcher) != isLomaType(features) &&
         isLearnedMatcher(matcher))
         return "--matcher " + matcher + " and --features " + features +
                " are different frontends; a learned matcher only reads the "
                "descriptors it was trained on";
-    // Nor do two LoMa variants whose descriptors differ. The matcher would
-    // refuse them anyway, but only after the extraction had run.
+    // 提前拒绝描述子宽度不同的 LoMa 版本组合，避免完成提取后才失败。
     if ((cmd & (CMD_AUTO | CMD_EXTRACT)) && isLomaType(matcher) && isLomaType(features) &&
         lomaDescriptorDim(matcher) != lomaDescriptorDim(features))
         return "--matcher " + matcher + " wants " +
                std::to_string(lomaDescriptorDim(matcher)) + "-D descriptors and "
                "--features " + features + " makes " +
                std::to_string(lomaDescriptorDim(features)) + "-D ones";
-    // Two metric references would each claim the gauge, and the fit would be
-    // whichever the code happened to try first.
+    // 两个公制参考会争夺坐标规范，必须拒绝同时指定，避免结果依赖代码尝试顺序。
     const bool gps = metric_gps != "none";
     if (!metric_positions.empty() && gps)
         return "--metric-positions and --metric-gps are two references for one "
                "gauge; pass one";
     if (gps && image_dir.empty() && !(cmd & CMD_AUTO))
         return "--metric-gps reads each image's EXIF, so it needs --images";
-    // GPS is metres-accurate and a positions file is usually centimetres, so
-    // one default cannot serve both; 0 means "the one for this source".
+    // GPS 通常为米级，位置文件通常为厘米级精度；阈值 0 表示使用对应来源的默认值。
     if (metric_max_error == 0)
         metric_max_error = gps ? 5.0 : 0.5;
     if (!telemetry.empty()) {
@@ -484,21 +407,16 @@ std::string SfmConfig::finalize(uint32_t cmd) {
 
     sift.device = match.device = prefilter.device = mapper.device = device;
     aliked.device = device;
-    // UUID crosses stage and worker boundaries; the int remains legacy input spelling.
+    // 跨阶段与工作线程传递 UUID；整数仅兼容旧输入形式。
     mapper.threads = threads;
     const bool v = !quiet;
     sift.verbose = mapper.verbose = manager.verbose = merge.verbose = aliked.verbose = v;
     lightglue.verbose = loma.verbose = loma_match.verbose = v;
 
-    // Scoring problems are ~1/32 the size of full matching, so the selection
-    // pass batches at least as many pairs per submit as the matcher does.
+    // 筛选评分问题约为完整匹配的 1/32，因此每次提交至少处理与匹配阶段一样多的图像对。
     prefilter.batch_pairs = std::max(prefilter.batch_pairs, match.batch_pairs);
 
-    // Post-merge filtering follows the mapper, because spliced tracks have
-    // never seen a bundle adjustment across the seam and should not survive
-    // criteria the mapper's own observations would not. `merge` is the
-    // exception: there is no mapper in that command, and --filter-error /
-    // --min-tri-angle are the flags that set these directly.
+    // 合并后轨迹尚未经过跨接缝 BA，过滤标准应与建图器一致；独立 merge 没有建图器，直接使用 filter-error/min-tri-angle。
     if (cmd != CMD_MERGE) {
         merge.filter_reproj_error = mapper.max_reproj_error;
         merge.min_tri_angle_deg = mapper.min_tri_angle_deg;
@@ -512,23 +430,21 @@ std::string SfmConfig::finalize(uint32_t cmd) {
 PairMode SfmConfig::pairMode() const {
     if (pairs == "sequential") return PairMode::Sequential;
     if (pairs == "prefilter") return PairMode::Prefilter;
-    return PairMode::Exhaustive;  // "exhaustive", and "auto" until counted
+    return PairMode::Exhaustive;  // exhaustive，以及尚未统计图像数的 auto
 }
 
-// ---------------------------------------------------------------------------
-// Device resolution
-// ---------------------------------------------------------------------------
+// ---------------- 设备解析 ----------------
 
 std::string SfmConfig::selectorForDevice(const std::string& request, bool request_set,
                                           std::string& error) {
     error.clear();
-    // The request's own spelling wins; an unset one uses environment, then Auto.
+    // 显式请求优先，其次环境变量，再其次 Auto。
     const bool supplied = request_set || !request.empty();
     const spirula::vkselect::Request req =
         spirula::vkselect::requestFrom(request, supplied);
     const spirula::vkselect::Resolution& res = VkContext::cachedSelector(req);
     if (res.ok()) return res.selector;
-    // Only the effective default Auto may use the CPU path when no device exists.
+    // 仅有效默认选择为 Auto 时，缺少设备才允许退回 CPU。
     if (!supplied &&
         res.status == spirula::vkselect::ResolveStatus::NoDevice &&
         req.kind == spirula::vkselect::Request::Kind::Auto)
@@ -538,7 +454,7 @@ std::string SfmConfig::selectorForDevice(const std::string& request, bool reques
 }
 
 std::string SfmConfig::resolveDevice() {
-    // Resolve the request once before stages inspect it.
+    // 各阶段使用前统一解析设备请求。
     const bool request_set = device_request_set || !device_request.empty() ||
                              !device_selector.empty() || device >= 0;
     const bool request_text = device_request_set || !device_request.empty();
@@ -549,8 +465,7 @@ std::string SfmConfig::resolveDevice() {
     std::string error;
     device_selector = selectorForDevice(request, request_set, error);
     if (!error.empty()) return error;
-    // An ordinal request still sets the legacy int, so a caller that has not
-    // migrated keeps working; the UUID is what fans out.
+    // 序号请求继续填写兼容整数，但跨模块传递规范 UUID。
     if (request_text) {
         const spirula::vkselect::Request req = spirula::vkselect::parseRequest(request);
         if (req.kind == spirula::vkselect::Request::Kind::Ordinal) device = req.ordinal;
@@ -564,9 +479,7 @@ std::string SfmConfig::resolveDevice() {
     return "";
 }
 
-// ---------------------------------------------------------------------------
-// Help
-// ---------------------------------------------------------------------------
+// ---------------- 帮助 ----------------
 
 void printConfigOptions(FILE* out, uint32_t cmd, const SfmConfig& defaults) {
     const char* cur_group = "";
@@ -589,14 +502,11 @@ void printOptionLine(FILE* out, const std::string& flag, const std::string& valu
     printOption(out, flag, "", value, help, "");
 }
 
-// ---------------------------------------------------------------------------
-// stageSignature
-// ---------------------------------------------------------------------------
+// ---------------- 阶段签名 ----------------
 
 namespace {
 
-// Flags of a stage that cannot change what it writes: how fast it goes, on
-// which device, how much it says about it.
+// 设备、速度和日志详细度等不会改变阶段写出内容的选项不参与签名。
 bool signatureRelevant(const char* name) {
     for (const char* n : {"threads", "decode-threads", "decode-budget", "device",
                           "quiet", "profile", "spv-path"})
@@ -604,7 +514,7 @@ bool signatureRelevant(const char* name) {
     return true;
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 std::string stageSignature(const SfmConfig& cfg, uint32_t cmd) {
     std::string out;
@@ -613,9 +523,7 @@ std::string stageSignature(const SfmConfig& cfg, uint32_t cmd) {
         out += std::string(name) + "=" + valueString(cfg.member) + "\n";
     SFM_CONFIG_FIELDS(SFM_SIG_FIELD)
 #undef SFM_SIG_FIELD
-    // Per-group lenses reach the camera setup, and so verification, without
-    // being table rows: `--camera-model cam0=opencv-fisheye` and the manifest
-    // both land here.
+    // 相机分组覆盖项不属于配置表行，但会影响相机设置与验证；命令行和清单均在此纳入签名。
     if (cmd & (CMD_MATCH | CMD_MAP))
         for (const CameraOverride& o : cfg.camera.overrides) {
             out += "override " + o.prefix + "=";
@@ -624,7 +532,7 @@ std::string stageSignature(const SfmConfig& cfg, uint32_t cmd) {
             for (double e : o.extra) out += "," + valueString(e);
             out += "\n";
         }
-    // A sequence adds its temporal window to the pair list.
+    // 序列会将时间窗口加入图像对列表。
     if (cmd & (CMD_MATCH | CMD_MAP))
         for (const SequenceDef& d : cfg.sequences) {
             out += "sequence ";
@@ -635,4 +543,4 @@ std::string stageSignature(const SfmConfig& cfg, uint32_t cmd) {
     return out;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

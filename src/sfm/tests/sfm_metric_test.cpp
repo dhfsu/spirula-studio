@@ -1,7 +1,4 @@
-// The metric gauge: Sim(3) fit to reference camera positions, its uncertainty
-// and its gates (host only).
-//
-// Prints PASS/FAIL and returns 0/1. See docs/testing.md.
+// 纯主机公制规范测试，覆盖参考相机位置的 Sim(3)、不确定度与拒绝条件。
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -19,8 +16,7 @@
 
 using namespace sfm;
 
-// Camera at C looking at `target`, y-up. Also in sfm_merge_test.cpp: a local
-// copy beats a shared test-support header for nine lines of scene setup.
+// 相机位于 C 看向 target，y 向上，场景辅助函数局部定义。
 static Pose lookAt(const Vec3& C, const Vec3& target) {
     Vec3 f = (target - C).normalized();
     Vec3 up0 = {0, 1, 0};
@@ -31,8 +27,7 @@ static Pose lookAt(const Vec3& C, const Vec3& target) {
     return {R, {-t.x, -t.y, -t.z}};
 }
 
-// Cameras on an arc of radius 3 with height variation, so the centres span all
-// three axes: a planar or collinear set is a separate fixture below.
+// 半径 3 的圆弧叠加高度变化，保证中心覆盖三轴，平面与共线另设测试。
 static std::vector<Vec3> arcCentres(int n) {
     std::vector<Vec3> c(n);
     for (int i = 0; i < n; i++) {
@@ -52,7 +47,7 @@ static Mat3 rotFromAxisAngle(const Vec3& axis, double ang) {
     return angleAxisToRotation(axis.normalized() * ang);
 }
 
-// The reference positions a known Sim3 would produce from `centres`.
+// 已知 Sim3 作用于中心后的参考位置。
 static MetricRef makeRef(const std::vector<Vec3>& centres, const Sim3& T) {
     MetricRef ref;
     ref.centres = centres;
@@ -68,9 +63,8 @@ int cmdMetricSelftest(int, char**) {
         return ok;
     };
 
-    // ---- T1: exact recovery of a known Sim3, at two non-unit scales -------
-    // The scales are deliberately not 1: a fit that normalizes by the target
-    // variance, or divides the trace by three, is invisible at s = 1.
+    // ---------------- 两种非单位尺度的精确恢复 ----------------
+    // 避免单位尺度掩盖错误方差归一化或多除三的问题。
     for (double s_true : {0.0731, 12.4}) {
         Sim3 T;
         T.scale = s_true;
@@ -91,9 +85,8 @@ int cmdMetricSelftest(int, char**) {
         check(fit.inliers == fit.n && fit.n == 24, what);
     }
 
-    // ---- T1b: a left-handed reference, where the guard actually fires -----
-    // Unguarded this fits to 3e-15 m with det(R) = -1, so no RMS gate can see
-    // it. A coplanar fixture cannot test this: det(cov) is then round-off.
+    // ---------------- 左手参考须被拒绝 ----------------
+    // 镜像可产生 det=-1 且误差仅 3e-15 m，RMS 门限无法发现；须使用非共面样本。
     {
         int proper = 0, fitted = 0;
         double worst_rms = 0;
@@ -123,15 +116,13 @@ int cmdMetricSelftest(int, char**) {
         check(proper == 200, "T1b mirrored reference: det(R) = +1 on 200/200");
     }
 
-    // ---- T2: gross outliers, and near-threshold points that must survive --
+    // ---------------- 大离群点与近门限内点 ----------------
     {
         Sim3 T;
         T.scale = 12.4;
         T.R = rotFromAxisAngle({0.2, 0.4, -0.9}, 1.7);
         T.t = {-3.0, 8.0, 1.0};
-        // Above 3 m, so that comparing an unsquared residual to max_error^2
-        // LOOSENS the threshold: 3x is then rejected but 3x < max_err^2, and
-        // 3x > 2x means no shift of the model can capture it either.
+        // 阈值大于 3 m，使误把距离与平方阈值比较会明显放宽接受；3 倍偏移也不能靠整体平移同时捕获。
         const double max_err = 4.0;
         std::vector<Vec3> centres = arcCentres(40);
         MetricRef ref = makeRef(centres, T);
@@ -140,10 +131,10 @@ int cmdMetricSelftest(int, char**) {
         std::uniform_real_distribution<double> dir(-1.0, 1.0);
         for (int i = 0; i < 40; i++) {
             Vec3 d = Vec3{dir(rng), dir(rng), dir(rng)}.normalized();
-            if (i % 10 == 3 || i % 10 == 7) {         // 20 %: out at 3x
+            if (i % 10 == 3 || i % 10 == 7) {         // 20% 点位于三倍阈值外
                 ref.targets[i] = ref.targets[i] + d * (3.0 * max_err);
                 want[i] = 0;
-            } else if (i % 10 == 5) {                 // 10 %: in at 0.3x
+            } else if (i % 10 == 5) {                 // 10% 点位于 0.3 倍阈值内
                 ref.targets[i] = ref.targets[i] + d * (0.3 * max_err);
             }
         }
@@ -163,15 +154,13 @@ int cmdMetricSelftest(int, char**) {
             printf("  T2: inliers %d (want 32), kept-outliers %d, dropped-inliers %d\n",
                    fit.inliers, wrong_in, wrong_out);
         }
-        // The kept near-threshold points carry real displacement, so the refit
-        // moves off truth by a bounded amount rather than to 1e-9.
+        // 保留的扰动内点会使重拟合偏离真值有限距离，不能要求无噪声精度。
         printf("  T2: scale rel err %.3e\n", std::fabs(fit.T.scale / T.scale - 1.0));
         check(std::fabs(fit.T.scale / T.scale - 1.0) <= 5e-3, "T2: scale within 0.5 %");
     }
 
-    // ---- T3: 300 trials of one geometry with fresh noise ------------------
-    // Empirical spread of the recovered scale, and of the rotation about the
-    // WORST principal axis, against what the fit predicts for each.
+    // ---------------- 同几何三百次独立噪声试验 ----------------
+    // 比较实际尺度与最弱轴旋转的统计离散和预测不确定度。
     {
         const int trials = 300, n = 50;
         const double sigma = 0.05, s_true = 0.7;
@@ -180,8 +169,7 @@ int cmdMetricSelftest(int, char**) {
         T.R = rotFromAxisAngle({0.5, 0.2, 0.84}, 0.6);
         T.t = {2.0, -1.0, 0.5};
         std::vector<Vec3> centres = arcCentres(n);
-        // The axis the reported figure is the worst of: least spread across it,
-        // so the largest eigenvalue of the centres' covariance.
+        // 最弱旋转约束轴为横向跨度最小者，对应中心协方差最大特征值方向。
         Vec3 cbar{0, 0, 0};
         for (const Vec3& c : centres) cbar = cbar + c;
         cbar = cbar * (1.0 / n);
@@ -206,7 +194,7 @@ int cmdMetricSelftest(int, char**) {
         for (int k = 0; k < trials; k++) {
             MetricRef ref = makeRef(centres, T);
             for (Vec3& p : ref.targets) p = p + Vec3{nz(rng), nz(rng), nz(rng)};
-            MetricFit fit = fitMetricGauge(ref, 1.0);   // 11 sigma: nothing is rejected
+            MetricFit fit = fitMetricGauge(ref, 1.0);   // 十一倍 sigma 门限，不拒绝任何点
             if (!fit.ok) continue;
             ok_count++;
             const double rel = fit.T.scale / s_true - 1.0;
@@ -232,7 +220,7 @@ int cmdMetricSelftest(int, char**) {
         check(r_r >= 0.75 && r_r <= 1.33, "T3: rotation uncertainty predicts the spread");
     }
 
-    // ---- T4: every refusal, asserted on its REASON, not on the bool ------
+    // ---------------- 按具体原因验证每种拒绝 ----------------
     {
         Sim3 T;
         T.scale = 4.0;
@@ -245,13 +233,13 @@ int cmdMetricSelftest(int, char**) {
             MetricFit fit = fitMetricGauge(ref, 0.5);
             check(!fit.ok && fit.reason == MetricFail::Pairs, "T4: n < 3 -> Pairs");
         }
-        {   // every reference position identical: nothing to fit a scale to
+        {   // 全部参考位置相同，无法确定尺度
             MetricRef ref = makeRef(arcCentres(20), T);
             for (Vec3& p : ref.targets) p = ref.targets[0];
             MetricFit fit = fitMetricGauge(ref, 0.5);
             check(!fit.ok && fit.reason == MetricFail::Spread, "T4: no spread -> Spread");
         }
-        {   // cameras exactly on a line: the rotation about it is free
+        {   // 相机中心严格共线，绕线旋转自由
             MetricRef ref;
             for (int i = 0; i < 20; i++) {
                 ref.centres.push_back({0.4 * i, 0, 0});
@@ -260,7 +248,7 @@ int cmdMetricSelftest(int, char**) {
             MetricFit fit = fitMetricGauge(ref, 0.5);
             check(!fit.ok && fit.reason == MetricFail::Collinear, "T4: collinear -> Collinear");
         }
-        {   // every reference position wrong by far more than max_error
+        {   // 全部参考误差远超 max_error
             MetricRef ref = makeRef(arcCentres(20), T);
             std::mt19937 rng(9);
             std::uniform_real_distribution<double> big(-500.0, 500.0);
@@ -269,9 +257,7 @@ int cmdMetricSelftest(int, char**) {
             check(!fit.ok && fit.reason == MetricFail::Inliers, "T4: all outliers -> Inliers");
             check(fit.inliers < (fit.n + 1) / 2, "T4: all outliers -> under half are inliers");
         }
-        {   // A minority that agrees perfectly is still a minority: 8 of 24
-            // cameras on an exact Sim3, the rest elsewhere. The 8 are well
-            // spread, so every uncertainty gate would wave them through.
+        {   // 24 图中仅八图精确符合 Sim3，即使空间分散、预测不确定度很好，仍须因少数共识拒绝。
             Sim3 T2;
             T2.scale = 2.0;
             T2.R = rotFromAxisAngle({0.1, 0.2, 0.97}, 1.3);
@@ -289,8 +275,7 @@ int cmdMetricSelftest(int, char**) {
         }
     }
 
-    // ---- T8: applySim3 puts the centres on the targets, and moves nothing
-    // else. Reprojection is gauge-invariant, so it must not budge.
+    // ---------------- 应用 Sim3 后中心对齐且重投影不变 ----------------
     {
         Sim3 T;
         T.scale = 0.0731;
@@ -329,7 +314,7 @@ int cmdMetricSelftest(int, char**) {
             }
             rec.addPoint3D(pts[j], track);
         }
-        // Projections before, so the invariance claim is measured, not assumed.
+        // 保存变换前投影，实际测量不变性。
         std::vector<Vec2> before;
         for (const auto& kv : rec.points3D)
             for (const TrackElement& e : kv.second.track)
@@ -362,15 +347,12 @@ int cmdMetricSelftest(int, char**) {
         check(k == before.size() && k == (size_t)M * N,
               "T8: the same observations project after the transform");
         printf("  T8: worst centre %.3e m, worst reprojection %.3e px\n", worst_c, worst_px);
-        // 1e-6 px is what sfm_merge_test asks of the same invariance. The
-        // floor here is ~1e-9 px: a metric frame puts the origin metres away,
-        // and forming s*x_cam cancels two |t|-sized terms.
+        // 使用与合并测试相同的 1e-6 px 容差；米制原点移位带来的消减使数值底约 1e-9 px。
         check(worst_px <= 1e-6, "T8: reprojection unchanged");
     }
 
-    // ---- T9: the collinearity gate does not read the noise ----------------
-    // Same thin arc at two noise levels 160x apart. A gate on the reported
-    // orientation uncertainty passes the quiet one; this one refuses both.
+    // ---------------- 共线门限独立于噪声 ----------------
+    // 相同细长轨迹在相差 160 倍的噪声下均应拒绝，不能只靠预测角度不确定度。
     {
         Sim3 T;
         T.scale = 1.7;
@@ -396,7 +378,7 @@ int cmdMetricSelftest(int, char**) {
         check(quiet.rot_unc_deg < 5.0 && loud.rot_unc_deg > 5.0,
               "T9: the reported uncertainty WOULD have split them, which is why it cannot gate");
         check(loud.perp_frac < 0.05 && quiet.perp_frac < 0.05, "T9: both below the floor");
-        // The same 60 cameras spread across the long axis instead: passes.
+        // 相同六十相机增加横向跨度后应通过。
         std::vector<Vec3> fat(60);
         for (int i = 0; i < 60; i++)
             fat[i] = {0.5 * i, 4.0 * std::sin(0.3 * i), 3.0 * std::cos(0.21 * i)};
@@ -405,9 +387,8 @@ int cmdMetricSelftest(int, char**) {
         check(ok.ok, "T9: the same cameras spread off the axis pass");
     }
 
-    // ---- T10: same inputs twice, bit for bit ----------------------------
-    // Two exact 30-camera consensus sets tie under MSAC, so the winner is
-    // whichever the draw reached first; one consensus converges from any seed.
+    // ---------------- 重复输入须逐位一致 ----------------
+    // 两组各三十图的精确共识在 MSAC 上平局，固定随机序列必须稳定选择。
     {
         Sim3 A, B;
         A.scale = 3.3;
@@ -421,8 +402,7 @@ int cmdMetricSelftest(int, char**) {
         ref.centres = centres;
         for (int i = 0; i < 60; i++)
             ref.targets.push_back(transformPoint(i < 30 ? A : B, centres[i]));
-        // Eight fits, not two: which set wins is a coin flip per seed, so a pair
-        // that happens to agree proves nothing about a varying one.
+        // 重复八次，避免仅两次偶然选择相同共识而误判确定性。
         MetricFit a = fitMetricGauge(ref, 0.1);
         bool same = true;
         for (int rep = 0; rep < 7; rep++) {
@@ -441,9 +421,8 @@ int cmdMetricSelftest(int, char**) {
         check(bimodal, "T10: the fixture really has two answers to choose between");
     }
 
-    // ---- T5: pairing a positions file to image names ----------------------
-    // Two files share a basename in different folders, one entry has no
-    // extension, one names an image the model does not have.
+    // ---------------- 参考位置与图像名配对 ----------------
+    // 覆盖不同目录同名、无扩展名和模型缺失图像。
     {
         namespace fs = std::filesystem;
         const fs::path dir = fs::temp_directory_path() / "sfm_metric_t5";
@@ -455,10 +434,10 @@ int cmdMetricSelftest(int, char**) {
             f << "# a comment, and the blank line below\n\n";
             f << "cam1/a.jpg 1 2 3\n";
             f << "cam2/a.jpg 4 5 6\n";
-            f << "b 7 8 9\n";              // stem match against b.png
-            f << "zzz.jpg 10 11 12\n";     // not in the model
-            f << "e.jpg 20 21 22\n";       // in the model, but unregistered
-            f << "v1 99 99 99\n";          // a dot in a FOLDER is not an extension
+            f << "b 7 8 9\n";              // 按主干匹配 b.png
+            f << "zzz.jpg 10 11 12\n";     // 模型中不存在
+            f << "e.jpg 20 21 22\n";       // 模型存在但未配准
+            f << "v1 99 99 99\n";          // 文件夹中的点号不属于扩展名
         }
         std::map<std::string, Vec3> pos;
         std::string err;
@@ -472,7 +451,7 @@ int cmdMetricSelftest(int, char**) {
             Image im;
             im.id = (uint32_t)(i + 1);
             im.name = names[i];
-            im.registered = i != 4;  // e.jpg is in the model but not solved
+            im.registered = i != 4;  // e.jpg 在模型中但未求解位姿
             im.pose = {mat3Identity(), {(double)-i, 0, 0}};
             rec.images[im.id] = im;
         }
@@ -491,7 +470,7 @@ int cmdMetricSelftest(int, char**) {
               "T5: same basename in two folders stays two cameras");
         check(got.count(3) && got[3].x == 7, "T5: an extensionless entry matches by stem");
 
-        {   // a malformed line is refused, and the message names its number
+        {   // 畸形行须拒绝且错误包含行号
             const fs::path bad = dir / "bad.txt";
             std::ofstream f(bad.string());
             f << "ok.jpg 1 2 3\n\nbroken.jpg 1 2\n";
@@ -501,7 +480,7 @@ int cmdMetricSelftest(int, char**) {
             check(!readMetricPositions(bad.string(), p2, e2), "T5: a short line is refused");
             check(e2.find("3") != std::string::npos, "T5: the error names line 3");
         }
-        {   // a fourth number is not a comment: refuse rather than ignore it
+        {   // 第四个数字不是注释，必须拒绝
             const fs::path junk = dir / "junk.txt";
             std::ofstream f(junk.string());
             f << "ok.jpg 1 2 3 4\n";
@@ -511,7 +490,7 @@ int cmdMetricSelftest(int, char**) {
             check(!readMetricPositions(junk.string(), pj, ej),
                   "T5: a trailing field is refused");
         }
-        {   // the same image twice is a mistake, not a last-one-wins
+        {   // 重复图像条目是错误，不能后值覆盖前值
             const fs::path dup = dir / "dup.txt";
             std::ofstream f(dup.string());
             f << "a.jpg 1 2 3\na.jpg 4 5 6\n";
@@ -520,7 +499,7 @@ int cmdMetricSelftest(int, char**) {
             std::string e3;
             check(!readMetricPositions(dup.string(), p3, e3), "T5: a repeated name is refused");
         }
-        {   // a path that is not there reports so rather than reading nothing
+        {   // 路径不存在须明确报告，不能视为空输入
             std::map<std::string, Vec3> p4;
             std::string e4;
             check(!readMetricPositions((dir / "nope.txt").string(), p4, e4),
@@ -529,9 +508,8 @@ int cmdMetricSelftest(int, char**) {
         fs::remove_all(dir);
     }
 
-    // ---- T6: the GPS IFD, hand-built, both byte orders ---------------------
-    // IFD0 carries decoy tags 1..6, which are exactly the GPS IFD's own tag
-    // numbers: one switch for both reads latitude out of them.
+    // ---------------- 两种字节序的 GPS IFD ----------------
+    // IFD0 放入与 GPS 标签同号的干扰项，验证不能混用分派表。
     struct Tiff {
         std::vector<uint8_t> b;
         bool le;
@@ -547,7 +525,7 @@ int cmdMetricSelftest(int, char**) {
         void ent(uint16_t tag, uint16_t type, uint32_t count, uint32_t val) {
             u16(tag); u16(type); u32(count); u32(val);
         }
-        // A value of 4 bytes or fewer sits in the entry, left-aligned.
+        // 不超过四字节的值左对齐存于条目内部。
         void entIn(uint16_t tag, uint16_t type, uint32_t count,
                    const std::vector<uint8_t>& raw) {
             u16(tag); u16(type); u32(count);
@@ -603,7 +581,7 @@ int cmdMetricSelftest(int, char**) {
             check(std::fabs(e.lat_deg + lat) <= 1e-9, "T6: S is negative");
             check(std::fabs(e.lon_deg + lon) <= 1e-9, "T6: W is negative");
         }
-        {   // GPSAltitudeRef 1 means below sea level
+        {   // GPSAltitudeRef=1 表示海平面以下
             std::vector<uint8_t> blk = build(true, 'N', 'E', 1, true);
             ExifData e = parseExifTiff(blk.data(), blk.size());
             check(std::fabs(e.alt_m + 253.66) <= 1e-9, "T6: altitude ref 1 is below sea level");
@@ -616,9 +594,8 @@ int cmdMetricSelftest(int, char**) {
         }
     }
 
-    // ---- T6b: GPS straight off files, through readExif's JPEG walk ---------
-    // Three minimal JPEGs, one with no EXIF at all, so the "no GPS" count is
-    // measured rather than assumed.
+    // ---------------- 经 JPEG 遍历读取 GPS ----------------
+    // 三份最小 JPEG 包含无 EXIF 情况，明确验证无 GPS 计数。
     {
         namespace fs = std::filesystem;
         const fs::path dir = fs::temp_directory_path() / "sfm_metric_t6b";
@@ -653,7 +630,7 @@ int cmdMetricSelftest(int, char**) {
             Image im;
             im.id = (uint32_t)(i + 1);
             im.name = names[i];
-            im.registered = i != 4;   // e.jpg has a fix but was never solved
+            im.registered = i != 4;   // e.jpg 有定位但未配准
             im.pose = {mat3Identity(), {(double)-i, 0, 0}};
             rec.images[im.id] = im;
         }
@@ -665,9 +642,7 @@ int cmdMetricSelftest(int, char**) {
         check(gc.no_alt == 1, "T6b: the fix with no altitude tag is counted");
         check(ref.targets.size() == 3 && ref.image_ids.size() == 3,
               "T6b: the unpositioned and unregistered images are left out");
-        // b.jpg is 7.00 arcseconds of latitude north of a.jpg and nothing
-        // else. 215.99 m by the meridional radius; a sphere of radius a gives
-        // 216.43, so 0.05 m of tolerance is what refuses a flat-earth ENU.
+        // 仅纬度相差 7 角秒应为 215.99 m；简单球体为 216.43 m，0.05 m 容差可检出错误 ENU 近似。
         const Vec3 d = ref.targets[1] - ref.targets[0];
         printf("  T6b: b - a = (%.4f, %.4f, %.4f) m\n", d.x, d.y, d.z);
         check(std::fabs(d.y - 215.99) < 0.05 && std::fabs(d.x) < 0.01,
@@ -675,9 +650,8 @@ int cmdMetricSelftest(int, char**) {
         fs::remove_all(dir);
     }
 
-    // ---- T7: WGS-84, against vectors computed outside this program ---------
-    // (0,0,0) and (90,0,0) are the semi-axes and exact by inspection; float
-    // ECEF cannot reach 1e-6 m on any of the four.
+    // ---------------- WGS-84 与外部计算参考 ----------------
+    // 赤道和极点半轴可精确检查，四个样本均要求 float ECEF 无法达到的 1e-6 m 精度。
     {
         struct Case { double lat, lon, h, X, Y, Z; };
         const Case cs[4] = {
@@ -715,17 +689,14 @@ int cmdMetricSelftest(int, char**) {
         }
         printf("  T7: worst ENU displacement error %.3e m\n", we);
         check(we <= 1e-6, "T7: the three pinned ENU displacements");
-        // A permuted or mirrored axis set leaves every fit RMS unchanged --
-        // the Sim3 absorbs it -- so only the named axes can catch one.
+        // 轴置换或镜像可被 Sim3 吸收而不改 RMS，必须逐命名轴检查。
         const Vec3 north = enu[1] - o, east = enu[2] - o, up = enu[3] - o;
         check(north.y > 100.0 && std::fabs(north.x) < 1.0, "T7: +latitude is +N");
         check(east.x > 80.0 && std::fabs(east.y) < 1.0, "T7: +longitude is +E");
         check(up.z > 9.9, "T7: +height is +U");
         check(east.normalized().cross(north.normalized()).dot(up.normalized()) > 0.999,
               "T7: E x N = U, from the fitted axes");
-        // The origin --metric-gps uses is the arithmetic mean of the fixes.
-        // It is not the ECEF centroid -- that leaves 3e-4 m of offset here,
-        // which the Sim3's translation absorbs.
+        // GPS 原点采用定位经纬度算术均值而非 ECEF 质心，后者在此有 3e-4 m 偏移，可被平移掩盖。
         Geodetic mo;
         for (const Geodetic& q : g) {
             mo.lat_deg += q.lat_deg / g.size();
@@ -742,17 +713,14 @@ int cmdMetricSelftest(int, char**) {
               "T7: and not the first fix");
     }
 
-    // ---- T11: the conditioning floor is pinned from both sides -------------
-    // A line with a chosen transverse spread. 0.045 and 0.055 straddle the
-    // constant, so moving it outside +/-10 % turns one of these red.
+    // ---------------- 条件数门限两侧测试 ----------------
+    // 横向比例 0.045/0.055 夹住阈值，移动超过 10% 应使至少一项失败。
     {
         Sim3 T;
         T.scale = 2.5;
         T.R = rotFromAxisAngle({0.2, 0.5, 0.84}, 0.7);
         T.t = {3.0, -1.0, 8.0};
-        // lambda1 = (n^2-1)/12 along x, lambda2 = a^2, so perp_frac is
-        // sqrt(a^2/(lambda1+a^2)); the + - - + sign pattern makes the cross
-        // covariance with x exactly zero, so those are the true eigenvalues.
+        // 沿 x 的 lambda1=(n²-1)/12，lambda2=a²，perp_frac=sqrt(a²/(lambda1+a²))；+--+ 符号模式使交叉协方差严格为零。
         auto line = [](double a) {
             std::vector<Vec3> c(60);
             for (int i = 0; i < 60; i++) {
@@ -772,9 +740,8 @@ int cmdMetricSelftest(int, char**) {
         check(above.ok, "T11: 0.055 is accepted, so the floor is not above it");
     }
 
-    // ---- T12: the horizontal fit, against an altitude that ramps ----------
-    // A level 30 m ring whose reference altitude drifts 0.1 m per metre east:
-    // the full fit turns that ramp into a tilt of the whole scene.
+    // ---------------- 高度漂移下的水平拟合 ----------------
+    // 水平 30 m 环形参考高度随向东每米增加 0.1 m，完整三维拟合会把漂移吸收为倾斜。
     {
         Sim3 T;
         T.scale = 4.0;
@@ -805,8 +772,7 @@ int cmdMetricSelftest(int, char**) {
               "T12: the horizontal rotation is a turn about +Z, bit for bit");
         check(full_tilt > 2.0, "T12: the full fit tips the scene by degrees");
         check(flat.rms <= 1e-12, "T12: the level residuals are the fit's own");
-        // The vertical the horizontal fit did not read is still reported, so
-        // the reference's own altitude error stays visible.
+        // 水平拟合虽不使用高度，仍须报告高度误差。
         double u = 0;
         for (size_t k = 0; k < ref.centres.size(); k++) {
             const Vec3 r = ref.targets[k] - transformPoint(flat.T, ref.centres[k]);
@@ -816,9 +782,8 @@ int cmdMetricSelftest(int, char**) {
               "T12: and the altitude it refused is still there to be printed");
     }
 
-    // ---- T13: a street the full fit refuses, and the horizontal one does not
-    // The T11 line at 0.045 transverse spread, level: nothing fixes the roll
-    // about it, but a turn about the vertical is fully resisted.
+    // ---------------- 共线街道可接受水平拟合 ----------------
+    // 横向比例 0.045 时绕轨迹滚转不可观，但绕竖轴仍有充分约束。
     {
         Sim3 T;
         T.scale = 2.5;

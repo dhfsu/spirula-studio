@@ -1,9 +1,5 @@
-// Bundle adjustment on the host, for a device that cannot run the fp64 kernels.
-// Same problem, same LM loop and the same two linear solvers as sfm/ba/Solver.h;
-// only where the arithmetic happens changes. Parameters live in the BAProblem's
-// own vectors, so there is nothing to upload or read back.
-//
-// The parallel decomposition and what it rests on: README.md, "Host fallback".
+// 不支持设备 fp64 内核时使用主机 BA，问题、LM 流程和两种线性求解器与 GPU 一致。
+// 直接操作 BAProblem 的参数向量，无需传输；并行划分依据见本目录 README 的主机回退说明。
 #pragma once
 
 #include <algorithm>
@@ -106,7 +102,7 @@ public:
         stats_.initial_cost = cost;
         int noimprov = 0;
 
-        bool reuse = false;  // after a reject, the assembly still matches the params
+        bool reuse = false;  // 拒绝步恢复后，装配仍与参数一致
         double reject_mult = 2.0;
         int consec_fallbacks = 0;
         for (int it = 0; it < opt_.max_iters; it++) {
@@ -117,8 +113,7 @@ public:
                            damping,
                            reuse ? " (reuse)" : "");
             const bool cg = useCG_;
-            // as sfm/ba/Solver.h: A_c when CG is slow, rebuilt every third
-            // solve or once the damping has moved tenfold
+            // 与 GPU 一致，CG 较慢时使用 A_c，每三次求解或阻尼变化十倍后重建。
             tcUse_ = cg && tcN_ && !tcOff_ && lastCg_ > kTcMinIters;
             tcBuild_ = tcUse_ && (!tcHave_ || tcAge_ >= 2 ||
                                   std::fabs(std::log(damping / tcLambda_)) > std::log(10.0));
@@ -130,8 +125,7 @@ public:
                 tcAge_++;
             }
             double newCost = iterate(damping, reuse, cg);
-            // as sfm/ba/Solver.h: a CG that stopped before its first step is
-            // retried without the coarse correction, then taken as a failed step
+            // 与 GPU 一致，CG 未迈出首步时先去掉粗层校正重试，再判为失败步骤。
             if (cg && cgIters_ == 0 && !cgConverged_ && tcUse_) {
                 tcUse_ = tcBuild_ = false;
                 restore();
@@ -158,7 +152,7 @@ public:
                 } else {
                     const uint32_t usedCap = cgMaxit_;
                     cgMaxit_ = (uint32_t)opt_.cg_max_iters;
-                    // a truncated-CG step is still a damped descent step
+                    // 截断 CG 仍可产生阻尼下降步
                     const bool stepOk = std::isfinite(newCost) && newCost <= cost * (1.0 + opt_.rtol);
                     if (stepOk) consec_fallbacks = 0;
                     if (haveFallback_ && !stepOk) {
@@ -185,7 +179,7 @@ public:
                     if (++noimprov >= opt_.patience) { cost = newCost; break; }
                 } else {
                     noimprov = 0;
-                    damping = std::max(damping / 3.0, 1e-8);  // kMinDamping in sfm/ba/Solver.h
+                    damping = std::max(damping / 3.0, 1e-8);  // 与 GPU Solver.h 的 kMinDamping 一致
                 }
                 cost = newCost;
                 stats_.accepted++;
@@ -214,7 +208,7 @@ public:
 
     const SolverStats& stats() const { return stats_; }
 
-    // ---- debug hooks, mirroring BundleSolver's ----
+    // ---------------- 与 BundleSolver 对应的调试接口 ----------------
 
     void assembleOnly(double damping) {
         jacobianPass();
@@ -253,9 +247,7 @@ public:
     }
 
 private:
-    // ================
-    // setup
-    // ================
+    // ================ 初始化 ================
 
     void buildImageTables() {
         dof_.resize(nImg_);
@@ -287,9 +279,7 @@ private:
         exclusive_ = exclusiveGroups(P_);
         tail_ = n_ - poseDim_;
 
-        // Rows an image-per-task assembly cannot own outright: a member's
-        // extrinsic columns (every frame of the rig touches them) and the
-        // columns of an intrinsics group that more than one image refines.
+        // 逐图像任务不能独占 rig 成员外参及多图像组的自由内参行，需单独处理共享累加。
         srow_.assign(tail_, -1);
         sharedCol_.clear();
         for (const BAProblem::Member& m : P_.members)
@@ -306,16 +296,13 @@ private:
             }
         }
         m_ = (uint32_t)sharedCol_.size();
-        // Preconditioner blocks of the shared partition that several tasks
-        // feed: every member's and every group's (buildPrecBlocks' numbering).
+        // 按 buildPrecBlocks 编号，各成员与分组预条件块由多个任务共同贡献。
         nSharedBlk_ = exclusive_ ? 0 : (uint32_t)(P_.members.size() + P_.groups.size());
     }
 
     static double defaultBudgetMB() {
         const size_t ram = sfm::physicalRamBytes();
-        // Half the machine, not nine tenths of it: unlike a GPU heap this is
-        // shared with the rest of the pipeline (features, matches, the
-        // reconstruction) and with the page cache.
+        // 预算使用主机内存的一半，而非 GPU 的九成；还需为特征、匹配、重建与页缓存留空间。
         return ram ? 0.5 * (double)ram / (1024.0 * 1024.0) : 4096.0;
     }
 
@@ -324,8 +311,8 @@ private:
         double b = 0;
         b += ((double)P_.jc_total + 8 * no) * 8;              // Jc, Jp, res
         b += (9 + 9 + 3 + 3) * np * 8;                        // App, W, Bp, Bp0
-        b += (P_.pose_dim + P_.exts.size() + P_.total_intr + 3 * np) * 8;  // parameter backups
-        b += 4 * no + 4 * (ni + 1) + 12 * (no / 1024 + ni);   // obs-by-image CSR + chunks
+        b += (P_.pose_dim + P_.exts.size() + P_.total_intr + 3 * np) * 8;  // 参数备份
+        b += 4 * no + 4 * (ni + 1) + 12 * (no / 1024 + ni);   // 按图像组织的观测 CSR 与分块
         b += n * 8;                                           // g
         if (withDense) {
             b += (double)DenseSpd::elems(n_) * 8 + 2.0 * n * DenseSpd::kBlock * 8;
@@ -343,9 +330,7 @@ private:
         return b / (1024.0 * 1024.0);
     }
 
-    // One LM iteration of each path in seconds on 8 cores, fitted where dense
-    // assembly's quadratic cost in track length shows: 7.4 s dense against 1.5 s
-    // CG, same cost, on 1068 images averaging 70 a track (GPU's: Solver.h).
+    // 以八核心测量单轮代价：1068 图、平均每轨迹 70 观测时，同等代价下稠密路径 7.4 s，CG 1.5 s，体现稠密装配的轨迹长度平方开销。
     double denseSeconds() const {
         double t1 = 0, t2 = 0;
         for (uint32_t p = 0; p < nPts_; p++) {
@@ -405,8 +390,8 @@ private:
                        useCG_ ? "cg" : "dense", needMB, budget);
         }
 
-        P_.use_pair_schur = false;  // the pair tables are a GPU-only accelerator
-        buildCamTables(P_);         // the dense path walks the same per-image lists
+        P_.use_pair_schur = false;  // 图像对表仅用于 GPU 加速
+        buildCamTables(P_);         // 稠密路径沿用逐图像列表
         if (useCG_) buildPrecBlocks(P_, exclusive_);
         cgMaxit_ = (uint32_t)opt_.cg_max_iters;
         if (tcN_) {
@@ -440,9 +425,7 @@ private:
         intr0_ = P_.intr;
         points0_ = P_.points;
 
-        // Work split: by Schur entry count for the dense assembly (a track's
-        // contribution is quadratic in its length, so observation counts alone
-        // balance it badly), by observation count for the per-camera CG passes.
+        // 稠密装配按 Schur 条目数划分工作，避免长轨迹平方开销导致失衡；逐相机 CG 阶段按观测数划分。
         std::vector<uint64_t> ew(nImg_ + 1, 0), ow(nImg_ + 1, 0);
         for (uint32_t a = 0; a < nImg_; a++) {
             uint64_t e = 0;
@@ -455,8 +438,7 @@ private:
         }
         splitByWeight(ew, taskCount((int64_t)ew[nImg_], 1 << 14, nthreads_), asmSplit_);
         splitByWeight(ow, taskCount((int64_t)ow[nImg_], 1 << 13, nthreads_), cgSplit_);
-        // A task owns whole frames: the rows of a frame's pose are written by
-        // every image in it, so a split inside one would race.
+        // 每任务必须独占完整帧；同帧各图像都会写帧位姿行，帧内切分会产生竞争。
         snapToFrames(asmSplit_);
         snapToFrames(cgSplit_);
         const int nAsm = (int)asmSplit_.size() - 1, nCg = (int)cgSplit_.size() - 1;
@@ -514,7 +496,7 @@ private:
         for (size_t i = 1; i < out.size(); i++) out[i] = std::max(out[i], out[i - 1]);
     }
 
-    // Move each boundary of an image split up to the start of its frame.
+    // 将图像分段边界移到所在帧的起始图像。
     void snapToFrames(std::vector<uint32_t>& split) const {
         if (!P_.hasRigs()) return;
         for (size_t k = 1; k + 1 < split.size(); k++) {
@@ -528,9 +510,7 @@ private:
         return imageColumns(P_, img, cols);
     }
 
-    // ================
-    // one LM iteration
-    // ================
+    // ================ 单次 LM 迭代 ================
 
     double iterate(double damping, bool reuse, bool cg) {
         auto mark = std::chrono::steady_clock::now();
@@ -541,7 +521,7 @@ private:
             return dt;
         };
         if (reuse) {
-            Bp_ = Bp0_;  // the point back-substitution overwrote it in place
+            Bp_ = Bp0_;  // 点回代已原地覆盖该缓冲
         } else {
             poses0_ = P_.poses;
             exts0_ = P_.exts;
@@ -584,9 +564,7 @@ private:
         P_.points = points0_;
     }
 
-    // Jc, Jp, the weighted residual and the per-point normal blocks. One task
-    // per range of points, so App/Bp need no atomics and every write is
-    // sequential (observations are stored point-major).
+    // 按点区间分配任务，计算 Jc/Jp、加权残差和逐点正规块；观测按点连续存放，App/Bp 无需原子操作且写入连续。
     void jacobianPass() {
         withLoss(opt_.loss, [&](auto L) {
             using LT = decltype(L);
@@ -606,8 +584,7 @@ private:
                         const double* pose = &P_.poses[6 * (size_t)frame_[img]];
                         withModel(model_[img], [&](auto M) {
                             using MT = decltype(M);
-                            // The evaluated block is [6 | NE | kNumIntr]; the
-                            // stored one [6 | ne | gz] (sfm/ba/Problem.h).
+                            // 求值块为 [6 | NE | kNumIntr]，实际存储为 [6 | ne | gz]，见 Problem.h。
                             const bool rig = eoff_[img] != kNoSlot;
                             const int NE = rig ? 6 : 0;
                             const int DOF = 6 + NE + MT::kNumIntr;
@@ -651,7 +628,7 @@ private:
         });
     }
 
-    // W = (App + lambda)^-1, by the adjugate formula of common/linalg.slang.
+    // 通过与设备 linalg.slang 相同的伴随矩阵公式求 W = (App + lambda)^-1。
     void pointPrep(double lambda) {
         const double d = 1.0 + lambda;
         const int nt = taskCount(nPts_, 4096, nthreads_);
@@ -682,9 +659,7 @@ private:
         });
     }
 
-    // ================
-    // dense path
-    // ================
+    // ================ 稠密路径 ================
 
     void addAt(uint32_t R, uint32_t C, double v, double* sb) {
         if (R >= poseDim_) {
@@ -696,8 +671,7 @@ private:
         }
         S_.row(R)[C] += v;
     }
-    // An element whose two columns coincide is reached by both orderings of the
-    // observation pair, so it takes the value twice.
+    // 两列重合的元素会被观测对的两种顺序访问，因此需累计两次。
     void addSym(uint32_t u, uint32_t v, double val, double* sb) {
         if (u == v) {
             addAt(u, u, val + val, sb);
@@ -777,9 +751,7 @@ private:
                         const double* Jcj = &Jc_[P_.jc_off[oj]];
                         uint32_t colsB[kMaxCamDof];
                         imgCols(b, colsB);
-                        // Track images ascend, so frame(b) <= frame(a): two
-                        // frames put the pose x pose block below the diagonal,
-                        // one frame (rig-mates) folds both orderings onto it.
+                        // 轨迹图像升序，故 frame(b) <= frame(a)；不同帧的位姿块落在下三角，同帧 rig 伙伴的两种顺序折叠到同一块。
                         if (frame_[a] != frame_[b]) {
                             const uint32_t bp = 6 * frame_[b];
                             for (uint32_t r = 0; r < 6; r++) {
@@ -832,10 +804,7 @@ private:
         }
     }
 
-    // ================
-    // priors (sfm/ba/Priors.h): the assembled frame blocks into whichever
-    // system this iteration builds
-    // ================
+    // ================ 先验：将帧块加入当前系统 ================
 
     void addPriorDense() {
         const std::vector<uint32_t>& cols = prior_.cols();
@@ -854,8 +823,7 @@ private:
         for (uint32_t i = 0; i < poseDim_; i++) g_[i] += g[i];
     }
 
-    // Diagonal blocks into the preconditioner (frame f's block is block f on
-    // either partition, pose rows first) and the gradient.
+    // 对角先验块加入预条件器及梯度；两种划分中帧 f 均对应块 f，位姿行在前。
     void addPriorCg() {
         const std::vector<uint32_t>& cols = prior_.cols();
         const std::vector<uint32_t>& erow = prior_.entryRow();
@@ -893,13 +861,9 @@ private:
         });
     }
 
-    // ================
-    // implicit-Schur PCG
-    // ================
+    // ================ 隐式 Schur PCG ================
 
-    // B_c, the diagonal blocks of S under the preconditioner partition, and the
-    // reduced right-hand side -- the diagonal-pair part of the dense assembly,
-    // per camera (see cg_cam_diag in sfm/shaders/ba/cg.slang).
+    // B_c 为预条件划分下 S 的对角块，同时计算约化右端；对应稠密装配的对角图像对部分，逐相机执行。
     void cgCamDiag(double lambda) {
         std::fill(cgB_.begin(), cgB_.end(), 0.0);
         std::fill(cgM_.begin(), cgM_.end(), 0.0);
@@ -954,9 +918,7 @@ private:
                         gacc[r] += Jc[r] * d0 + Jc[dof + r] * d1;
                 }
                 double* Bblk = &cgB_[(size_t)kCamBlk * img];
-                // M's rows go to the partition block owning them: the image's
-                // (exclusive) or the frame's directly, this task's both; the
-                // member's and group's through per-task slots summed afterwards.
+                // 独占图像或帧的行直接写入所属块；成员和分组的共享行先存入逐任务槽位，再统一求和。
                 double* Fblk = exclusive_ ? &cgM_[(size_t)kCamBlk * img]
                                           : &cgM_[(size_t)kCamBlk * frame_[img]];
                 double* Mblk = nullptr;
@@ -1008,7 +970,7 @@ private:
                 const uint32_t dof = P_.prec_blocks[4 * b + 1] + P_.prec_blocks[4 * b + 3];
                 if (!dof) continue;
                 double* L = &cgM_[(size_t)kCamBlk * b];
-                // as cg_prec_fact: a failed pivot is floored and decoupled
+                // 与 cg_prec_fact 一致，失败主元设下限并解除耦合
                 double f = 1e-30;
                 for (uint32_t j = 0; j < dof; j++)
                     if (L[pidx(j, j)] > f) f = L[pidx(j, j)];
@@ -1063,12 +1025,9 @@ private:
         if (tcUse_) coarseApply(r, z);
     }
 
-    // ================
-    // coarse correction (README.md, "Coarse correction")
-    // ================
+    // ================ 粗层校正 ================
 
-    // P_f: pose deltas of a similarity motion (w, tau, s) of the world,
-    // d(angle-axis) = -Jr^-1 w and dt = s t - R tau; 6x7 row-major per frame.
+    // 世界相似运动 (w,tau,s) 的帧位姿增量 P_f：d(angle-axis) = -Jr^-1 w，dt = s t - R tau；每帧 6×7 行主序。
     void coarseBasis() {
         const uint32_t nf = P_.num_frames;
         const int nt = taskCount(nf, 1024, nthreads_);
@@ -1101,7 +1060,7 @@ private:
         });
     }
 
-    // G = sum over the run starting at observation o of P_f^T Jc_pose^T Jp.
+    // G 为从观测 o 开始的一段内 P_f^T Jc_pose^T Jp 之和。
     void coarseRunG(uint32_t o, uint32_t end, double* G) const {
         std::fill(G, G + 21, 0.0);
         const uint32_t c = frame_[P_.obs_image[o]] / tcK_;
@@ -1121,9 +1080,7 @@ private:
         }
     }
 
-    // A_c = P^T S P, factored. A task owns a range of block rows, so every
-    // write is its own: the B part from its frames' images, the Schur part
-    // from the run pairs keyed to its rows.
+    // 构造并分解 A_c = P^T S P；任务独占块行，B 来自对应帧图像，Schur 项来自索引到该行的段对。
     void coarseBuild() {
         coarseBasis();
         tcA_.zero(*pool_, nthreads_);
@@ -1174,8 +1131,7 @@ private:
                         }
                     }
                 }
-                // the global similarity is a gauge freedom: A_c is singular up
-                // to the damping
+                // 全局相似变换属于规范自由度，A_c 仅靠阻尼消除奇异性
                 for (uint32_t i = 0; i < 7; i++) {
                     double& d = tcA_.row(7 * c + i)[7 * c + i];
                     tcDiag_[7 * c + i] = d;
@@ -1240,8 +1196,7 @@ private:
         });
     }
 
-    // Sp = B p, then Sp -= sum_obs Acp v. A frame's rows belong to one task
-    // (rig-mates share a task); the tail past the poses is summed per task.
+    // 先 Sp = B p，再减去 sum_obs Acp v；任务独占帧行，rig 伙伴共享任务，位姿后的尾部按任务归约。
     void cgMatvec() {
         const int nt = (int)cgSplit_.size() - 1;
         if (!exclusive_) std::fill(cgSpIntr_.begin(), cgSpIntr_.end(), 0.0);
@@ -1322,13 +1277,13 @@ private:
         bool conv = !(std::isfinite(rho) && rho > 0.0);
         uint32_t iters = 0;
         cgP_ = cgZ_;
-        double Q = 0;  // the quadratic model at g, for cg_fin's Nash-Sofer test
+        double Q = 0;  // g 处的二次模型值，用于 cg_fin 的 Nash-Sofer 判据
         bool qstop = false;
         while (!conv && iters < maxit) {
             cgGather();
             cgMatvec();
             const double pAp = dot(cgP_, cgSp_);
-            if (!(std::isfinite(pAp) && pAp > 0.0)) {  // lost positive-definiteness
+            if (!(std::isfinite(pAp) && pAp > 0.0)) {  // 已失去正定性
                 conv = true;
                 break;
             }
@@ -1368,9 +1323,7 @@ private:
         return iters;
     }
 
-    // ================
-    // back-substitution and updates
-    // ================
+    // ================ 回代与更新 ================
 
     void dpAccum() {
         const int nt = taskCount(nPts_, 1024, nthreads_);
@@ -1439,10 +1392,10 @@ private:
 
     uint32_t n_ = 0, poseDim_ = 0, tail_ = 0, nImg_ = 0, nPts_ = 0, nObs_ = 0;
     std::vector<uint8_t> dof_, gz_, model_, efree_, emask_;
-    std::vector<uint32_t> icol_, ioff_, frame_, eoff_;  // eoff_: into exts, or kNoSlot
+    std::vector<uint32_t> icol_, ioff_, frame_, eoff_;  // eoff_ 为 exts 偏移，或 kNoSlot
     bool exclusive_ = true;
 
-    std::vector<int32_t> srow_;       // tail column -> shared-row slot, or -1
+    std::vector<int32_t> srow_;       // 尾部列到共享行槽位的映射，无映射时为 -1
     std::vector<uint32_t> sharedCol_;
     uint32_t m_ = 0, nSharedBlk_ = 0;
 
@@ -1453,8 +1406,7 @@ private:
     std::vector<double> poses0_, exts0_, intr0_, points0_;
     std::vector<double> sbuf_, sgbuf_, part_;
     std::vector<double> cgR_, cgZ_, cgP_, cgSp_, cgV_, cgB_, cgM_, cgGIntr_, cgSpIntr_, cgGrp_;
-    // Coarse correction: frames per cluster, dimension (0: off), the run-pair
-    // entries by cluster pair, block rows per task, and each frame's first image.
+    // 粗层校正包含每簇帧数、维度（0 禁用）、按簇对组织的段对条目、任务块行及各帧首图索引。
     uint32_t tcK_ = 0, tcN_ = 0;
     uint64_t tcEntries_ = 0;
     std::vector<uint32_t> tcEnt_, tcKey_, tcSplit_, frameImg_;
@@ -1472,4 +1424,4 @@ private:
     struct { double jac = 0, prep = 0, schur = 0, lin = 0, back = 0, cost = 0; } prof_;
 };
 
-}  // namespace bacpu
+}  // 命名空间 bacpu

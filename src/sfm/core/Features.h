@@ -1,9 +1,4 @@
-// Keypoints + descriptors and the flat-file interchange format.
-//
-// The layout is deliberately dtype/dim-agnostic (docs/notes/sfm-design.md D1): SIFT is
-// 128-D uint8 today, a learned frontend later may be F32 and a different width,
-// and nothing downstream may assume otherwise. `features.bin` is our own format
-// (D4); a converter to/from COLMAP's SQLite database is a separate host tool.
+// 关键点、描述子及独立二进制格式；布局不假定数据类型或维度，兼容 SIFT 的 128 维 uint8 与学习前端浮点描述子。
 #pragma once
 
 #include <cmath>
@@ -17,19 +12,12 @@
 
 namespace sfm {
 
-// Similarity-covariant keypoint in *original*-image pixel coordinates (top-left
-// origin, +x right, +y down), matching COLMAP's FeatureKeypoint(x,y,scale,orn).
-// "Original" is the source file's resolution, not the possibly-downscaled one
-// SIFT ran on: the extractor scales its output back (see scaleKeypoints), so a
-// camera built from a FeatureSet describes the images on disk (D46).
+// 关键点使用原图像素坐标，左上原点、x 向右、y 向下；提取器将缩小工作图的结果映回原尺寸，使相机参数对应磁盘图像（D46）。
 struct Keypoint {
-    float x = 0, y = 0;         // subpixel location
-    float scale = 0;            // sigma in original-image pixels
-    float orientation = 0;      // radians, CCW from +x
-    // SIFT: |DoG| at the refined extremum. A learned detector: its detection
-    // score. Persisted from v5 -- ALIKED has neither scale nor orientation, so
-    // this is the only ranking signal its keypoints carry, and anything that
-    // used to rank by scale has to fall back to it (Pairing / PairSelection).
+    float x = 0, y = 0;         // 亚像素位置
+    float scale = 0;            // 原图像素单位的 sigma
+    float orientation = 0;      // 弧度，从 +x 逆时针
+    // 响应值为 SIFT 的 DoG 极值或学习检测分数，v5 起保存，无尺度检测器依赖它排序。
     float response = 0;
 };
 
@@ -37,75 +25,48 @@ enum class DType : uint32_t { U8 = 0, F32 = 1 };
 
 inline uint32_t dtypeSize(DType t) { return t == DType::U8 ? 1u : 4u; }
 
-// One image's features. Descriptors are row-major: feature i occupies
-// data[i*dim .. i*dim+dim) as `dtype` elements.
+// 单图特征，描述子按行排列，第 i 个占 data[i*dim .. i*dim+dim)，元素类型为 dtype。
 struct FeatureSet {
-    int width = 0, height = 0;          // source image size features refer to
-    // The size SIFT actually ran at, which is smaller than (width,height)
-    // whenever the loader downscaled to --max-image-size. 0 means "the same",
-    // which is what a file written before this field says. Keypoint coordinates
-    // are in the *source* frame (see scaleKeypoints), but their localization
-    // noise is a property of *this* frame, so it is what pixel thresholds are
-    // measured in (D47).
+    int width = 0, height = 0;          // 特征坐标所属的源图尺寸
+    // extract 尺寸为实际检测分辨率，0 表示相同；坐标属于源图，但定位噪声与像素阈值属于提取分辨率（D47）。
     int extract_width = 0, extract_height = 0;
-    // The focal length EXIF claims for this image, in pixels of (width,height),
-    // and the camera identity EXIF gives it (sfm/core/Exif.h). 0 / empty when the
-    // file had no usable EXIF. Recorded at extraction because that is the last
-    // stage that sees the image file; matching and mapping only see features.
+    // EXIF 像素焦距与相机身份，无有效值时为 0/空；提取阶段是最后读取原图的阶段，因此须在此记录。
     double exif_focal = 0;
     std::string exif_camera;
-    // The Orientation tag, 1..8, of the pixels as the mapper will see them --
-    // so 1 once `--exif-orientation apply` has turned them (sfm/core/Exif.h).
-    // The gauge fix reads it: a portrait capture's up is not the image's.
+    // 建图所见像素的 Orientation，范围 1..8；apply 旋转后为 1，供规范对齐修正竖拍向上方向。
     uint8_t exif_orientation = 1;
     uint32_t dim = 128;
     DType dtype = DType::U8;
     std::vector<Keypoint> keypoints;
-    std::vector<uint8_t> descriptors;   // count*dim*dtypeSize bytes
-    // Optional per-keypoint RGB sampled from the source image (count*3 bytes, or
-    // empty). Written by `spirula-sfm extract`; the mapper averages them over each 3D
-    // point's track to color the point cloud for 3DGS init. Empty for a feature
-    // set produced without an image (e.g. selftest) or read from a v1 file.
+    std::vector<uint8_t> descriptors;   // count*dim*dtypeSize 字节
+    // 可选 RGB 为 count*3 字节，三维点沿轨迹平均颜色；无图像来源或旧 v1 特征时可为空。
     std::vector<uint8_t> colors;
 
     uint32_t count() const { return (uint32_t)keypoints.size(); }
     bool hasColors() const { return colors.size() == (size_t)count() * 3; }
-    // Whether any keypoint carries a detection score worth persisting. SIFT
-    // leaves response at 0; a learned detector fills it in.
+    // 是否存在需要保存的检测分数；SIFT 的 response 保持 0，学习检测器填充分数。
     bool hasScores() const {
         for (const Keypoint& k : keypoints)
             if (k.response != 0) return true;
         return false;
     }
-    // What a subset selection should rank by. Scale for SIFT (D16: the largest
-    // scales are the most repeatable), the detection score for a detector that
-    // has no scale. Never both -- an extractor fills in one of them.
+    // SIFT 按更具可重复性的尺度排序（D16），无尺度检测器按检测分数排序，不混合两者。
     float rank(uint32_t i) const {
         const Keypoint& k = keypoints[i];
         return k.scale > 0 ? k.scale : k.response;
     }
-    // How many source pixels one extraction pixel is worth: >= 1, and exactly 1
-    // when nothing was downscaled. The two axes agree up to the rounding in
-    // the size clamp, so their mean is the isotropic answer.
+    // 每提取像素对应的源像素数，至少为 1；两轴仅有尺寸取整差异，取平均得到各向同性尺度。
     double pixelScale() const {
         if (extract_width <= 0 || extract_height <= 0 || width <= 0 || height <= 0) return 1.0;
         return 0.5 * ((double)width / extract_width + (double)height / extract_height);
     }
 };
 
-// Scale keypoints from the coordinates of a (dw,dh) image to those of a (w,h)
-// one, and record the new size. The extractor runs SIFT on a downscaled copy
-// when the source is larger than --max-image-size; everything downstream --
-// cameras.bin above all -- should still be in the coordinates of the file the
-// user has (COLMAP's ScaleKeypoints does the same, feature/utils.cc).
-//
-// The mapping is the exact inverse of the bilinear resample in sfm/core/Image.h: a
-// destination pixel center (x+0.5) came from source (x+0.5)*sx. Sigma scales by
-// the geometric mean, the only isotropic choice when the two axes round
-// differently.
+// 将关键点从工作尺寸映回原图并记录尺寸，使用双线性重采样的精确逆：源像素中心为 (x+0.5)*sx。
+// sigma 按两轴比例的几何平均缩放，处理宽高取整差异，保证 cameras.bin 对应原图。
 inline void scaleKeypoints(FeatureSet& fs, int w, int h) {
     if (w <= 0 || h <= 0 || fs.width <= 0 || fs.height <= 0) return;
-    fs.extract_width = fs.width;    // where the keypoints were actually measured
+    fs.extract_width = fs.width;    // 关键点实际测量所在的分辨率
     fs.extract_height = fs.height;
     if (w == fs.width && h == fs.height) return;
     const float sx = (float)w / fs.width, sy = (float)h / fs.height;
@@ -119,13 +80,10 @@ inline void scaleKeypoints(FeatureSet& fs, int w, int h) {
     fs.height = h;
 }
 
-// ---- features.bin -------------------------------------------------------
-// The layout and every version's appended section: src/sfm/README.md. Each one
-// is read back as its own absence, so a stale cache is reused, not rejected.
+// ---------------- 特征文件格式 ----------------
+// 各版本附加段见 src/sfm/README.md；旧版本缺失字段按默认值读取，允许复用旧缓存。
 
-// Written to a sibling and renamed over the destination, so a run killed mid
-// stage leaves a file that is either whole or absent -- which is what lets the
-// next run reuse it without reading the descriptor block back to check (D76).
+// 先写相邻临时文件再重命名替换，保证中断后文件完整或不存在，无需重读描述子即可安全复用（D76）。
 inline void writeFeatures(const std::string& path, const FeatureSet& fs) {
     const std::string tmp = path + ".part";
     {
@@ -168,9 +126,7 @@ inline void writeFeatures(const std::string& path, const FeatureSet& fs) {
     }
 }
 
-// Is there a whole feature file at `path`, and how many keypoints does it hold?
-// The keypoints and descriptors are all but the whole file, so the size against
-// the header catches a truncated one without reading a gigabyte to find out.
+// 通过文件头与文件大小检查完整性和关键点数，避免为发现截断而读取整个描述子块。
 inline bool peekFeatures(const std::string& path, uint32_t& count) {
     std::error_code ec;
     const uint64_t bytes = (uint64_t)std::filesystem::file_size(path, ec);
@@ -194,11 +150,7 @@ inline bool peekFeatures(const std::string& path, uint32_t& count) {
     return true;
 }
 
-// `with_descriptors == false` seeks past the descriptor block instead of
-// reading it. Everything downstream of matching -- the mapper, and so the
-// whole `map` subcommand -- wants only keypoints and colors, and the
-// descriptors are the file: a gigabyte per thousand images, read and then
-// never touched.
+// with_descriptors=false 时直接跳过描述子；建图只需关键点与颜色，每千张图可避免约 1 GB 无用读取。
 inline FeatureSet readFeatures(const std::string& path, bool with_descriptors = true) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot read " + path);
@@ -216,8 +168,7 @@ inline FeatureSet readFeatures(const std::string& path, bool with_descriptors = 
     fs.dim = dim;
     fs.dtype = (DType)dtype;
     fs.keypoints.resize(count);
-    {   // one read, not one per keypoint: a 1200-image capture has ten million
-        // of them and the per-call stream overhead dominated the actual copy.
+    {   // 一次批量读取关键点，避免千万点级数据的逐点流调用开销。
         std::vector<float> raw((size_t)count * 4);
         f.read((char*)raw.data(), (std::streamsize)(raw.size() * sizeof(float)));
         for (uint32_t i = 0; i < count; i++) {
@@ -242,9 +193,7 @@ inline FeatureSet readFeatures(const std::string& path, bool with_descriptors = 
         }
     }
     if (version >= 3) {
-        // Read into locals and only publish a complete section: a file
-        // truncated mid-EXIF must read back as "no EXIF", not as a garbage
-        // focal length that would then be trusted as a prior.
+        // 附加段先读到局部变量，完整后才发布；截断 EXIF 应表现为缺失，而非可信的错误焦距。
         double focal = 0;
         uint32_t cam_len = 0;
         f.read((char*)&focal, 8);
@@ -284,4 +233,4 @@ inline FeatureSet readFeatures(const std::string& path, bool with_descriptors = 
     return fs;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

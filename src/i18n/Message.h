@@ -1,32 +1,8 @@
 #pragma once
 
-// Msg -- a translated string, as a *type* rather than a lookup key.
-//
-// The whole design exists to make "somebody added a language, or a message,
-// and forgot a translation" a compile error. A catalog entry
-//
-//     SS_MSG(open_dataset, EN("Open a Dataset..."), JA("..."), ...);
-//
-// expands to a constexpr object with one slot per language plus a
-// `static_assert` that every slot is filled. There is no runtime lookup, no
-// catalog file to ship, and no fallback path that can rot unnoticed.
-//
-// Properties worth knowing:
-//   - Each tag carries its own slot index, so the ORDER of the tags does not
-//     matter. Write them in whatever order reads best in the source.
-//   - A duplicated tag necessarily leaves another slot empty, so it is caught
-//     by the same assert rather than silently overwriting.
-//   - A wrong tag COUNT is caught by its own assert with a clearer message.
-//   - Every message carries `id` -- its own C++ name -- which src/app/gui/Ui.h
-//     uses as the stable ImGui widget ID, so switching language does not
-//     collapse open headers or reset scroll positions.
-//
-// Cost: all 13 languages are always linked, ~104 bytes of pointers per message
-// plus the strings. At the current catalog size that is well under a megabyte
-// of .rodata, which is cheaper than any resource-file scheme would be to
-// build, ship and get wrong.
-//
-// See docs/i18n.md and src/i18n/README.md.
+// Msg 用类型表示完整译文，目录条目生成含各语言槽位的 constexpr 对象，并在编译期检查数量、重复标签及缺失译文。
+// 标签携带槽位索引，因此顺序不影响结果；消息 id 保持稳定，语言切换不会改变 GUI 控件身份。
+// 始终链接 13 种语言，每条消息约 104 字节指针加字符串，目录静态数据不足 1 MB，无运行期目录查找或资源文件依赖。
 
 #include "i18n/Languages.h"
 
@@ -50,8 +26,7 @@ inline constexpr unsigned kLangCount = 0
 #undef X
     ;
 
-// A translation tagged with the language it is for. The tag macros in
-// BeginCatalog.h (EN, JA, ZH_HANS, ...) are the only intended way to build one.
+// 带语言标签的译文，统一由 BeginCatalog.h 的 EN、JA、ZH_HANS 等宏构造。
 template <Lang L>
 struct Tr {
     const char* s;
@@ -66,10 +41,10 @@ struct Msg {
         static_assert(sizeof...(Ls) == kLangCount,
                       "i18n: wrong number of translations -- one tag per "
                       "language in SS_LANGUAGES, no more and no fewer");
-        ((v[unsigned(Ls)] = t.s), ...);   // C++17 fold over the tagged slots
+        ((v[unsigned(Ls)] = t.s), ...);   // 通过 C++17 折叠表达式填写带标签槽位
     }
 
-    // Untranslated escape hatch; see en_only() below.
+    // 仅英文的过渡入口，参见 en_only()
     struct EnOnlyTag {};
     constexpr Msg(EnOnlyTag, const char* id_, const char* s) : v{}, id(id_) {
         for (unsigned i = 0; i < kLangCount; i++) v[i] = s;
@@ -81,29 +56,19 @@ struct Msg {
         return true;
     }
 
-    // The string for the language the UI is currently in.
+    // 当前界面语言对应的字符串。
     const char* get() const;
 
     const char* in(Lang l) const { return v[unsigned(l)]; }
 };
 
-// The staged-rollout escape hatch: every slot gets the English string, so the
-// message is usable and `complete()` holds, but the entry is greppable.
-//   grep -rc SS_MSG_EN src/i18n/catalog/
-// IS the remaining translation work. A catalog flips to full enforcement one
-// at a time as it is translated.
+// 分阶段翻译时暂以英文填充全部槽位，使 complete() 仍成立；SS_MSG_EN 标识尚未完成的译文，便于统计。
 constexpr Msg en_only(const char* id, const char* s) {
     return Msg(Msg::EnOnlyTag{}, id, s);
 }
 
-// ---------------------------------------------------------------------------
-// Current language
-// ---------------------------------------------------------------------------
-// Resolved once at startup by i18n::init() (Locale.h) and changed by the GUI's
-// language picker. Atomic because worker threads format status messages while
-// the UI thread may be switching languages; relaxed is enough -- the strings
-// are immortal .rodata, so the worst a race can do is render one frame, or one
-// log line, in the previous language.
+// ---------------- 当前语言 ----------------
+// i18n::init() 初始化，GUI 可切换；工作线程同时格式化消息，因此使用原子变量。字符串常驻只读区，relaxed 足够，竞争最多使一帧或一行沿用旧语言。
 namespace detail {
 extern std::atomic<Lang> g_current;
 }
@@ -115,24 +80,9 @@ void set_current(Lang l);
 
 inline const char* Msg::get() const { return v[unsigned(current())]; }
 
-// ---------------------------------------------------------------------------
-// Positional substitution
-// ---------------------------------------------------------------------------
-// NEVER build a sentence by concatenating message fragments. Every one of
-// these languages reorders clauses relative to English, and Japanese, Korean
-// and Turkish are verb-final -- a sentence assembled from pieces in English
-// order cannot be translated at all. Write the whole sentence as one message
-// with {0} / {1} placeholders and substitute here:
-//
-//     i18n::format(msg::gui::frames_extracted, {count, path})
-//
-// `{{` is a literal `{`. An index with no argument is left in place verbatim,
-// so the mistake shows up in the UI as `{2}` rather than as a crash or a
-// silently truncated sentence.
-//
-// The other half of the rule: no plural-sensitive sentences in the catalog.
-// Write "Images: 5", not "5 images" -- otherwise Russian needs a three-form
-// CLDR plural rule and every message that counts anything triples.
+// ---------------- 位置参数替换 ----------------
+// 完整句子使用一条消息及 {0}/{1} 占位符，禁止按英文顺序拼接片段；避免依赖复数变化，采用“图像：5”等标签形式。
+// {{ 表示字面量 {；缺少参数的占位符原样保留，使错误可见而不会截断句子。
 struct Arg {
     std::string s;
 
@@ -145,7 +95,7 @@ struct Arg {
     Arg(unsigned v);
     Arg(unsigned long v);
     Arg(unsigned long long v);
-    Arg(double v);           // "%g" -- for anything else, format it yourself
+    Arg(double v);           // 采用 %g；需要其他形式时由调用方自行格式化
     Arg(float v) : Arg(double(v)) {}
 };
 
@@ -155,44 +105,21 @@ inline std::string format(const Msg& m, std::initializer_list<Arg> args) {
     return format(m.get(), args);
 }
 
-// ---------------------------------------------------------------------------
-// The inverse: reading a line back
-// ---------------------------------------------------------------------------
-// A subprocess prints translated lines and the parent has to understand them --
-// the GUI's progress bar reads what `spirula mesh` writes, and both are in the
-// language the user picked. Matching on English fragments is exactly the thing
-// that breaks the moment the child is translated, so match on the MESSAGE
-// instead: scan() takes the same Msg the child printed with, matches its
-// literal parts against the line, and hands back what stood in the {0}, {1},
-// ... positions.
-//
-//     std::vector<std::string> got;
-//     if (scan(msg::mesh::cameras_rendered, rest, got))  // "12/120 cameras"
-//         frac = atof(got[0].c_str()) / atof(got[1].c_str());
-//
-// The whole line must match, start to end. Literal parts are matched at the
-// earliest position that still allows the rest to match, so a placeholder never
-// swallows the separator that follows it. Two adjacent placeholders have
-// nothing to split on and are rejected rather than guessed at.
+// ---------------- 从日志反向解析参数 ----------------
+// scan() 使用子进程打印时的同一 Msg 匹配整行，并提取各占位符，避免匹配英文片段而破坏本地化。
+// 固定文本取允许后续继续匹配的最早位置；无分隔符的相邻占位符无法可靠解析，直接拒绝。
 bool scan(const char* pattern, const std::string& text,
           std::vector<std::string>& out);
 
-// Terminal columns a UTF-8 string occupies (East Asian wide characters count
-// as two), for the places that lay text out in a fixed column: a log tag, a
-// table of labels. Not a full UAX #11 table -- the ranges a translation can
-// plausibly land in.
+// UTF-8 字符串的终端列宽，东亚宽字符占两列，用于日志标签和表格对齐；覆盖常见译文范围，并非完整 UAX #11 表。
 int display_width(const char* s);
 inline int display_width(const std::string& s) { return display_width(s.c_str()); }
 
-// `s` padded on the right to `columns` terminal columns (never truncated).
+// 在 s 右侧补空格至 columns 列，不截断。
 std::string pad_to(const std::string& s, int columns);
 
-// `text` broken into lines of at most `columns` terminal columns, for the help
-// printers. Breaks at spaces where there are any -- and BETWEEN CHARACTERS
-// where there are not, which is the only way Chinese and Japanese wrap at all:
-// they are written without spaces, so a space-only wrapper leaves one line
-// four hundred columns wide. A line never begins with the closing punctuation
-// or the small kana that may not start one.
+// 按终端列宽将 text 换行为最多 columns 列；有空格时按词断行，无空格的中日文按字符断行。
+// 禁止闭合标点或小假名出现在行首。
 std::vector<std::string> wrap(const std::string& text, int columns);
 
 inline bool scan(const Msg& m, const std::string& text,
@@ -200,15 +127,11 @@ inline bool scan(const Msg& m, const std::string& text,
     return scan(m.get(), text, out);
 }
 
-}  // namespace i18n
-}  // namespace spirula
+}  // 命名空间 i18n
+}  // 命名空间 spirula
 
-// ---------------------------------------------------------------------------
-// Catalog entry points
-// ---------------------------------------------------------------------------
-// Both must appear between #include "i18n/BeginCatalog.h" and
-// #include "i18n/EndCatalog.h", which define and then #undef the short tag
-// macros so EN/JA/... never leak into ordinary code.
+// ---------------- 消息目录入口 ----------------
+// 须位于 BeginCatalog.h 与 EndCatalog.h 之间，后者撤销短语言标签宏，避免污染普通代码。
 
 #define SS_MSG(name, ...)                                                     \
     inline constexpr ::spirula::i18n::Msg name{#name, __VA_ARGS__};           \

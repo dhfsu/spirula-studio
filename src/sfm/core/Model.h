@@ -1,9 +1,4 @@
-// Reconstruction model + COLMAP binary IO (docs/notes/sfm-design.md D4).
-//
-// Cameras, images (poses + 2D points), and 3D points with tracks, written to
-// and read from COLMAP's cameras.bin / images.bin / points3D.bin so the output
-// drops into the dataset parser and can be diffed against COLMAP. Little-endian
-// host assumed (as the rest of this repo does).
+// 重建模型及 COLMAP 二进制读写，保存相机、图像位姿和二维点、带轨迹的三维点；假设主机为小端。
 #pragma once
 
 #include <algorithm>
@@ -42,14 +37,12 @@ struct Image {
     uint32_t id = 0;
     uint32_t camera_id = 0;
     std::string name;
-    Pose pose;                 // world -> camera
+    Pose pose;                 // 世界坐标系 -> 相机坐标系
     bool registered = false;
-    // The file's EXIF Orientation (sfm/core/Exif.h), 1 when it has none or the
-    // pixels already carry it. Only the gauge fix reads it, and only a model
-    // built from features has it -- one read back from disk does not.
+    // EXIF Orientation，无标签或像素已旋转时为 1；仅规范对齐使用，磁盘模型本身不保存此信息。
     uint8_t exif_orientation = 1;
-    std::vector<Vec2> points2D;              // keypoint coords (all features)
-    std::vector<uint64_t> point3D_ids;       // parallel; kInvalidPoint3D if none
+    std::vector<Vec2> points2D;              // 全部特征的关键点坐标
+    std::vector<uint64_t> point3D_ids;       // 与关键点一一对应，无三维点时为 kInvalidPoint3D
 
     uint32_t numPoint3D() const {
         uint32_t n = 0;
@@ -59,19 +52,16 @@ struct Image {
     }
 };
 
-// COLMAP camera model ids come from sfm/core/Camera.h's kCamModelInfo table
-// (camColmapId / camFromColmapId), so cameras.bin IO needs no local enum.
+// COLMAP 相机模型 ID 统一来自 Camera.h 的元数据表，读写层不再维护独立枚举。
 
 struct Reconstruction {
     std::map<uint32_t, Camera> cameras;
     std::map<uint32_t, Image> images;
     std::map<uint64_t, Point3D> points3D;
     uint64_t next_point3D_id = 1;
-    // Per rig of the run's RigTable, the extrinsics this model has settled on;
-    // empty until a rig's frames register. In this model's units (sfm/core/Rig.h).
+    // 逐 rig 的模型外参标定，使用模型单位；尚无帧配准时为空。
     std::vector<RigCalib> rigs;
-    // Images left outside their frame, with a pose of their own. The mapper
-    // keeps frames whole and never fills it; the solvers and the merge honour it.
+    // 脱离帧、拥有独立位姿的图像；建图器保持整帧而不填充此集合，求解与合并仍遵守它。
     std::set<uint32_t> rig_detached;
 
     uint32_t numRegistered() const {
@@ -95,10 +85,7 @@ struct Reconstruction {
     static Reconstruction readBinary(const std::string& dir);
 };
 
-// A copy holding only `keep`, with the tracks trimmed to match: the operation
-// every "this model is really two models" decision ends in (D45). Images not
-// kept go back to the unregistered state the mapper starts them in, and points
-// whose track falls below two observations go away entirely.
+// 复制 keep 指定的图像并裁剪轨迹，其余图像恢复未配准，少于两个观测的三维点删除，供模型拆分使用（D45）。
 inline Reconstruction subsetModel(const Reconstruction& m, const std::set<uint32_t>& keep) {
     Reconstruction out = m;
     for (auto& kv : out.images) {
@@ -127,12 +114,10 @@ inline Reconstruction subsetModel(const Reconstruction& m, const std::set<uint32
     return out;
 }
 
-// "Have these two images been matched to each other, with real support?" --
-// supplied by whoever holds the correspondence graph (the mapper does; the
-// merger does not). See findDuplicateStructure (D45).
+// 由对应图持有者提供两图像是否具有真实匹配支持的查询，用于重复结构检查；建图器有对应图，合并器没有。
 using MatchedFn = std::function<bool(uint32_t, uint32_t)>;
 
-// The 3D points an image observes, sorted (for cheap intersections).
+// 排序后的图像可见三维点，便于快速求交。
 inline std::vector<uint64_t> observedPoints(const Image& im) {
     std::vector<uint64_t> v;
     for (uint64_t p : im.point3D_ids)
@@ -152,7 +137,7 @@ inline size_t sharedPoints(const std::vector<uint64_t>& a, const std::vector<uin
     return n;
 }
 
-// ---- little-endian binary helpers ----
+// ---------------- 小端二进制辅助函数 ----------------
 namespace detail {
 template <class T>
 void wr(std::ostream& f, T v) {
@@ -164,7 +149,7 @@ T rd(std::istream& f) {
     f.read((char*)&v, sizeof(T));
     return v;
 }
-}  // namespace detail
+}  // 命名空间 detail
 
 inline void Reconstruction::writeBinary(const std::string& dir) const {
     using namespace detail;
@@ -196,7 +181,7 @@ inline void Reconstruction::writeBinary(const std::string& dir) const {
             for (double v : {q[0], q[1], q[2], q[3]}) wr<double>(f, v);
             for (double v : {im.pose.t.x, im.pose.t.y, im.pose.t.z}) wr<double>(f, v);
             wr<uint32_t>(f, im.camera_id);
-            f.write(im.name.c_str(), im.name.size() + 1);  // NUL-terminated
+            f.write(im.name.c_str(), im.name.size() + 1);  // 以 NUL 结尾
             wr<uint64_t>(f, im.points2D.size());
             for (size_t i = 0; i < im.points2D.size(); i++) {
                 wr<double>(f, im.points2D[i].x);
@@ -290,9 +275,7 @@ inline Reconstruction Reconstruction::readBinary(const std::string& dir) {
             r.next_point3D_id = std::max(r.next_point3D_id, id + 1);
         }
     }
-    // Some exporters drop untriangulated keypoints from images.bin and leave
-    // the tracks indexing the old lists (Hierarchical 3DGS "campus": 26.6 M of
-    // 29.7 M entries out of range), so a disagreeing model is re-tracked from images.
+    // 部分导出器删除未三角化关键点却保留旧轨迹索引；Hierarchical 3DGS campus 的 2970 万项中有 2660 万越界，因此不一致时从图像重建轨迹。
     auto agrees = [&](uint64_t id, const TrackElement& e) {
         auto it = r.images.find(e.image_id);
         return it != r.images.end() && e.point2D_idx < it->second.point3D_ids.size() &&
@@ -317,4 +300,4 @@ inline Reconstruction Reconstruction::readBinary(const std::string& dir) {
     return r;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

@@ -1,14 +1,5 @@
-// The metric gauge: a Sim(3) from the model's camera centres onto reference
-// positions in metres, with the uncertainty that says whether to trust it.
-//
-// Where Orient.h fixes the gauge from the poses alone -- upright, centred,
-// unit-sized -- this fixes it from an outside measurement, so the written
-// model is in metres and every consumer inherits that for free (D74).
-//
-// The scale and orientation uncertainties are REPORTED, never gated on: they
-// assume uncorrelated noise, and measured against a reference whose error is
-// correlated they under-state it by 3.9-4.5x (D74). What gates is geometry --
-// how far the reference positions spread, and how close to a line they lie.
+// 公制规范用相机中心与米制参考拟合 Sim(3)。尺度和旋转不确定度仅报告，不作接受门限，因为相关参考噪声可使其低估 3.9–4.5 倍。
+// 接受依据是参考空间跨度和是否近共线（D74）。
 #pragma once
 
 #include <cmath>
@@ -31,9 +22,7 @@
 
 namespace sfm {
 
-// Camera centres in the model's own gauge, paired by index with reference
-// positions in metres. `image_ids` is what the caller needs to report; the fit
-// never reads it.
+// 模型相机中心与米制目标按索引配对，image_ids 仅供报告，不参与拟合。
 struct MetricRef {
     std::vector<Vec3> centres;
     std::vector<Vec3> targets;
@@ -42,29 +31,25 @@ struct MetricRef {
 
 enum class MetricFail { None, Pairs, Spread, Inliers, Collinear };
 
-// Which components of the reference carry the gauge. Horizontal reads the
-// level pair and takes the tilt from the caller's own up axis: a GPS altitude
-// biased by metres tips a full fit by degrees over a 100 m capture (D75).
+// 水平模式只用平面位置并沿用已有倾斜；百米采集中的米级 GPS 高度偏差会使完整三维拟合倾斜数度（D75）。
 enum class MetricAxes { Full, Horizontal };
 
 struct MetricFit {
     bool ok = false;
     MetricFail reason = MetricFail::Pairs;
     Sim3 T;
-    int n = 0;                  // paired cameras offered
+    int n = 0;                  // 输入的相机对应数
     int inliers = 0;
-    double max_error = 0;       // metres
-    double rms = 0;             // metres, over the inliers
-    double scale_unc = 0;       // per cent, std(ds/s) -- advisory
-    double rot_unc_deg = 0;     // worst principal axis -- advisory
-    double spread = 0;          // metres, RMS radius of the reference positions
-    double perp_frac = 0;       // spread across the least-resisted axis, over the whole
+    double max_error = 0;       // 米
+    double rms = 0;             // 内点误差，单位米
+    double scale_unc = 0;       // std(ds/s)，百分比，仅供参考
+    double rot_unc_deg = 0;     // 最弱约束主轴的角度不确定度，仅供参考
+    double spread = 0;          // 参考位置的 RMS 半径，单位米
+    double perp_frac = 0;       // 最弱约束轴的横向跨度占整体比例
     std::vector<char> inlier_mask;
 };
 
-// Orientation error grows as 1/perp_frac against scale error, so 0.05 refuses
-// a reference amplifying it beyond 20x -- a starting heuristic, not a bound:
-// the derivation gives the shape, not 20 rather than 10 (D74, one flight).
+// 旋转误差相对尺度误差约按 1/perp_frac 放大，0.05 拒绝超过约二十倍放大的近共线参考；这是单次飞行测量形成的启发值（D74）。
 inline constexpr double kMetricMinPerpFraction = 0.05;
 
 namespace detail {
@@ -75,11 +60,9 @@ inline Vec3 meanOf(const std::vector<Vec3>& v) {
     return v.empty() ? m : m * (1.0 / (double)v.size());
 }
 
-}  // namespace detail
+}  // 命名空间 detail
 
-// The similarity restricted to scale, heading and place: one rotation about
-// +Z, fitted to the level components alone. Flattening the targets and calling
-// estimateSim3 instead would fit a full rotation and tip the model into them.
+// 仅拟合尺度、绕 +Z 航向和位置；不能简单压平目标后使用完整 Sim3，否则会把模型倾斜到目标平面。
 inline bool estimateSim3Yaw(const std::vector<Vec3>& src, const std::vector<Vec3>& dst,
                             Sim3& out) {
     const size_t n = src.size();
@@ -105,9 +88,7 @@ inline bool estimateSim3Yaw(const std::vector<Vec3>& src, const std::vector<Vec3
     return std::isfinite(out.t.x) && std::isfinite(out.t.y) && std::isfinite(out.t.z);
 }
 
-// The similarity taking `ref.centres` onto `ref.targets`, refused with a named
-// reason when the data cannot support one. The inlier radius is `max_error`
-// metres or `max_error_frac` of the reference's RMS radius, whichever is larger.
+// 拟合 centres 到 targets，证据不足时给出拒绝原因；内点半径为绝对米制阈值与参考 RMS 半径比例阈值的较大者。
 inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error,
                                 MetricAxes axes = MetricAxes::Full,
                                 double max_error_frac = 0.0) {
@@ -121,8 +102,7 @@ inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error,
         return out;
     }
 
-    // Reference positions that do not spread out carry no scale to fit, and
-    // every fit to them is an arbitrary one that would pass an RMS gate.
+    // 没有空间跨度的参考不约束尺度，任意拟合都可能通过 RMS 门限，必须拒绝。
     const Vec3 pbar = detail::meanOf(ref.targets);
     double var_t = 0;
     for (const Vec3& p : ref.targets) {
@@ -134,8 +114,7 @@ inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error,
         out.reason = MetricFail::Spread;
         return out;
     }
-    // A capture's own error grows with its extent -- GPS drift, and the
-    // model's own -- so the radius scales with the spread past the floor.
+    // GPS 与模型漂移随范围增大，误差半径在绝对下限之上按跨度缩放。
     max_error = std::max(max_error, max_error_frac * out.spread);
     out.max_error = max_error;
 
@@ -190,8 +169,7 @@ inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error,
     }
     cbar = cbar * (1.0 / (double)m);
     out.rms = std::sqrt(ss / (double)m);
-    // Seven parameters come out of 3m residual components -- four out of the
-    // 2m level ones -- so the noise estimate divides by what is left.
+    // 三维拟合从 3m 残差估七参数，水平从 2m 估四参数，噪声按剩余自由度归一化。
     const double sigma = std::sqrt(ss / (double)(flat ? 2 * m - 4 : 3 * m - 7));
 
     std::vector<double> C(9, 0.0);
@@ -208,9 +186,7 @@ inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error,
     const double tr = lam[0] + lam[1] + lam[2];
 
     out.scale_unc = 100.0 * sigma / (std::sqrt((double)m) * std::sqrt(tr));
-    // Rotation about principal axis k is resisted only by the spread across
-    // it, and none at all makes the angle unidentifiable; the horizontal fit
-    // turns about the vertical alone, which the whole in-plane radius resists.
+    // 绕主轴旋转仅受横向分布约束，无横向跨度则不可观；水平模式只绕竖轴，受整个平面半径约束。
     double worst = 0, perp_min = 0;
     for (int k = 0; k < 3; k++) {
         const double perp = flat ? tr : tr - lam[k];
@@ -221,7 +197,7 @@ inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error,
     out.rot_unc_deg = worst * 180.0 / M_PI;
     out.perp_frac = tr > 0.0 ? std::sqrt(std::max(perp_min, 0.0) / tr) : 0.0;
 
-    // The horizontal fit makes no rotation this can refuse.
+    // 水平拟合不引入此检查针对的倾斜。
     if (!flat && !(out.perp_frac >= kMetricMinPerpFraction)) {
         out.reason = MetricFail::Collinear;
         return out;
@@ -231,16 +207,14 @@ inline MetricFit fitMetricGauge(const MetricRef& ref, double max_error,
     return out;
 }
 
-// What pairing found, so a run can say why it has fewer cameras than either
-// side offered.
+// 配对统计，解释参考与已配准图像为何数量不同。
 struct MetricPairCounts {
     int matched = 0;
-    int unmatched_file = 0;    // positions naming no registered image
-    int unmatched_model = 0;   // registered images with no position
+    int unmatched_file = 0;    // 没有对应已配准图像的参考位置数
+    int unmatched_model = 0;   // 没有参考位置的已配准图像数
 };
 
-// COLMAP's model_aligner --ref_images_path format: `image_name X Y Z` per
-// line, metres, '#' comments, blank lines skipped. `err` names the line.
+// 参考文件采用每行 image_name X Y Z，单位米，支持 # 注释并跳过空行，错误带行号。
 inline bool readMetricPositions(const std::string& path, std::map<std::string, Vec3>& out,
                                 std::string& err) {
     std::ifstream f(path);
@@ -274,9 +248,7 @@ inline bool readMetricPositions(const std::string& path, std::map<std::string, V
     return true;
 }
 
-// Pair registered images to positions on the name the model carries, then on
-// that name without its extension. Never on the basename: two folders holding
-// one file name is a rig capture, not a duplicate.
+// 先按完整模型图像名，再按去扩展名路径配对；不能仅用基本文件名，rig 不同目录常有同名帧。
 inline MetricPairCounts pairMetricRef(const Reconstruction& rec,
                                       const std::map<std::string, Vec3>& positions,
                                       MetricRef& ref) {
@@ -311,8 +283,7 @@ struct Geodetic {
     double lat_deg = 0, lon_deg = 0, alt_m = 0;
 };
 
-// WGS-84 geodetic to earth-centred earth-fixed, in double: ECEF magnitudes are
-// ~6.4e6 m, where a float's half-ulp is 0.25 m.
+// WGS-84 转 ECEF 使用 double，地心坐标约 6.4e6 m，此处 float 的半 ULP 已达 0.25 m。
 inline Vec3 ecefFromGeodetic(double lat_deg, double lon_deg, double h) {
     constexpr double a = 6378137.0, f = 1.0 / 298.257223563;
     constexpr double e2 = f * (2.0 - f);
@@ -322,8 +293,7 @@ inline Vec3 ecefFromGeodetic(double lat_deg, double lon_deg, double h) {
     return {(N + h) * cp * std::cos(l), (N + h) * cp * std::sin(l), (N * (1.0 - e2) + h) * sp};
 }
 
-// A local east-north-up metre frame about `origin`. Right-handed, north
-// positive. Not valid across the antimeridian or over ~100 km.
+// 以 origin 为中心的右手东、北、上米制坐标，北向为正；不适用于跨日界线或约 100 km 以上范围。
 inline std::vector<Vec3> enuFromGeodetic(const std::vector<Geodetic>& g,
                                          const Geodetic& origin) {
     std::vector<Vec3> out;
@@ -342,8 +312,7 @@ inline std::vector<Vec3> enuFromGeodetic(const std::vector<Geodetic>& g,
     return out;
 }
 
-// The same, about the mean of the fixes. The rotation depends on where the
-// origin is, so two origins do not differ by a translation alone.
+// 以定位均值为原点建立同类坐标；原点变化也改变旋转，不只是平移。
 inline std::vector<Vec3> enuFromGeodetic(const std::vector<Geodetic>& g) {
     if (g.empty()) return {};
     Geodetic o;
@@ -360,15 +329,14 @@ inline std::vector<Vec3> enuFromGeodetic(const std::vector<Geodetic>& g) {
 }
 
 
-// What reading GPS off the images found.
+// 图像 EXIF GPS 的读取统计。
 struct MetricGpsCounts {
     int matched = 0;
     int no_gps = 0;
-    int no_alt = 0;   // positioned, but with no altitude: treated as sea level
+    int no_alt = 0;   // 有位置但无高度时按海平面处理
 };
 
-// Reference positions from each registered image's own EXIF, in a local ENU
-// metre frame. Altitude is optional; a fix without one is still a fix.
+// 从已配准图像 EXIF 生成局部 ENU 米制参考，高度可缺省。
 inline MetricGpsCounts metricRefFromGps(const Reconstruction& rec, const std::string& image_dir,
                                         MetricRef& ref) {
     MetricGpsCounts c;
@@ -399,12 +367,10 @@ inline MetricGpsCounts metricRefFromGps(const Reconstruction& rec, const std::st
 }
 
 
-// Angle between the reference frame's +Z and where the cameras themselves say
-// up is. A few degrees on a hand-held or gimballed capture; tens of degrees
-// means a tilted reference or a tilted capture, and says which to look at.
+// 比较参考 +Z 与相机估计向上方向；手持或云台通常仅几度，数十度提示参考或采集倾斜。
 inline double metricUpDisagreementDeg(const Reconstruction& rec) {
     const Sim3 up = uprightTransform(rec);
     return std::acos(std::max(-1.0, std::min(1.0, up.R[8]))) * 180.0 / M_PI;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

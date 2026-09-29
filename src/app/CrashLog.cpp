@@ -1,8 +1,5 @@
-// CrashLog.cpp -- see CrashLog.h.
-//
-// No handler here allocates, formats through the CRT or takes a lock: it runs
-// on a thread that may already hold the heap lock it died inside, and one that
-// deadlocks there writes no report at all.
+// 崩溃报告实现，参见 CrashLog.h。
+// 处理器禁止分配内存、调用 CRT 格式化或加锁：故障线程可能已持有堆锁，再次加锁会死锁，无法写出报告。
 
 #include "app/CrashLog.h"
 
@@ -40,8 +37,7 @@ namespace {
 
 constexpr int kMaxFrames = 64;
 constexpr size_t kBufSize = 32768;
-// A report is a couple of KB and nobody reads the hundredth, so the file
-// starts over rather than growing without bound.
+// 每份报告仅数 KB；覆盖旧文件以避免无限增长。
 constexpr long long kMaxLogBytes = 256 * 1024;
 
 char g_path[1024];
@@ -78,8 +74,7 @@ void put_pad2(int v) {
     put_ch((char)('0' + v % 10));
 }
 
-// UTC from a Unix timestamp by arithmetic (civil_from_days), because
-// localtime/gmtime take a lock and this runs where locks may be held.
+// 用 civil_from_days 算术转换 Unix 时间戳为 UTC；localtime/gmtime 会加锁，不适合崩溃处理器。
 void put_utc(long long t) {
     long long days = t / 86400, secs = t % 86400;
     if (secs < 0) { secs += 86400; days--; }
@@ -108,9 +103,7 @@ const char* basename_of(const char* p) {
     return base;
 }
 
-// ---------------------------------------------------------------------------
-// Stack
-// ---------------------------------------------------------------------------
+// ---------------- 调用栈 ----------------
 
 #ifdef _WIN32
 
@@ -127,8 +120,7 @@ void put_frame(DWORD64 pc) {
     } else {
         put_hex(pc);
     }
-    // Absent without a .pdb beside the executable, which a release build has
-    // no reason to ship: the module+RVA above is what resolves it later.
+    // 没有随程序提供的 .pdb 时无法解析名称；后续可用上述模块名与 RVA 定位。
     alignas(SYMBOL_INFO) char sym[sizeof(SYMBOL_INFO) + 512];
     SYMBOL_INFO* si = (SYMBOL_INFO*)sym;
     si->SizeOfStruct = sizeof(SYMBOL_INFO);
@@ -150,7 +142,7 @@ void put_frame(DWORD64 pc) {
     }
 }
 
-// StackWalk64 writes through the context it is given, so it gets a copy.
+// StackWalk64 会修改传入的上下文，因此必须传副本。
 void put_stack(const CONTEXT* from) {
     CONTEXT ctx = *from;
     STACKFRAME64 sf{};
@@ -221,9 +213,7 @@ void put_stack_here() {
 
 #endif
 
-// ---------------------------------------------------------------------------
-// The report
-// ---------------------------------------------------------------------------
+// ---------------- 报告 ----------------
 
 void begin_report() {
     g_len = 0;
@@ -275,15 +265,14 @@ void end_report() {
         WriteFile(err, g_buf, (DWORD)g_len, &written, nullptr);
     }
 
-    // The whole point for the window: its console is gone by now (GuiMain), so
-    // without this it simply vanishes and the file is never found.
+    // 窗口程序的控制台已释放；必须显示报告位置，否则崩溃只表现为窗口消失。
     if (!g_dialog.load()) return;
     wchar_t text[2048];
     int n = MultiByteToWideChar(CP_UTF8, 0,
                                 spirula::i18n::msg::gui::crash_report_saved.get(),
                                 -1, text, 1024);
     if (n > 0) {
-        n--;                                  // the terminator it counted
+        n--;                                  // 计数包含字符串终止符
         text[n++] = L'\n';
         text[n++] = L'\n';
         MultiByteToWideChar(CP_UTF8, 0, g_path, -1, text + n,
@@ -309,15 +298,12 @@ void end_report() {
 #endif
 }
 
-// One report per process: a fault inside the handler must end the process
-// rather than recurse into it.
+// 每个进程只生成一次报告；处理器内再次故障必须结束进程，避免递归。
 bool claim() {
     return g_armed.load() && !g_busy.test_and_set();
 }
 
-// ---------------------------------------------------------------------------
-// Handlers
-// ---------------------------------------------------------------------------
+// ---------------- 故障处理器 ----------------
 
 void put_exception() {
     if (!std::current_exception()) return;
@@ -340,17 +326,15 @@ void report_uncaught() {
     put_stack_here();
     end_report();
 #ifdef _MSC_VER
-    // std::terminate goes on to abort(), whose CRT dialog would land on top
-    // of the message box end_report() has just shown.
+    // std::terminate 随后会调用 abort()；避免 CRT 对话框叠在 end_report() 的消息框之上。
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
 }
 
 #ifdef _WIN32
 
-// 0xE06D7363 is an MSVC C++ throw, and this filter -- not std::terminate --
-// is where an uncaught one lands, so what() is lost on Windows. Returning
-// CONTINUE_SEARCH to reach terminate instead ends the process with no report.
+// 0xE06D7363 是 MSVC C++ 异常；未捕获异常进入此过滤器而非 std::terminate，无法获取 what()。
+// 返回 CONTINUE_SEARCH 也无法可靠进入 terminate，反而可能不留报告就退出。
 const char* exception_name(DWORD code) {
     switch (code) {
         case 0xE06D7363:                      return "C++ exception";
@@ -386,14 +370,11 @@ LONG WINAPI on_exception(EXCEPTION_POINTERS* info) {
     put("\nstack:\n");
     put_stack(info->ContextRecord);
     end_report();
-    // Our own dialog has been shown; letting this fall through would put
-    // Windows Error Reporting's on top of it.
+    // 应用已显示错误对话框，避免再触发 Windows 错误报告窗口。
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-// The only hook left for a worker thread: std::set_terminate is per-thread in
-// the MSVC CRT, so a std::thread keeps the default handler and dies in a
-// __fastfail the filter above never sees. ucrtbase raises SIGABRT first.
+// MSVC CRT 的 std::set_terminate 按线程生效，工作线程可能通过过滤器看不到的 __fastfail 退出；ucrtbase 之前发出的 SIGABRT 是最后可用的钩子。
 void on_abort(int) {
     if (claim()) {
         begin_report();
@@ -434,15 +415,14 @@ void on_signal(int sig, siginfo_t* info, void*) {
         put_stack_here();
         end_report();
     }
-    // Back to the default disposition so the shell still sees a crash and a
-    // core file can be produced.
+    // 恢复默认信号处理，让 shell 识别崩溃并允许生成核心转储。
     signal(sig, SIG_DFL);
     raise(sig);
 }
 
 #endif
 
-}  // namespace
+}  // 匿名命名空间
 
 
 void set_crash_dialog(bool on) { g_dialog = on; }
@@ -457,7 +437,7 @@ void set_crash_note(const std::string& what) {
         g_note[n] = what[n];
         n++;
     }
-    while (n < sizeof g_note) g_note[n++] = '\0';   // always terminated
+    while (n < sizeof g_note) g_note[n++] = '\0';   // 始终包含终止符
 }
 
 
@@ -478,14 +458,12 @@ void install_crash_log(const std::string& dir) {
     SetUnhandledExceptionFilter(on_exception);
     std::signal(SIGABRT, on_abort);
 #else
-    // backtrace() loads the unwinder on its first call, which allocates; do
-    // that now rather than inside the handler.
+    // backtrace() 首次调用会加载展开器并分配内存，因此在安装处理器时预热。
     void* warm[4];
     (void)backtrace(warm, 4);
 
-    // A stack overflow is the fault most worth a report and the one that
-    // leaves no room on the faulting stack to write one.
-    static char alt[65536];   // SIGSTKSZ is not a constant on current glibc
+    // 栈溢出时原栈已没有空间写报告，必须提供备用信号栈。
+    static char alt[65536];   // 当前 glibc 的 SIGSTKSZ 不是常量
     stack_t ss{};
     ss.ss_sp = alt;
     ss.ss_size = sizeof alt;
@@ -511,4 +489,4 @@ void install_crash_log(const std::string& dir) {
     *(volatile int*)(uintptr_t)8 = 0;
 }
 
-}  // namespace app
+}  // 命名空间 app

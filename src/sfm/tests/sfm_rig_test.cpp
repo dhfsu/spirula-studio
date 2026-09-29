@@ -1,10 +1,4 @@
-// Rig support: the GPU bundle adjustment against the host one on problems
-// whose images share frames and refine member extrinsics, then the mapper on
-// a synthetic two-lens rig (docs/notes/sfm-rig-constraints.md).
-//
-//   sfm_rig_test [--device N] [--real double|df|float]
-//
-// Prints PASS/FAIL per case and returns 0/1. See docs/testing.md.
+// rig 测试比较共享帧、自由外参问题的 GPU 与 CPU BA，再验证合成双镜头增量重建。
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -58,7 +52,7 @@ SolverOptions baseOptions(RealCfg real, int device, bool cg) {
     return o;
 }
 
-// One assembly and one step, device against host, then the whole solve.
+// 先比较单次装配与更新，再比较完整求解。
 void testParity(uint32_t model, uint32_t rig, bool rig_free, bool cg, RealCfg real, int device,
                 double tol, uint32_t rig_mask = kExtAll) {
     const BAProblem base = synth::makeProblem(model, 9, 120, 1, 0.2, 40 + model + 3 * rig, -1,
@@ -66,7 +60,7 @@ void testParity(uint32_t model, uint32_t rig, bool rig_free, bool cg, RealCfg re
     char name[96];
     const char* path = cg ? "cg" : "dense";
 
-    // Assembled S and g (dense path only: the CG path never forms S).
+    // 仅稠密路径显式构造 S/g，CG 不生成 S。
     if (!cg) {
         BAProblem Pg = base, Pc = base;
         SolverOptions og = baseOptions(real, device, false), oc = og;
@@ -86,7 +80,7 @@ void testParity(uint32_t model, uint32_t rig, bool rig_free, bool cg, RealCfg re
         report(name, relMax(sg.debugG(), sc.debugG()), tol);
     }
 
-    // The full solve: same descent, same answer on frames and extrinsics.
+    // 完整求解须具有一致下降行为及帧、外参结果。
     BAProblem Pg = base, Pc = base;
     SolverOptions og = baseOptions(real, device, cg), oc = og;
     oc.real = RealCfg::CPU;
@@ -111,14 +105,14 @@ void testParity(uint32_t model, uint32_t rig, bool rig_free, bool cg, RealCfg re
     }
 }
 
-// ---- which pairs a rig implies ---------------------------------------------
+// ---------------- rig 推导的图像对 ----------------
 
 void testPairSources() {
     using namespace sfm;
     auto has = [](const std::vector<std::pair<uint32_t, uint32_t>>& v, uint32_t a, uint32_t b) {
         return std::binary_search(v.begin(), v.end(), std::make_pair(a, b));
     };
-    // Two folders of 40: the window stays inside each, and reaches 16 and 32.
+    // 两个各四十图文件夹，时间窗口不能跨组，并覆盖 16/32 的指数间隔。
     std::vector<uint32_t> run(80);
     for (uint32_t i = 0; i < 80; i++) run[i] = i / 40;
     const auto seq = sequentialPairs(80, 10, true, run);
@@ -132,7 +126,7 @@ void testPairSources() {
                                                                                            : 1.0,
            0.5);
 
-    // A dual fisheye of three frames: cam0 = images 0..2, cam1 = 3..5.
+    // 三帧双鱼眼，cam0 对应 0..2，cam1 对应 3..5。
     RigDef d;
     d.members = {RigMemberDef{"cam0"}, RigMemberDef{"cam1"}};
     d.kind = "dual-fisheye";
@@ -145,7 +139,7 @@ void testPairSources() {
     report("rig pairs: nothing else", mates.size() == 1 ? 0.0 : 1.0, 0.5);
 }
 
-// ---- the mapper on a rig ---------------------------------------------------
+// ---------------- rig 增量重建 ----------------
 
 sfm::Pose lookAt(const sfm::Vec3& C, const sfm::Vec3& target) {
     using namespace sfm;
@@ -158,13 +152,11 @@ sfm::Pose lookAt(const sfm::Vec3& C, const sfm::Vec3& target) {
     return {R, {-t.x, -t.y, -t.z}};
 }
 
-// Two lenses on an arc: cam0 looks at the origin, cam1 sits on it turned
-// 22 deg and offset; the last frames' cam1 sees nothing (a lens on the sky),
-// so only the rig can place them.
+// 圆弧双镜头，cam1 相对 cam0 旋转 22 度并平移；末帧 cam1 看不到结构，只能由 rig 定位。
 struct RigScene {
     int W = 1280, H = 960, M = 10, N = 260, blind_from = 7;
-    sfm::Pose ext;                     // cam1_from_cam0, the truth
-    std::vector<sfm::Pose> gt;         // by image id: cam0 = f, cam1 = M + f
+    sfm::Pose ext;                     // cam1_from_cam0 的真值
+    std::vector<sfm::Pose> gt;         // 图像编号：cam0=f，cam1=M+f
     std::vector<sfm::Vec3> pts;
     std::vector<sfm::FeatureSet> feats;
     sfm::MatchesDatabase db;
@@ -255,7 +247,7 @@ void testMapperRig(int device) {
     report("rig: blind lenses placed by the rig",
            blind_reg == (size_t)(sc.M - sc.blind_from) ? 0.0 : 1.0, 0.5);
 
-    // The calibration: rotation against the truth, and rigidity across frames.
+    // 比较标定旋转真值及跨帧刚性。
     double rot_err = 180, rigid = 0;
     if (rec.rigs.size() == 1 && rec.rigs[0].ref >= 0 && rec.rigs[0].usable(1 - rec.rigs[0].ref)) {
         const RigCalib& c = rec.rigs[0];
@@ -274,7 +266,7 @@ void testMapperRig(int device) {
     report("rig: extrinsic rotation", rot_err, 0.2);
     report("rig: rigid across frames", rigid, 1e-3);
 
-    // Pose accuracy of every image against the truth, through one similarity.
+    // 通过一个相似变换比较全部图像位姿与真值。
     std::vector<Pose> src, dst;
     for (int i = 0; i < n; i++) {
         auto it = rec.images.find(i);
@@ -294,7 +286,7 @@ void testMapperRig(int device) {
     printf("  worst absolute rotation error %.3f deg over %zu images\n", worst, src.size());
     report("rig: poses against the truth", worst, 0.3);
 
-    // The same capture with the rig ignored leaves the blind lenses out.
+    // 忽略 rig 时应漏掉无自身观测的镜头。
     MapperOptions plain = opt;
     plain.use_rigs = false;
     Mapper flat(sc.db, sc.feats, plain, sc.cam_ids, &rigs);
@@ -303,7 +295,7 @@ void testMapperRig(int device) {
     report("rig: the rig adds coverage",
            pm.front().numRegistered() < rec.numRegistered() ? 0.0 : 1.0, 0.5);
 
-    // The final free refinement keeps every image and stays near the rig.
+    // 最终解除 rig 精化仍应保留全部图像并接近刚性关系。
     Reconstruction freed = mapper.releaseRigs(rec);
     double drift = 0;
     for (int f = 0; f < sc.blind_from; f++) {
@@ -318,7 +310,7 @@ void testMapperRig(int device) {
     report("rig: released poses stay put", drift, 0.5);
 }
 
-// Two models that share no image -- one lens each -- align through the rig.
+// 各持一个镜头、没有共同图像的两模型应通过 rig 对齐。
 void testRigAlignment() {
     using namespace sfm;
     RigScene sc = makeRigScene();
@@ -410,22 +402,20 @@ int run(int argc, char** argv) {
     if (got != real)
         printf("  note: '%s' is not supported here; running '%s'\n", realCfgName(real),
                realCfgName(got));
-    // fp64 kernels and the host agree on S and g to ~1e-7, not to rounding
-    // (measured the same on rig-free problems before rigs existed); the
-    // emulated pair and fp32 leave more.
+    // fp64 设备与主机 S/g 差异约 1e-7，非仅舍入级；df 和 fp32 误差更大。
     const double tol = got == RealCfg::F64 ? 1e-5 : got == RealCfg::DF64 ? 1e-4 : 1e-3;
 
     for (uint32_t rig : {2u, 3u}) {
         testParity(3, rig, true, false, got, device, tol);
         testParity(3, rig, false, false, got, device, tol);
-        testParity(7, rig, true, false, got, device, tol);   // full_opencv: dof 24
+        testParity(7, rig, true, false, got, device, tol);   // full_opencv，24 自由度
         testParity(6, rig, true, true, got, device, tol);
         testParity(3, rig, true, true, got, device, tol);
         testParity(6, rig, true, false, got, device, tol, 0x27);
         testParity(6, rig, true, true, got, device, tol, 0x27);
         testParity(3, rig, true, false, got, device, tol, 0x20);
     }
-    // The rig-free problem still takes the plain kernels.
+    // 无 rig 问题仍使用普通内核。
     testParity(3, 0, true, false, got, device, tol);
     testParity(3, 0, true, true, got, device, tol);
 
@@ -437,6 +427,6 @@ int run(int argc, char** argv) {
     return g_fail ? 1 : 0;
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 int main(int argc, char** argv) { return sfmTestMain(argc, argv, run); }

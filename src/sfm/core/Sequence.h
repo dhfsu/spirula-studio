@@ -1,9 +1,5 @@
-// Image sequences: ranges of images the user says were taken in file-name
-// order (a video's frames, a folder shot in a walk). The mapper trusts the
-// correspondences between neighbours in a sequence before any other
-// (map/Mapper.h, D79). A definition names path prefixes exactly as a rig
-// does; images under them with the same path share one position, so a rig's
-// lenses are one sequence.
+// 图像序列按用户声明的文件名顺序排列，建图优先信任相邻对应（D79）。
+// 成员按 rig 相同的前缀规则定义，同相对路径共享一个序列位置，使多镜头属于同一时序。
 #pragma once
 
 #include <algorithm>
@@ -22,10 +18,10 @@ namespace sfm {
 constexpr int32_t kNoSequence = -1;
 
 struct SequenceDef {
-    std::vector<std::string> members;   // path prefixes; "" is the whole dataset
+    std::vector<std::string> members;   // 路径前缀，空值覆盖整个数据集
 };
 
-// `--sequence PREFIX[,PREFIX...]`; "." names the image directory itself.
+// --sequence PREFIX[,PREFIX...]；点号表示图像根目录。
 inline std::string parseSequenceArg(const std::string& arg, SequenceDef& out) {
     out = SequenceDef{};
     size_t i = 0;
@@ -43,28 +39,26 @@ inline std::string parseSequenceArg(const std::string& arg, SequenceDef& out) {
     return {};
 }
 
-// Per image: which sequence it is in, its position (rank of its path under the
-// member prefix, among the distinct paths of the sequence) and its member.
+// 逐图像保存所属序列、成员及相对路径在序列不同路径中的排序位置。
 struct SequenceTable {
-    std::vector<int32_t> seq;      // kNoSequence outside every sequence
+    std::vector<int32_t> seq;      // 不属于任何序列时为 kNoSequence
     std::vector<int32_t> pos;
     std::vector<int32_t> member;
-    std::vector<uint32_t> length;  // positions per sequence
+    std::vector<uint32_t> length;  // 每序列的位置数量
     std::vector<std::vector<std::string>> members;
 
     bool empty() const { return length.empty(); }
     bool has(uint32_t img) const { return img < seq.size() && seq[img] != kNoSequence; }
     int32_t sequenceOf(uint32_t img) const { return has(img) ? seq[img] : kNoSequence; }
 
-    // Positions apart along one sequence; INT_MAX when not in the same one.
+    // 同序列中的位置距离，不同序列返回 INT_MAX。
     int distance(uint32_t a, uint32_t b) const {
         if (!has(a) || !has(b) || seq[a] != seq[b]) return INT_MAX;
         return std::abs(pos[a] - pos[b]);
     }
     bool nearby(uint32_t a, uint32_t b, int window) const { return distance(a, b) <= window; }
 
-    // The same sequences over a sub-database (map/Atoms.h): positions are kept,
-    // so a window means the same thing inside an atom.
+    // 映射到原子子数据库时保留原位置，使时间窗口含义不变。
     SequenceTable subset(const std::vector<uint32_t>& local, size_t num_local) const {
         SequenceTable out;
         out.length = length;
@@ -82,9 +76,7 @@ struct SequenceTable {
     }
 };
 
-// Resolve definitions against image names (by id). The longest member prefix
-// wins within a sequence; an image in two sequences, or a member matching no
-// image, is an error.
+// 按图像名解析序列，最长成员前缀优先；图像重复归属或成员无匹配图像时报错。
 inline SequenceTable buildSequenceTable(const std::vector<std::string>& names,
                                         const std::vector<SequenceDef>& defs) {
     SequenceTable out;
@@ -130,4 +122,4 @@ inline SequenceTable buildSequenceTable(const std::vector<std::string>& names,
     return out;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

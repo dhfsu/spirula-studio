@@ -1,37 +1,31 @@
-// Generalized P3P: a camera rig's pose from three 2D-3D correspondences its
-// members contribute between them, each ray free to start at its own lens
-// (docs/notes/sfm-rig-constraints.md). Rays are given in the rig's frame, the
-// world point of ray i sitting at o_i + lambda_i * d_i, and the poses returned
-// are rig_from_world. Three rays through one point is P3P, which this defers to
-// -- a rig whose members share an optical centre has no baseline to use.
+// 广义 P3P 用 rig 各镜头共同提供的三组对应估计 rig_from_world；射线在 rig 系中为 o_i+lambda_i*d_i。
+// 射线共心时没有广义基线，退回普通 P3P。
 #pragma once
 
 #include <array>
 #include <cmath>
 #include <vector>
 
-#include "sfm/geometry/Essential.h"  // Pose, nearestRotation
+#include "sfm/geometry/Essential.h"  // 使用 Pose 与 nearestRotation
 #include "sfm/geometry/LinAlg.h"
 #include "sfm/geometry/P3P.h"
 
 namespace sfm {
 
-// One ray of a generalized camera, in the rig's frame.
+// rig 坐标系中的广义相机射线。
 struct RigRay {
-    Vec3 o;  // the member's centre
-    Vec3 d;  // unit direction
+    Vec3 o;  // 成员镜头中心
+    Vec3 d;  // 单位方向
 };
 
 namespace gp3p_detail {
 
-// lambda_i^2 + lambda_j^2 - 2c li lj + 2p li - 2q lj + e = 0, one per point
-// pair: the pair's distance in the world, seen along two rays.
+// 每点对满足 lambda_i^2+lambda_j^2-2c li lj+2p li-2q lj+e=0，由世界点距与两条射线共同确定。
 struct PairEq {
     double c = 0, p = 0, q = 0, e = 0;
 };
 
-// Dense coefficients of a polynomial in the hidden depth, low order first.
-// Degree 8 is the whole elimination, so the array never grows.
+// 隐藏深度多项式的稠密系数，低次在前；完整消元最高八次，数组固定大小。
 struct Poly {
     double c[9] = {0};
     int n = 0;
@@ -78,9 +72,7 @@ inline Poly subP(const Poly& a, const Poly& b) {
     return r;
 }
 
-// Real roots by Aberth-Ehrlich, the variable rescaled by the geometric mean of
-// the root magnitudes: the depths are tens of times the triangle they span, so
-// the raw octic spans 10^10 and 7% of samples came back with no root at all.
+// 用 Aberth-Ehrlich 求实根，按根模长几何平均缩放变量；原始八次系数跨度可达 10^10，未缩放时约 7% 样本丢失全部根。
 inline int realRoots(const Poly& poly, double* out, double imag_tol = 1e-4) {
     double amax = 0;
     for (int i = 0; i <= poly.n; i++) amax = std::max(amax, std::fabs(poly.c[i]));
@@ -147,9 +139,7 @@ inline int realRoots(const Poly& poly, double* out, double imag_tol = 1e-4) {
         zi[k] = std::sin(th);
         done[k] = false;
     }
-    // Retiring roots one at a time, rather than waiting for the worst of them:
-    // a near-double pair trades its last bit back and forth forever, and that
-    // was 45% of samples running the whole iteration budget for nothing.
+    // 逐根停止迭代，避免近重根在最低位往返震荡；统一等待最慢根曾使 45% 样本耗尽迭代预算。
     for (int it = 0; it < 40; it++) {
         int live = 0;
         for (int k = 0; k < n; k++) {
@@ -195,9 +185,7 @@ inline double eqResidual(const PairEq& q, double li, double lj) {
     return li * li + lj * lj - 2 * q.c * li * lj + 2 * q.p * li - 2 * q.q * lj + q.e;
 }
 
-// Newton on the three distance equations, returning the residual it reached
-// relative to the depths' size: the elimination's root is only as exact as an
-// octic with near-coincident roots allows, and this is what makes it a pose.
+// 对三个距离方程做 Newton 精化，返回相对深度尺度的残差，补偿近重根八次多项式的有限精度。
 inline double polishLambdas(const PairEq eq[3], double l[3]) {
     static const int I[3] = {0, 0, 1}, J[3] = {1, 2, 2};
     double r[3] = {0, 0, 0};
@@ -227,7 +215,7 @@ inline double polishLambdas(const PairEq eq[3], double l[3]) {
     return sum / (1.0 + l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
 }
 
-}  // namespace gp3p_detail
+}  // 命名空间 gp3p_detail
 
 inline std::vector<Pose> gp3p(const std::array<RigRay, 3>& rays, const std::array<Vec3, 3>& X) {
     using namespace gp3p_detail;
@@ -247,8 +235,7 @@ inline std::vector<Pose> gp3p(const std::array<RigRay, 3>& rays, const std::arra
     for (int i = 0; i < 3; i++)
         for (int j = i + 1; j < 3; j++) baseline = std::max(baseline, (o[i] - o[j]).norm());
 
-    // Concurrent rays carry no baseline: the generalized problem is P3P about
-    // their shared centre, and the octic below is degenerate there.
+    // 共点射线无基线，八次消元退化，应在公共中心使用普通 P3P。
     if (baseline < 1e-5) {
         const Vec3 centre = (rays[0].o + rays[1].o + rays[2].o) * (1.0 / 3.0);
         out = p3p({d[0], d[1], d[2]}, X);
@@ -267,9 +254,7 @@ inline std::vector<Pose> gp3p(const std::array<RigRay, 3>& rays, const std::arra
         eq[k].e = u.dot(u) - dist[k] * dist[k];
     }
 
-    // Hiding lambda_0: eq[0] and eq[1] are monic quadratics in lambda_1 and
-    // lambda_2, and reducing eq[2] by them leaves a bilinear relation, so
-    // lambda_2 is a ratio in lambda_1 and one resultant ends the elimination.
+    // 隐藏 lambda_0 后，前两方程分别是 lambda_1/lambda_2 的首一二次式；约简第三式得到双线性关系，再用结式消元。
     const Poly b1 = polyL(-2 * eq[0].q, -2 * eq[0].c);
     const Poly c1 = polyQ(eq[0].e, 2 * eq[0].p, 1);
     const Poly b2 = polyL(-2 * eq[1].q, -2 * eq[1].c);
@@ -279,8 +264,7 @@ inline std::vector<Pose> gp3p(const std::array<RigRay, 3>& rays, const std::arra
     const Poly C = polyL(-2 * eq[2].q + 2 * eq[1].q, 2 * eq[1].c);
     const Poly D = polyQ(eq[2].e - eq[0].e - eq[1].e, -2 * (eq[0].p + eq[1].p), -2);
 
-    // (B l1 + D)^2 - b2 (B l1 + D)(A l1 + C) + c2 (A l1 + C)^2, a quadratic in
-    // lambda_1 that eq[0] must share a root with.
+    // (B l1+D)^2-b2(B l1+D)(A l1+C)+c2(A l1+C)^2 为 lambda_1 二次式，须与 eq[0] 有共同根。
     const Poly alpha = addP(subP(mulP(B, B), mulP(mulP(b2, A), B)), mulP(c2, mulP(A, A)));
     const Poly beta = addP(subP(mulP(polyC(2), mulP(B, D)),
                                 mulP(b2, addP(mulP(B, C), mulP(D, A)))),
@@ -303,8 +287,7 @@ inline std::vector<Pose> gp3p(const std::array<RigRay, 3>& rays, const std::arra
         if (!(l0 > 1e-9) || !std::isfinite(l0)) continue;
         const double bb1 = b1.c[0] + b1.c[1] * l0, cc1 = c1.c[0] + l0 * (c1.c[1] + l0);
         const double bb2 = b2.c[0] + b2.c[1] * l0, cc2 = c2.c[0] + l0 * (c2.c[1] + l0);
-        // A double root sits where the discriminant does: rounding puts it just
-        // below zero as often as just above, and Newton recovers either way.
+        // 重根判别式接近零，舍入可使其略正或略负，后续 Newton 均可恢复。
         const double disc1 = bb1 * bb1 - 4 * cc1, disc2 = bb2 * bb2 - 4 * cc2;
         if (disc1 < -1e-8 || disc2 < -1e-8) continue;
         const double s1 = std::sqrt(std::max(disc1, 0.0)), s2 = std::sqrt(std::max(disc2, 0.0));
@@ -340,4 +323,4 @@ inline std::vector<Pose> gp3p(const std::array<RigRay, 3>& rays, const std::arra
     return out;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

@@ -1,5 +1,4 @@
-// Telemetry: the four carriers on synthetic files, and the checks on
-// synthetic readings. With file arguments it prints what each file carries.
+// 遥测测试覆盖四类合成容器与读数检查，给定文件参数时打印其内容诊断。
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,9 +22,7 @@ static void check(bool ok, const std::string& what) {
 
 static bool near(double a, double b, double tol) { return std::fabs(a - b) <= tol; }
 
-// ================
-// Byte builders
-// ================
+// ================ 字节构造器 ================
 
 using Bytes = std::vector<uint8_t>;
 
@@ -67,7 +64,7 @@ struct TrackSpec {
     std::vector<Bytes> samples;
 };
 
-// ftyp, mdat (every track's samples in order), moov.
+// 依次构造 ftyp、各轨道样本的 mdat、moov。
 static Bytes build_mp4(const std::vector<TrackSpec>& tracks, uint32_t mv_timescale,
                        uint32_t mv_duration, uint32_t creation_1904) {
     Bytes ftyp_p;
@@ -128,7 +125,7 @@ static Bytes build_mp4(const std::vector<TrackSpec>& tracks, uint32_t mv_timesca
     return out;
 }
 
-// GPMF key-length-value; payload padded to 4.
+// GPMF 键、长度、值，载荷补齐到四字节。
 static Bytes klv(const char* key, char type, uint8_t size, uint16_t repeat, const Bytes& data) {
     Bytes b;
     put_str(b, key); put_u8(b, (uint8_t)type); put_u8(b, size); put_be16(b, repeat);
@@ -142,7 +139,7 @@ static Bytes klv_str(const char* key, const char* s) {
 }
 static Bytes klv_nest(const char* key, const Bytes& inner) { return klv(key, 0, 1, (uint16_t)inner.size(), inner); }
 
-// Protobuf fields.
+// Protobuf 字段。
 static void pb_varint(Bytes& b, uint64_t v) {
     while (v >= 0x80) { b.push_back((uint8_t)(v | 0x80)); v >>= 7; }
     b.push_back((uint8_t)v);
@@ -154,9 +151,7 @@ static Bytes pb_bytes(uint32_t num, const Bytes& v) { Bytes b; pb_varint(b, (num
 static Bytes pb_str(uint32_t num, const char* s) { Bytes v; put_str(v, s); return pb_bytes(num, v); }
 static Bytes cat(std::initializer_list<Bytes> parts) { Bytes b; for (const Bytes& p : parts) put_raw(b, p); return b; }
 
-// ================
-// Carriers
-// ================
+// ================ 遥测载体 ================
 
 static void test_camm() {
     TrackSpec t{"camm", "camm", "CAMM", 1000, 100, {}};
@@ -236,7 +231,7 @@ static void test_gpmf() {
     check(tm.camera == "GoPro Max", "gpmf: camera name");
     check(tm.accel.size() == 8, "gpmf: 8 accel readings");
     if (tm.accel.size() == 8) {
-        // ORIN XzY: x = col0, z = -col1, y = col2; SCAL 417.
+        // ORIN=XzY 表示 x=col0，z=-col1，y=col2，SCAL=417。
         check(near(tm.accel[0].x, 100.0 / 417, 1e-9) && near(tm.accel[0].y, 4170.0 / 417, 1e-9) &&
               near(tm.accel[0].z, -200.0 / 417, 1e-9), "gpmf: ORIN and SCAL");
         check(near(tm.accel[0].t, 0.0, 1e-9) && near(tm.accel[1].t, 0.25, 1e-9) && near(tm.accel[5].t, 1.25, 1e-9),
@@ -280,8 +275,8 @@ static void test_insta360(bool raw) {
     for (int i = 0; i < 3; i++) {
         if (raw) {
             put_le64(gyro, 1000000 + 1000ull * i);
-            put_le16(gyro, 32768); put_le16(gyro, 32768); put_le16(gyro, 32768 + 2048);   // 1 g on z
-            put_le16(gyro, 32768 + 1638); put_le16(gyro, 32768); put_le16(gyro, 32768);   // ~100 deg/s on x
+            put_le16(gyro, 32768); put_le16(gyro, 32768); put_le16(gyro, 32768 + 2048);   // z 轴一个 g
+            put_le16(gyro, 32768 + 1638); put_le16(gyro, 32768); put_le16(gyro, 32768);   // x 轴约每秒 100 度
         } else {
             put_le64(gyro, 1000 + i);
             put_lef64(gyro, 0); put_lef64(gyro, 0); put_lef64(gyro, 1.0);
@@ -360,18 +355,15 @@ static void test_dji() {
     check(tm.gps.empty(), "dji: no gps");
 }
 
-// ================
-// Checks
-// ================
+// ================ 检查 ================
 
 static void test_checks() {
     Telemetry tm;
     tm.video_duration = 10;
     for (int i = 0; i < 1000; i++) {
         const double t = i * 0.01;
-        const double th = 0.3 * std::sin(t);   // rocking about x
-        // q maps sensor->world; the accelerometer reads world up (0,0,g)
-        // brought into the sensor frame.
+        const double th = 0.3 * std::sin(t);   // 绕 x 摇摆
+        // q 将传感器映到世界，加速度为世界 (0,0,g) 转回传感器坐标。
         tm.orientation.push_back({t, std::cos(th / 2), std::sin(th / 2), 0, 0});
         tm.accel.push_back({t, 0, 9.80665 * std::sin(th), 9.80665 * std::cos(th)});
         tm.gyro.push_back({t, 0.3 * std::cos(t), 0, 0});
@@ -385,8 +377,7 @@ static void test_checks() {
     check(c.gps_usable && c.gps_frozen_fraction == 0 && c.gps_spread_m > 5, "check: moving GPS usable");
     check(c.warnings.empty(), "check: no warnings on clean data");
 
-    // A 1 Hz receiver logged at 10 Hz repeats 90% of its samples and is fine;
-    // one jump of a kilometre is not.
+    // 1 Hz 接收器以 10 Hz 记录导致 90% 重复是正常的，单次跳跃一公里则异常。
     Telemetry slow = tm;
     slow.gps.clear();
     for (int i = 0; i < 100; i++) slow.gps.push_back({i * 0.1, 0, 43.5 + (i / 10) * 1e-4, -79.4, 100, true, true, 1.0, 0, 1});
@@ -395,12 +386,12 @@ static void test_checks() {
     check(c.gps_usable && c.gps_distinct == 12 && c.gps_outliers == 1 && near(c.gps_longest_hold, 0.9, 1e-6),
           "check: slow receiver kept, jump dropped");
 
-    // The other quaternion sense.
+    // 相反四元数变换方向。
     for (TelemetryQuat& q : tm.orientation) { q.x = -q.x; }
     c = telemetry_check(tm);
     check(c.accel_in_world_spread_deg < 0.5 && !c.attitude_is_sensor_to_world, "check: conjugate sense found");
 
-    // A stale fix repeated, in g, with a gap.
+    // 重复陈旧定位、以 g 为单位的加速度及时间缺口。
     Telemetry bad;
     bad.video_duration = 10;
     for (int i = 0; i < 500; i++) {
@@ -435,11 +426,9 @@ static void test_rejects() {
           "an MP4 without telemetry reads as empty, not as an error (" + err + ")");
 }
 
-// ================
-// Entry
-// ================
+// ================ 测试入口 ================
 
-// `--head N` also prints the first N readings of every stream.
+// --head N 额外打印各流前 N 条读数。
 static void print_head(const Telemetry& tm, int n) {
     auto vecs = [&](const char* name, const std::vector<TelemetryVec>& v) {
         for (int i = 0; i < n && i < (int)v.size(); i++)

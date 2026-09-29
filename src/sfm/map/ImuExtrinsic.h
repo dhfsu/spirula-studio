@@ -1,11 +1,7 @@
 #pragma once
-// The rotation from a video's IMU frame into one lens, calibrated from the
-// reconstruction itself: relative rotations the gyro integrated must equal
-// the ones the poses show (a hand-eye problem, A X = X B), and the gravity
-// direction each frame measures must land on one world vector. Both are
-// linear in the nine entries of X, so the answer is a null vector projected
-// onto the orthogonal matrices. Also the IMU clock offset and the robust up
-// consensus, which are the two other things a gauge fix needs from the IMU.
+// 通过重建标定视频 IMU 到镜头的旋转：陀螺积分与相机位姿的相对旋转满足手眼约束 A X = X B，各帧重力方向需映射到同一世界向量。
+// 两类约束对 X 的九个元素均为线性，求零空间向量后投影到正交矩阵。
+// 同时估计规范对齐所需的 IMU 时钟偏移与稳健向上方向。
 
 #include <algorithm>
 #include <cmath>
@@ -19,15 +15,15 @@
 
 namespace sfm {
 
-// One registered image with a time on its capture's clock.
+// 已配准图像，时间采用所属采集序列的时钟。
 struct SensorFrame {
     uint32_t image_id = 0;
     double t = 0;
-    Mat3 R;      // world -> camera
-    Vec3 c;      // camera centre, model units
-    int group = 0;     // lens: one IMU-to-camera rotation per group
-    int capture = 0;   // which timeline
-    UpVote up;         // in the IMU frame, at t
+    Mat3 R;      // 世界坐标系 -> 相机坐标系
+    Vec3 c;      // 相机中心，单位为模型单位
+    int group = 0;     // 镜头分组；每组一个 IMU 到相机的旋转
+    int capture = 0;   // 所属时间线
+    UpVote up;         // t 时刻的 IMU 坐标系向量
 };
 
 enum class ExtrinsicFail { None, Frames, Pairs, Disagree, NoStream, Degenerate };
@@ -35,22 +31,21 @@ enum class ExtrinsicFail { None, Frames, Pairs, Disagree, NoStream, Degenerate }
 struct ExtrinsicFit {
     bool ok = false;
     ExtrinsicFail reason = ExtrinsicFail::None;
-    Mat3 R_ci = mat3Identity();   // camera <- IMU; det -1 when the IMU axes are left-handed
+    Mat3 R_ci = mat3Identity();   // 相机 <- IMU；IMU 轴为左手系时 det = -1
     bool mirrored = false;
-    // Rotation mostly about one axis leaves X free about it: up still
-    // holds after the sign is settled, but pre-integrated positions do not.
+    // 运动主要绕单轴旋转时，X 绕该轴的自由度不可观；确定符号后仍能使用向上方向，但不能使用预积分位置。
     bool degenerate = false;
-    double gyro_sign = 1.0;       // the integration sign that fit
+    double gyro_sign = 1.0;       // 拟合采用的积分符号
     int frames = 0, rot_pairs = 0, grav_pairs = 0;
-    double rms = 0;               // weighted residual, in sigmas
-    double sig_rot_deg = 0, sig_grav_deg = 0;   // the noise each family showed
-    double gap = 0;               // second-smallest over smallest eigenvalue
-    Vec3 sigma_deg;               // per axis of a perturbation X Exp(d)
+    double rms = 0;               // 加权残差，以标准差为单位
+    double sig_rot_deg = 0, sig_grav_deg = 0;   // 各类约束估计出的噪声
+    double gap = 0;               // 次小特征值与最小特征值之比
+    Vec3 sigma_deg;               // 扰动 X Exp(d) 的逐轴不确定度
 };
 
 namespace extrinsic_detail {
 
-// Rows of M with M vec(X) = R X a, vec row-major.
+// 满足 M vec(X) = R X a 的 M 各行；vec 按行展开。
 inline void rowsRXa(const Mat3& R, const Vec3& a, double sign, std::vector<double>& rows) {
     const double av[3] = {a.x, a.y, a.z};
     for (int r = 0; r < 3; r++) {
@@ -61,7 +56,7 @@ inline void rowsRXa(const Mat3& R, const Vec3& a, double sign, std::vector<doubl
     }
 }
 
-// Rows of M with M vec(X) = vec(A X - X B).
+// 满足 M vec(X) = vec(A X - X B) 的 M 各行。
 inline void rowsAXminusXB(const Mat3& A, const Mat3& B, std::vector<double>& rows) {
     for (int r = 0; r < 3; r++)
         for (int c = 0; c < 3; c++) {
@@ -72,8 +67,7 @@ inline void rowsAXminusXB(const Mat3& A, const Mat3& B, std::vector<double>& row
         }
 }
 
-// Nearest orthogonal matrix, keeping whichever determinant sign the polar
-// factor has: the constraints cannot tell X from -X, so the caller decides.
+// 最近正交矩阵，保留极分解因子的行列式符号；约束无法区分 X 与 -X，由调用方决定。
 inline Mat3 nearestOrthogonal(const Mat3& X) {
     const Svd3 s = svd3(X);
     return mul(s.U, transpose(s.V));
@@ -96,10 +90,10 @@ inline double medianOf(std::vector<double> v) {
 }
 
 struct Constraint {
-    std::vector<double> rows;   // 9 columns each
+    std::vector<double> rows;   // 每行 9 列
     int nrows = 0;
-    Mat3 A, B;    // rotation pair
-    Mat3 Rj, Rk;  // gravity pair
+    Mat3 A, B;    // 旋转对
+    Mat3 Rj, Rk;  // 重力对
     Vec3 aj, ak;
     bool gravity = false;
     double w = 1;
@@ -134,10 +128,9 @@ inline Mat3 solveNullSpace(const std::vector<Constraint>& cs, double& lam0, doub
     return nearestOrthogonal(X);
 }
 
-}  // namespace extrinsic_detail
+}  // 命名空间 extrinsic_detail
 
-// A relative camera rotation between two instants: A = R(t0) R(t1)^T over
-// world -> camera rotations, from a model's poses or from a verified pair.
+// 两时刻间的相机相对旋转 A = R(t0) R(t1)^T；R 为世界到相机的旋转，来自模型位姿或已验证图像对。
 struct RotationPairObs {
     double t0 = 0, t1 = 0;
     Mat3 A;
@@ -154,9 +147,7 @@ inline std::vector<RotationPairObs> consecutiveRotationPairs(const std::vector<S
     return out;
 }
 
-// The hand-eye problem over `rot`, plus gravity pairs from the `frames` that
-// carry up votes and poses (empty before mapping, when only two-view
-// rotations exist). `mean_up_w` settles the sign the constraints leave open.
+// 联合 rot 的手眼约束与 frames 的重力、位姿约束；建图前仅有双视图旋转，frames 可为空。mean_up_w 确定约束未定的符号。
 inline ExtrinsicFit calibrateImuExtrinsicFrom(const std::vector<RotationPairObs>& rot,
                                               const std::vector<SensorFrame>& frames,
                                               const SensorTimeline& tl, const Vec3& mean_up_w) {
@@ -216,9 +207,7 @@ inline ExtrinsicFit calibrateImuExtrinsicFrom(const std::vector<RotationPairObs>
             continue;
         }
 
-        // A gyro pair holds to a tenth of a degree, a gravity vote to a few:
-        // one shared gate would let the votes drown the pairs, so each family
-        // has its own sigma and the weights carry 1/sigma^2.
+        // 陀螺旋转对精度约十分之一度，重力投票误差为数度；各类约束分别估计 sigma，并按 1/sigma^2 加权，避免重力投票淹没旋转约束。
         Mat3 X = mat3Identity();
         double lam0 = 0, lam1 = 0, trace = 0, rms = 0, sig_rot = 1, sig_grav = 1;
         for (int round = 0; round < 6; round++) {
@@ -239,10 +228,9 @@ inline ExtrinsicFit calibrateImuExtrinsicFrom(const std::vector<RotationPairObs>
                 ss += huber * r * r;
                 sw += huber;
             }
-            rms = sw > 0 ? std::sqrt(ss / sw) : 0;   // in sigmas
+            rms = sw > 0 ? std::sqrt(ss / sw) : 0;   // 以标准差为单位
         }
-        // Hypotheses compare on the pairs' own residual in degrees: a sigma
-        // scaled up to fit everything would otherwise win on rms alone.
+        // 使用旋转对自身以度为单位的残差比较假设，避免放大 sigma 的假设仅凭较小归一化 RMS 胜出。
         const double score = rot_pairs > 0 ? sig_rot : sig_grav;
         if (rot_pairs > 0 ? sig_rot > 5.0 : sig_grav > 10.0) {
             if (fail != ExtrinsicFail::Degenerate) fail = ExtrinsicFail::Disagree;
@@ -252,8 +240,7 @@ inline ExtrinsicFit calibrateImuExtrinsicFrom(const std::vector<RotationPairObs>
             fail = ExtrinsicFail::Degenerate;
             continue;
         }
-        // Rotation about one axis alone cannot tell the two signs apart, so
-        // the negated one has to win clearly, not by noise.
+        // 单轴旋转无法区分两种符号；取反假设必须明显更优，不能仅凭噪声胜出。
         if (best.ok && score >= 0.7 * best_score) continue;
         best_score = score;
 
@@ -268,16 +255,14 @@ inline ExtrinsicFit calibrateImuExtrinsicFrom(const std::vector<RotationPairObs>
         f.gyro_sign = sign;
         f.gap = lam1 / std::max(lam0, 1e-12 * trace);
         f.degenerate = f.gap < 3.0;
-        // The sign: votes through X must agree with the cameras' mean up.
-        // Rotation pairs alone cannot tell X from -X; that is left for a
-        // caller with poses (SensorPriors.h settles it per model).
+        // 经 X 变换的投票须与相机平均向上方向一致；仅靠旋转对不能区分 X 与 -X，需由具备位姿的调用方确定，SensorPriors.h 按模型处理。
         double agree = 0;
         for (const SensorFrame& fr : frames)
             if (fr.up.ok) agree += mul(transpose(fr.R), mul(X, fr.up.up)).dot(mean_up_w);
         if (agree < 0) X = mat3Scale(X, -1.0);
         f.R_ci = X;
         f.mirrored = det3(X) < 0;
-        // Per-axis uncertainty of X Exp(d) from the weighted residual curvature.
+        // 由加权残差曲率估计 X Exp(d) 的逐轴不确定度。
         std::vector<double> H(9, 0.0);
         const double h = 1e-3;
         for (const Constraint& c : cs) {
@@ -308,7 +293,7 @@ inline ExtrinsicFit calibrateImuExtrinsicFrom(const std::vector<RotationPairObs>
     return best;
 }
 
-// `frames` is one group, time-sorted, with up votes filled in.
+// frames 属于同一组，已按时间排序并填入向上方向投票。
 inline ExtrinsicFit calibrateImuExtrinsic(const std::vector<SensorFrame>& frames,
                                           const SensorTimeline& tl, const Vec3& mean_up_w) {
     if (frames.size() < 3) {
@@ -320,13 +305,11 @@ inline ExtrinsicFit calibrateImuExtrinsic(const std::vector<SensorFrame>& frames
     return calibrateImuExtrinsicFrom(consecutiveRotationPairs(frames), frames, tl, mean_up_w);
 }
 
-// The IMU clock offset against the video, by matching the rotation ANGLE
-// between two instants -- invariant to the extrinsic, so it runs before the
-// calibration. 0 with `found` false when the data has no minimum.
+// 比较两时刻间的旋转角以估计 IMU 相对视频的时钟偏移；旋转角与外参无关，因此可先于标定估计。无明确极小值时返回 0 且 found 为 false。
 struct TimeOffsetFit {
     bool found = false;
-    double offset = 0;      // seconds to add to video times
-    double gain = 0;        // fraction of the angle mismatch removed
+    double offset = 0;      // 需加到视频时间上的秒数
+    double gain = 0;        // 消除的角度不一致比例
     int pairs = 0;
 };
 
@@ -335,7 +318,7 @@ inline TimeOffsetFit estimateTimeOffsetFrom(const std::vector<RotationPairObs>& 
     using namespace extrinsic_detail;
     TimeOffsetFit fit;
     struct Pair { double t0, t1, vis; };
-    // 25 pairs of a fragmented ride gave -111 ms and 39 ms on the same file.
+    // 同一段分散骑行重建仅用 25 对数据，曾分别得到 -111 ms 和 39 ms。
     constexpr size_t kMinPairs = 30;
     std::vector<Pair> pairs;
     for (const RotationPairObs& rp : rot) {
@@ -347,8 +330,7 @@ inline TimeOffsetFit estimateTimeOffsetFrom(const std::vector<RotationPairObs>& 
     }
     fit.pairs = (int)pairs.size();
     if (pairs.size() < kMinPairs) return fit;
-    // Squared angle mismatch, trimmed of its worst tenth so one bad pose
-    // does not move the minimum.
+    // 角度差的平方，剔除最差的十分之一，避免单个位姿错误移动极小值。
     auto cost = [&](double d) {
         std::vector<double> r;
         for (const Pair& p : pairs) {
@@ -390,13 +372,13 @@ inline TimeOffsetFit estimateTimeOffset(const std::vector<SensorFrame>& frames,
     return estimateTimeOffsetFrom(consecutiveRotationPairs(frames), tl, range);
 }
 
-// The world up every frame votes for, robustly averaged.
+// 稳健平均各帧投票得到世界向上方向。
 struct UpConsensus {
     bool ok = false;
     Vec3 up{0, 0, 1};
-    double spread_deg = 0;   // median angular residual of the votes
+    double spread_deg = 0;   // 投票角度残差的中位数
     int votes = 0, outliers = 0;
-    std::vector<double> residual_deg;   // per input vote, -1 where absent
+    std::vector<double> residual_deg;   // 对应各输入投票，缺失时为 -1
 };
 
 inline UpConsensus consensusUp(const std::vector<Vec3>& votes_w) {
@@ -432,4 +414,4 @@ inline UpConsensus consensusUp(const std::vector<Vec3>& votes_w) {
     return u;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

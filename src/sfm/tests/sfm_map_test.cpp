@@ -1,6 +1,4 @@
-// Synthetic full reconstruction, end to end, on the GPU BA solver.
-//
-// Prints PASS/FAIL and returns 0/1. See docs/testing.md.
+// 使用 GPU BA 的合成完整重建测试，逐项输出 PASS/FAIL。
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -22,9 +20,7 @@
 namespace fs = std::filesystem;
 using namespace sfm;
 
-// -----------------------------------------------------------------------
-// map-selftest: synthetic full reconstruction (uses the GPU BA solver)
-// -----------------------------------------------------------------------
+// ---------------- 合成端到端 GPU 重建 ----------------
 static Pose lookAt(const Vec3& C, const Vec3& target) {
     Vec3 f = (target - C).normalized();
     Vec3 up0 = {0, 1, 0};
@@ -44,14 +40,7 @@ int cmdMapSelftest(int argc, char** argv) {
         if (a == "--device" && i + 1 < argc) opt.device = std::stoi(argv[++i]);
         else if (a == "--verbose") opt.verbose = true;
     }
-    // Two of the checks below are convergence assertions on deliberately
-    // ill-conditioned geometry -- a rotation-degenerate capture's focal, and a
-    // principal point 30 px from truth. They need the fp64 solver. A device
-    // without an fp64 buffer atomic add (every AMD part here, both Intel iGPUs,
-    // llvmpipe) runs the emulated double-float instead, whose ~48-bit mantissa
-    // does not get there; on real captures the two agree to 0.01 px of
-    // reprojection, so this is a limit of the fallback and not a regression.
-    // Everything else in this file still has to pass everywhere.
+    // 两项刻意病态的焦距/主点收敛断言需要 fp64，约 48 位 df 可能达不到；真实数据重投影通常仍相差不超过 0.01 px，其他检查必须全部通过。
     const bool fp64_ba =
         realSupportedByDevice(RealCfg::F64, VkContext::probeCaps(opt.device));
     if (!fp64_ba)
@@ -68,14 +57,14 @@ int cmdMapSelftest(int argc, char** argv) {
     std::vector<Vec3> pts(N);
     for (auto& p : pts) p = {ub(rng), ub(rng), ub(rng)};
 
-    // Cameras on a 120-degree arc at radius 9, looking at the origin.
+    // 相机沿半径 9、跨度 120 度的圆弧看向原点。
     std::vector<Pose> gt(M);
     for (int c = 0; c < M; c++) {
         double ang = -1.05 + 2.1 * c / (M - 1);
         gt[c] = lookAt({9 * std::sin(ang), 1.5 * std::sin(0.7 * c), 9 * std::cos(ang)}, {0, 0, 0});
     }
 
-    // Project; build feature sets and ground-truth matches.
+    // 投影生成特征与真值匹配。
     std::vector<FeatureSet> feats(M);
     std::vector<std::vector<char>> vis(M, std::vector<char>(N, 0));
     for (int c = 0; c < M; c++) {
@@ -116,9 +105,7 @@ int cmdMapSelftest(int argc, char** argv) {
     }
 
     Mapper mapper(db, feats, opt);
-    // The synthetic scene is one connected component, so this must stay a
-    // single model -- more than one would mean the mapper split a graph that
-    // does not split (D41).
+    // 合成图为单连通分量，必须输出单模型（D41）。
     std::vector<Reconstruction> models = mapper.run();
     const Reconstruction& rec = models.front();
 
@@ -167,7 +154,7 @@ int cmdMapSelftest(int argc, char** argv) {
            compact_rec ? countObservations(*compact_rec) : 0);
     if (!compact_equivalent) fails++;
 
-    // Relative rotations are invariant to the global similarity gauge.
+    // 相对旋转不受全局相似规范影响。
     double maxRelErr = 0;
     int cmpCount = 0;
     for (auto& a : rec.images)
@@ -184,7 +171,7 @@ int cmdMapSelftest(int argc, char** argv) {
     printf("  max relative-rotation error: %.2f deg over %d pairs\n", maxRelErr, cmpCount);
     if (reg >= 2 && maxRelErr > 1.5) { printf("  FAIL: pose accuracy\n"); fails++; }
 
-    // Mean reprojection error over all observations.
+    // 全部观测的平均重投影误差。
     double sum = 0;
     int nobs = 0;
     for (const auto& kv : rec.points3D)
@@ -201,7 +188,7 @@ int cmdMapSelftest(int argc, char** argv) {
     printf("  mean reprojection error: %.3f px over %d obs\n", meanReproj, nobs);
     if (nobs > 0 && meanReproj > 1.5) { printf("  FAIL: reprojection error\n"); fails++; }
 
-    // COLMAP model round-trip.
+    // COLMAP 模型读写往返。
     std::string dir = "/tmp/spirula_sfm_map_selftest";
     fs::create_directories(dir);
     rec.writeBinary(dir);
@@ -211,14 +198,8 @@ int cmdMapSelftest(int argc, char** argv) {
     printf("  COLMAP model round-trip: %s\n", rt ? "ok" : "BAD");
     if (!rt) fails++;
 
-    // ---- aligning two models that share no image (D70) ----
-    //
-    // Two halves of one scene, reconstructed separately and in different
-    // gauges, with not one image in common: alignReconstructions has nothing to
-    // fit and the pair is never a merge candidate. What they do have is points
-    // both triangulated, which the correspondence graph pairs up -- and that
-    // determines the similarity. This is a building walked room by room, where
-    // the two rooms see the same doorway from two passes.
+    // ---------------- 无共同图像的结构对齐（D70）----------------
+    // 两段独立重建虽无共同帧，但对应图关联双方三角化的同一结构，应能恢复相似变换。
     {
         auto half = [&](int first, int last) {
             Reconstruction r;
@@ -245,7 +226,7 @@ int cmdMapSelftest(int argc, char** argv) {
             return r;
         };
         Reconstruction A = half(0, M / 2 - 1), B = half(M / 2, M - 1);
-        // Put B in a gauge of its own: 1.7x, a 25-degree yaw, and an offset.
+        // B 采用独立规范：1.7 倍尺度、25 度偏航及平移。
         Sim3 S;
         S.scale = 1.7;
         const double a = 25.0 * M_PI / 180.0;
@@ -256,9 +237,7 @@ int cmdMapSelftest(int argc, char** argv) {
 
         MergeOptions mopt;
         AlignmentResult al = mapper.alignByStructure(A, B, mopt);
-        // Recovered transform applied to B's centres must land on A's gauge,
-        // which is `gt`. Measured on the cameras, none of which took part in
-        // the fit -- it only ever saw points.
+        // 使用未参与三维点拟合的相机中心验证恢复变换，应落到 A 的真值规范。
         double worst = 0;
         for (const auto& kv : B.images) {
             const Vec3 got = transformPoint(al.transform, cameraCenter(kv.second.pose));
@@ -274,19 +253,14 @@ int cmdMapSelftest(int argc, char** argv) {
         }
     }
 
-    // ---- two disconnected components -> two models (D41) ----
-    // The same scene twice, with no verified pair joining the halves: exactly
-    // the "loose components" case, where the pre-D41 mapper built both, threw
-    // one away and reported half the dataset. Both must now come back, largest
-    // first, with the images partitioned between them and nothing shared.
+    // ---------------- 两个不连通分量应输出两个模型（D41）----------------
+    // 两份场景之间无验证边，结果应完整保留、按大小排序且图像不重叠。
     {
         MapperOptions opt2 = opt;
-        opt2.min_model_size = 5;  // the components are 8 images each
+        opt2.min_model_size = 5;  // 每分量八张图像
         MatchesDatabase db2;
         std::vector<FeatureSet> feats2;
-        // Two copies of the single-component scene above; image c of component
-        // k becomes image k*M + c, and pairs are only ever built within a
-        // component, so the view graph has no edge between the halves.
+        // 复制两份场景，仅生成各自内部匹配，编号为 k*M+c。
         for (int k = 0; k < 2; k++) {
             for (int c = 0; c < M; c++) {
                 feats2.push_back(feats[c]);
@@ -314,9 +288,7 @@ int cmdMapSelftest(int argc, char** argv) {
             printf("  FAIL: expected 2 models covering all %d images\n", 2 * M);
             fails++;
         }
-        // Sorted largest-first, disjoint, and each model holds one component
-        // whole -- a model straddling the halves would mean the mapper invented
-        // a constraint the view graph does not have.
+        // 每模型完整对应一个分量，不能凭空跨分量建立约束。
         std::set<uint32_t> seen;
         bool disjoint = true, whole = true, sorted = true;
         for (size_t i = 0; i < ms.size(); i++) {
@@ -332,9 +304,7 @@ int cmdMapSelftest(int argc, char** argv) {
         if (!whole) { printf("  FAIL: a model straddles the two components\n"); fails++; }
         if (!sorted) { printf("  FAIL: models not ordered by point count\n"); fails++; }
 
-        // Assembly must leave two genuinely separate components alone: they
-        // share no image, so there is nothing to align on and nothing to grow
-        // across, and anything it did here would be an invention (D44).
+        // 装配不能合并或跨越真正独立的分量（D44）。
         {
             ManagerOptions mo;
             mo.verbose = false;
@@ -353,11 +323,7 @@ int cmdMapSelftest(int argc, char** argv) {
             }
         }
 
-        // Shared intrinsics across components (D45). Both components look
-        // through the same camera id, so one set of intrinsics is the truth for
-        // both. Give one component a badly wrong focal -- what a small
-        // component's own focal search does to it in the wild -- and the joint
-        // bundle adjustment has to pull it back onto the other's evidence.
+        // 共享相机组的两分量中故意扰乱一个焦距，联合 BA 应借另一分量证据恢复一致（D45）。
         {
             std::vector<Reconstruction> two = ms;
             const double good = two[0].cameras.at(1).focal();
@@ -373,12 +339,7 @@ int cmdMapSelftest(int argc, char** argv) {
             }
         }
 
-        // Splitting a model the correspondence graph contradicts (D45). Half
-        // the images of a sound model are rotated where they stand: the model
-        // is still self-consistent as a data structure, but the verified pairs
-        // that span the two halves cannot hold any more, and that is what the
-        // split has to find. Nothing here looks at 3D points -- the whole idea
-        // is to use evidence the model did not build itself from.
+        // 将正确模型半数相机整体旋转，内部两半各自一致但跨缝验证边失效，拆分应仅凭独立对应图识别（D45）。
         {
             Reconstruction broken = ms[0];
             uint32_t moved = 0, kept = 0;
@@ -390,9 +351,7 @@ int cmdMapSelftest(int argc, char** argv) {
                          -std::sin(a35), 0, std::cos(a35)};
             for (size_t i = 0; i < ids.size(); i++) {
                 if (i * 2 < ids.size()) { kept++; continue; }
-                // A world rotation applied to this half only: their poses
-                // stay mutually consistent (so the half is a valid model in
-                // its own right), and every pair that spans the halves breaks.
+                // 仅对一半施加世界旋转，保留半内一致性并破坏跨半关系。
                 Image& im = broken.images[ids[i]];
                 im.pose.R = mul(im.pose.R, transpose(spin));
                 moved++;
@@ -411,7 +370,7 @@ int cmdMapSelftest(int argc, char** argv) {
             bool ok = parts.size() == 2 && sizes.size() == 2 &&
                       sizes[0] == std::max(moved, kept) && sizes[1] == std::min(moved, kept);
             if (!ok) { printf("  FAIL: split did not separate the rotated half\n"); fails++; }
-            // ... and a model nothing is wrong with must survive untouched.
+            // 正确模型必须保持不变。
             Mapper::SplitStats ok_ss;
             std::vector<Reconstruction> whole_parts =
                 mapper2.splitInconsistent(ms[0], 8.0, 0.5, 15, 2, &ok_ss);
@@ -423,7 +382,7 @@ int cmdMapSelftest(int argc, char** argv) {
             }
         }
 
-        // --max-models 1 must reproduce the old single-model behaviour exactly.
+        // max-models=1 应保持单模型行为。
         MapperOptions opt1 = opt2;
         opt1.max_num_models = 1;
         std::vector<Reconstruction> one = Mapper(db2, feats2, opt1).run();
@@ -435,10 +394,8 @@ int cmdMapSelftest(int argc, char** argv) {
         }
     }
 
-    // ---- the engine driven from outside: continueFrom / audit (D44) ----
-    // The manager hands the mapper models it did not build -- merged, or off
-    // disk -- and asks it to keep going, or to check them. Both are exercised
-    // here against the model above, whose correct answer is known.
+    // ---------------- 外部驱动的继续增长与审查（D44）----------------
+    // 用真值已知模型测试 continueFrom 和 audit 对外部模型的处理。
     {
         const uint32_t victim = 3;
         auto relRot = [](const Reconstruction& r, uint32_t a, uint32_t b) {
@@ -451,8 +408,7 @@ int cmdMapSelftest(int argc, char** argv) {
         };
         const Mat3 truth = relRot(rec, 0, victim);
 
-        // Detach one image entirely, as if it had never registered, and let
-        // continueFrom put it back.
+        // 完全移除一张图像，再由 continueFrom 恢复配准。
         Reconstruction partial = rec;
         partial.images.erase(victim);
         for (auto it = partial.points3D.begin(); it != partial.points3D.end();) {
@@ -473,8 +429,7 @@ int cmdMapSelftest(int argc, char** argv) {
             fails++;
         }
 
-        // A model nothing is wrong with must come through the audit untouched:
-        // false positives cost images, so this is the half that matters most.
+        // 正确模型审查后必须不变，防止假阳性损失覆盖。
         Mapper::AuditStats clean;
         Mapper(db, feats, opt).audit(rec, &clean);
         printf("  audit of a sound model: %u checked, %u contradicted\n", clean.checked,
@@ -484,9 +439,7 @@ int cmdMapSelftest(int argc, char** argv) {
             fails++;
         }
 
-        // Now the failure it exists for: an image sitting somewhere the rest of
-        // the model does not support, with its own observations gone (what a
-        // merge produces when its similarity does not fit both halves).
+        // 错误位姿图像失去自身观测时，应由其余模型结构发现不一致。
         Reconstruction bad = partial;
         Image moved = rec.images.at(victim);
         moved.pose.R = mul(angleAxisToRotation({0.0, 0.6, 0.0}), moved.pose.R);
@@ -505,20 +458,8 @@ int cmdMapSelftest(int argc, char** argv) {
         }
     }
 
-    // ---- a forward-motion capture (D48) ----
-    // A dashcam: the camera drives straight down its own optical axis, with only
-    // the pitch/yaw jitter of a vehicle. Two separate things have to work.
-    //
-    // Seeding: every pair on such a capture has its baseline along the viewing
-    // direction, so COLMAP's init_max_forward_motion veto rejects the whole
-    // dataset and the pre-D48 mapper registered nothing at all.
-    //
-    // The focal: with all cameras pointing one way, scaling the focal and
-    // stretching the scene along the viewing axis reproduces every image, so
-    // bundle adjustment cannot see the focal -- *except* through the distortion,
-    // whose radial polynomial does not rescale. Hence the synthetic camera here
-    // has distortion, as a real one does, and the focal bootstrap has to find
-    // its way from a guess 71% long back to the truth.
+    // ---------------- 前向运动（D48）----------------
+    // 模拟沿光轴行驶的相机，种子需最终允许前向基线；带真实畸变的合成镜头还要求从偏长 71% 的焦距猜测接近真值。
     {
         const int Wd = 1280, Hd = 400, Md = 14, Nd = 900;
         Camera Kd = Camera::defaultFor(1, Wd, Hd, 900, CamModel::OpenCV);
@@ -533,7 +474,7 @@ int cmdMapSelftest(int argc, char** argv) {
 
         std::vector<Pose> gtd(Md);
         for (int c = 0; c < Md; c++) {
-            // Straight down +Z, 1.1 units per frame, with a vehicle's jitter.
+            // 沿 +Z 每帧前进 1.1 单位，并加入车辆姿态抖动。
             Vec3 C = {0, 0, 1.1 * c};
             Mat3 R = angleAxisToRotation({jit(r2), jit(r2), jit(r2) * 0.3});
             Vec3 t = mul(R, C);
@@ -576,7 +517,7 @@ int cmdMapSelftest(int argc, char** argv) {
         od.verbose = opt.verbose;
         od.device = opt.device;
         od.camera_model = CamModel::OpenCV;
-        od.focal = 0;  // the 1.2*max_dim guess: 1536 against a truth of 900
+        od.focal = 0;  // 默认猜测 1.2*最大尺寸为 1536，真实焦距 900
 
         Mapper md(dbd, fd, od);
         std::vector<Reconstruction> mds = md.run();
@@ -590,21 +531,14 @@ int cmdMapSelftest(int argc, char** argv) {
             printf("  FAIL: a forward-motion capture must still seed and grow\n");
             fails++;
         }
-        // Well inside the guess's 71% error, and on the right side of it.
+        // 误差应显著小于初值的 71%，且朝正确方向改善。
         if (std::fabs(fd_est - 900.0) > 0.20 * 900.0) {
             printf("  %s: focal not recovered from a rotation-degenerate capture\n",
                    fp64_ba ? "FAIL" : "df-limited");
             if (fp64_ba) fails++;
         }
-        // The bootstrap must never make a focal *worse* than leaving it alone.
-        // This scene is deliberately kind about the focal -- 900 points at 0.3
-        // px and a strong k1 -- so bundle adjustment gets there on its own here,
-        // and the run below is the control: the same capture with the search
-        // switched off. The evidence that the search matters when BA *cannot*
-        // get there is a real dashcam, where it moves the focal from 54% long
-        // to 1.5% (D48); no synthetic scene reproduces that without being tuned
-        // to sit on the edge of recoverability, which would make this a coin
-        // flip rather than a test.
+        // 焦距初始化不能比禁用更差；本合成场景 900 点、0.3 px 噪声及强 k1，BA 自身可恢复，作为对照。
+        // 真实行车数据中搜索将偏长 54% 改善到 1.5%，无需把合成测试调到不稳定恢复边界。
         MapperOptions oo = od;
         oo.focal_trials = 0;
         Mapper mo(dbd, fd, oo);
@@ -618,13 +552,8 @@ int cmdMapSelftest(int argc, char** argv) {
         }
     }
 
-    // ---- the principal point is held, and only the principal point (D50) ----
-    // The same arc scene, started from a camera whose principal point is 30 px
-    // off the true one. By default bundle adjustment must leave those two
-    // numbers exactly where it found them while still fitting the focal, and
-    // with --refine-principal-point it must move them back towards the truth.
-    // That is the whole prefix-of-free-parameters mechanism, checked on a model
-    // that does have parameters after the held pair.
+    // ---------------- 仅固定主点（D50）----------------
+    // 主点故意偏 30 px，默认应逐位固定但仍优化焦距；开启主点优化后应向真值恢复，验证自由参数前缀机制。
     {
         Camera c0 = Camera::defaultFor(1, W, H, 1150.0, CamModel::OpenCV);
         c0.cx = W * 0.5 + 30;
@@ -633,7 +562,7 @@ int cmdMapSelftest(int argc, char** argv) {
         MapperOptions op = opt;
         op.camera_model = CamModel::OpenCV;
         op.initial_cameras[1] = c0;
-        op.focal_trials = 0;  // keep this about BA, not about the focal search
+        op.focal_trials = 0;  // 隔离 BA 行为，不让焦距搜索影响测试
 
         Mapper mp(db, feats, op);
         std::vector<Reconstruction> mps = mp.run();
@@ -641,15 +570,12 @@ int cmdMapSelftest(int argc, char** argv) {
 
         MapperOptions oq = op;
         oq.refine_principal_point = true;
-        oq.pp_min_images = 4;   // 8 images share this camera; the default asks 20
+        oq.pp_min_images = 4;   // 本组八张图，默认主点优化要求二十张
         Mapper mq(db, feats, oq);
         std::vector<Reconstruction> mqs = mq.run();
         const Camera& cq = mqs.front().cameras.at(1);
 
-        // The finished model gets one more pass with the principal point free
-        // (D51). This scene has 8 images on one camera, so it does not qualify
-        // under the default pp_min_images -- raise the bar's other side and it
-        // should walk the principal point back toward the truth.
+        // 降低共享图像门槛后，完整模型的主点释放精化应恢复真值（D51）。
         MapperOptions ol = op;
         ol.pp_min_images = 4;
         Mapper ml(db, feats, ol);
@@ -659,11 +585,9 @@ int cmdMapSelftest(int argc, char** argv) {
 
         const bool held = cp.cx == c0.cx && cp.cy == c0.cy;
         const bool moved = cq.cx != c0.cx || cq.cy != c0.cy;
-        // The focal still has to converge with the principal point pinned --
-        // holding a parameter must not freeze the group.
+        // 固定主点不能同时冻结焦距。
         const bool focal_ok = std::fabs(cp.focal() - 1200.0) < 0.05 * 1200.0;
-        // The final pass has to *find* something, not merely move: the true
-        // principal point is the image centre, and it starts 30 px away.
+        // 最终优化须接近图像中心真值，而非仅产生任意移动。
         const double d0 = std::hypot(c0.cx - W * 0.5, c0.cy - H * 0.5);
         const double dl = std::hypot(cl.cx - W * 0.5, cl.cy - H * 0.5);
         printf("  principal point: held (%.1f,%.1f) vs start (%.1f,%.1f), focal %.0f; "
@@ -677,14 +601,13 @@ int cmdMapSelftest(int argc, char** argv) {
                    fp64_ba ? "FAIL" : "df-limited");
             if (fp64_ba) fails++;
         }
-        // ... and a group too small to share intrinsics must be left alone.
+        // 图像数不足的共享组保持原样。
         Reconstruction unpolished = mp.polish(mps.front());
         if (unpolished.cameras.at(1).cx != c0.cx) {
             printf("  FAIL: polished a camera group below pp_min_images\n");
             fails++;
         }
-        // ... as must a model with more than one camera group, whatever the
-        // thresholds say: that is the rig case the pass must never touch (D51).
+        // 多相机组模型不执行主点收尾，避免 rig 相对朝向漂移（D51）。
         {
             MapperOptions orig = ol;
             Reconstruction two = mls.front();
@@ -705,9 +628,8 @@ int cmdMapSelftest(int argc, char** argv) {
         if (!focal_ok) { printf("  FAIL: focal did not converge with the PP held\n"); fails++; }
     }
 
-    // ---- distortion held during mapping, found by the finishing pass (D72) ----
-    // The same arc through a lens that really distorts. Per-image intrinsics
-    // (D73) ride on the same model: eight images on one camera become eight.
+    // ---------------- 建图固定畸变，收尾恢复（D72）----------------
+    // 同一弧形场景也测试逐图独立内参，将共享八图相机拆为八个（D73）。
     {
         Camera Kx = Camera::defaultFor(1, W, H, 1200, CamModel::OpenCV);
         Kx.k1 = -0.06;
@@ -761,14 +683,13 @@ int cmdMapSelftest(int argc, char** argv) {
                "(%.4f, %.4f), truth (%.4f, %.4f)\n",
                ch.k1, ch.k2, mxs.front().numRegistered(), cf.k1, cf.k2, Kx.k1, Kx.k2);
         if (!held) { printf("  FAIL: BA moved a held distortion coefficient\n"); fails++; }
-        // Recovered at least halfway, which no amount of gauge freedom gives
-        // for nothing: unlike the principal point, k1 is not a rotation.
+        // k1 至少恢复一半，它不是可由旋转规范免费吸收的参数。
         if (std::fabs(cf.k1 - Kx.k1) > 0.5 * std::fabs(Kx.k1)) {
             printf("  %s: the finishing pass did not recover the distortion\n",
                    fp64_ba ? "FAIL" : "df-limited");
             if (fp64_ba) fails++;
         }
-        // ... and holding them must not freeze the focal alongside.
+        // 固定畸变不能冻结焦距。
         if (std::fabs(ch.focal() - 1200.0) > 0.10 * 1200.0) {
             printf("  FAIL: focal did not converge with the distortion held\n");
             fails++;
@@ -791,9 +712,7 @@ int cmdMapSelftest(int argc, char** argv) {
             printf("  FAIL: the per-image pass lost images\n");
             fails++;
         }
-        // Free per-image intrinsics can only fit the same observations better.
-        // A synthetic capture whose lens really is shared should nonetheless
-        // stay near it, which is what makes a runaway visible.
+        // 逐图自由内参应改善拟合，但共享真值场景仍应保持参数接近，避免发散。
         if (!(spread < 0.05 * cf.focal())) {
             printf("  %s: per-image focals ran away from the shared solution\n",
                    fp64_ba ? "FAIL" : "df-limited");
@@ -801,20 +720,8 @@ int cmdMapSelftest(int argc, char** argv) {
         }
     }
 
-    // ---- an equirectangular (360) capture (D49) ----
-    // A spherical camera walking a straight line through a scene that surrounds
-    // it. Three things are specific to this model and nothing else exercises
-    // them:
-    //
-    //  * every direction projects, so most observations here are of points
-    //    *behind* the camera -- correspondences no perspective model can hold.
-    //  * forward motion is not degenerate the way it is for a narrow lens: the
-    //    points abeam have full parallax, so the path is recovered without any
-    //    of D48's machinery.
-    //  * the intrinsics are metadata. Bundle adjustment reads (w, h) and must
-    //    return them bit-identical -- the group owns no columns of the reduced
-    //    system, which is the whole reason for the free/stored split in
-    //    sfm/ba/Problem.h and ba.slang.
+    // ---------------- 等距柱状全景（D49）----------------
+    // 直线运动中覆盖后方与侧向点，验证全向可见性及前向运动非退化；图像宽高仅为固定元数据，BA 必须逐位保持。
     {
         const int We = 2048, He = 1024, Me = 10, Ne = 500;
         Camera Ke = Camera::defaultFor(1, We, He, 0, CamModel::Equirect);
@@ -823,8 +730,7 @@ int cmdMapSelftest(int argc, char** argv) {
         std::normal_distribution<double> gs(0.0, 1.0), noise3(0.0, 0.4);
         std::uniform_real_distribution<double> ur(4.0, 14.0), uy3(-2.0, 2.0);
 
-        // Points on a shell around the whole path, so every station sees the
-        // scene in all directions.
+        // 点分布于整条轨迹外围壳层，每站均可看到所有方向。
         std::vector<Vec3> pts3(Ne);
         for (Vec3& p : pts3) {
             Vec3 d = {gs(r3), 0.35 * gs(r3), gs(r3)};
@@ -836,8 +742,7 @@ int cmdMapSelftest(int argc, char** argv) {
         std::vector<Pose> gte(Me);
         for (int c = 0; c < Me; c++) {
             Vec3 C = {0.15 * c, 0.05 * std::sin(0.9 * c), 1.0 * c};
-            // A 360 camera is carried, so its yaw drifts; the model has to be
-            // right about orientation as well as position.
+            // 加入全景相机携带时的偏航漂移，同时验证位置和方向。
             Mat3 R = angleAxisToRotation({0.03 * std::sin(0.7 * c), 0.25 * c, 0.02 * c});
             Vec3 t = mul(R, C);
             gte[c] = {R, {-t.x, -t.y, -t.z}};

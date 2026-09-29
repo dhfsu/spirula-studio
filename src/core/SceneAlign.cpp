@@ -1,4 +1,4 @@
-// SceneAlign.cpp -- see SceneAlign.h.
+// 场景对齐实现，参见 SceneAlign.h。
 
 #include "core/SceneAlign.h"
 
@@ -12,8 +12,7 @@ namespace align {
 
 namespace {
 
-// RANSAC scores a hypothesis over at most this many points: the winner is
-// then recounted over all of them, so the cap costs accuracy nowhere.
+// RANSAC 用至多此数量的点评分，再对最佳假设统计全部点，限制采样不影响最终计数精度。
 constexpr int64_t kScoreCap = 40000;
 constexpr int kIterations = 500;
 
@@ -32,7 +31,7 @@ bool normalize(double v[3]) {
     return true;
 }
 
-// Smallest-eigenvalue eigenvector of a symmetric 3x3 by cyclic Jacobi.
+// 循环 Jacobi 求对称 3×3 矩阵最小特征值的特征向量。
 void smallest_eigenvector(double A[9], double out[3]) {
     double V[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
     for (int sweep = 0; sweep < 32; sweep++) {
@@ -69,7 +68,7 @@ void smallest_eigenvector(double A[9], double out[3]) {
     for (int k = 0; k < 3; k++) out[k] = V[k*3+lo];
 }
 
-// Least squares over the flagged points. Keeps the normal's side.
+// 对标记点执行最小二乘拟合，保持法向朝向。
 bool refit(const double* pts, int64_t n, const std::vector<uint8_t>& in,
            Plane& pl) {
     double c[3] = {0, 0, 0};
@@ -110,7 +109,7 @@ int64_t mark_inliers(const double* pts, int64_t n, const Plane& pl, double tol,
     return m;
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 
 bool fit_plane(const double* pts, int64_t n, double tol, uint32_t seed,
@@ -140,7 +139,7 @@ bool fit_plane(const double* pts, int64_t n, double tol, uint32_t seed,
     }
     if (best_count < 3) return false;
     std::vector<uint8_t> in;
-    // Two rounds: the first refit moves the plane, which moves who is on it.
+    // 执行两轮；首次重拟合移动平面后，内点集合也会改变。
     for (int round = 0; round < 2; round++) {
         if (mark_inliers(pts, n, best, tol, in) < 3) return false;
         if (!refit(pts, n, in, best)) return false;
@@ -172,9 +171,7 @@ std::vector<Plane> find_planes(const double* pts, int64_t n, double tol, int k,
     return out;
 }
 
-// Least quantile of squares THROUGH the click: smallest 35th-percentile
-// residual. No tolerance to choose (a lawn is centimetres thick, a tabletop is
-// not), and a wall that outnumbers the floor still misses the click.
+// 约束平面穿过点击点，以最小第 35 百分位平方残差评分；无需为草坪和桌面分别设置厚度容差，点数更多的墙也无法取代点击处地面。
 static bool fit_plane_lqs(const double* pts, int64_t n, const double at[3],
                           uint32_t seed, Plane& out) {
     if (n < 8) return false;
@@ -217,7 +214,7 @@ bool fit_plane_at(const double* pts, int64_t n, const double at[3], double r0,
         }
         return sub;
     };
-    // The first patch has to hold enough of the surface to have a normal.
+    // 初始邻域必须包含足够表面点才能确定法向。
     std::vector<double> sub;
     double r = r0;
     for (int tries = 0; tries < 6; tries++, r *= 1.6) {
@@ -228,16 +225,14 @@ bool fit_plane_at(const double* pts, int64_t n, const double at[3], double r0,
     Plane pl;
     if (!fit_plane_lqs(sub.data(), (int64_t)sub.size() / 3, at, 31u, pl)) return false;
 
-    // How thick the surface itself is, from the patch that found it: the slab
-    // below is sized by the data's own noise, not by the radius.
+    // 用初始表面自身的噪声估计厚度，而非按邻域半径决定下方薄层宽度。
     auto thickness = [&](const std::vector<double>& p, const Plane& q) {
         std::vector<double> res;
         res.reserve(p.size() / 3);
         for (size_t i = 0; i + 2 < p.size(); i += 3)
             res.push_back(std::fabs(q.distance(&p[i])));
         if (res.empty()) return 0.0;
-        // The 35th percentile of |N(0,1)| is 0.454: the same quantile the fit
-        // was scored on, so clutter that outnumbers the surface is not in it.
+        // |N(0,1)| 的第 35 百分位为 0.454；与拟合评分分位数一致，避免数量更多的杂点进入估计。
         const size_t k = res.size() * 35 / 100;
         std::nth_element(res.begin(), res.begin() + (ptrdiff_t)k, res.end());
         return res[k] / 0.454;
@@ -261,8 +256,7 @@ bool fit_plane_at(const double* pts, int64_t n, const double at[3], double r0,
         pl.inliers = (int64_t)sub.size() / 3;
     }
 
-    // Wider while it holds. The slab keeps what is off the surface -- the
-    // chair standing on the floor -- out of the refit.
+    // 表面一致时扩大邻域；薄层筛选阻止地板上的椅子等离面结构参与重拟合。
     int64_t support = (int64_t)sub.size() / 3;
     for (int grow = 0; grow < 4; grow++) {
         const double r2 = r * 2.0;
@@ -272,7 +266,7 @@ bool fit_plane_at(const double* pts, int64_t n, const double at[3], double r0,
         Plane next = pl;
         if (!tight_refit(wide, next, 3.0 * sigma)) break;
         if (!tight_refit(wide, next, 3.0 * sigma)) break;
-        // A surface that curves away is a different surface.
+        // 逐渐弯离当前平面的结构视为另一表面。
         if (dot(next.n, pl.n) < 0.985) break;
         std::vector<uint8_t> in;
         next.inliers = mark_inliers(wide.data(), m, next, 3.0 * sigma, in);
@@ -289,8 +283,7 @@ void rotation_between(const double a[3], const double b[3], double R[9]) {
     cross(a, b, axis);
     const double c = std::clamp(dot(a, b), -1.0, 1.0);
     if (!normalize(axis)) {
-        // Parallel: nothing to do. Opposite: half a turn about anything
-        // perpendicular.
+        // 同向无需旋转；反向则绕任意垂直轴旋转半圈。
         for (int i = 0; i < 9; i++) R[i] = i % 4 == 0 ? 1.0 : 0.0;
         if (c > 0) return;
         double other[3] = {1, 0, 0};
@@ -323,7 +316,7 @@ int fit_corner(const double* pts, int64_t n, const double at[3], double r0,
     }
     const std::vector<Plane> found =
         find_planes(sub.data(), (int64_t)sub.size() / 3, 0.03 * r, 5, 0.06);
-    // Greedily: the largest, then the largest roughly square to those kept.
+    // 贪心选择最大平面，再选择与已选平面近似垂直的最大平面。
     std::vector<Plane> keep;
     for (const Plane& p : found) {
         bool square = true;
@@ -337,7 +330,7 @@ int fit_corner(const double* pts, int64_t n, const double at[3], double r0,
     for (int i = 0; i < 9; i++) axes[i] = i % 4 == 0 ? 1.0 : 0.0;
     if (m == 0) return 0;
 
-    // Orthonormalize, most trusted first; complete the frame by cross products.
+    // 优先保留最可靠方向进行正交化，再用叉积补齐坐标系。
     double e[3][3];
     for (int k = 0; k < 3; k++) e[0][k] = keep[0].n[k];
     if (m >= 2) {
@@ -356,8 +349,7 @@ int fit_corner(const double* pts, int64_t n, const double at[3], double r0,
     for (int r = 0; r < 3; r++)
         for (int k = 0; k < 3; k++) axes[r*3+k] = e[r][k];
 
-    // Where they meet: the click pushed onto each plane found, in turn. For
-    // perpendicular planes one pass lands on all of them.
+    // 依次将点击点投影到各平面；平面正交时一轮即可落到全部平面的交点。
     for (int pass = 0; pass < 4; pass++)
         for (int i = 0; i < m; i++) {
             const double d = keep[(size_t)i].distance(corner);
@@ -398,14 +390,11 @@ AutoAlignResult auto_align(const double* pts, int64_t n, const double* up,
     }
 
     const std::vector<Plane> planes = find_planes(pts, n, opt.tol, 6, 0.03);
-    // The ground: well supported, facing up, and with the scene on top of it
-    // rather than under it -- which is what tells a floor from a ceiling and,
-    // more often, a floor from the largest wall.
+    // 地面应有充分支持、朝上且场景位于其上方，用于区分天花板和点数更多的墙。
     int best = -1;
     double best_score = 0.0;
     std::vector<Plane> oriented = planes;
-    // A prior that came from cameras is evidence; +Z is only what the file
-    // happens to say, and a model that arrived on its side says it wrongly.
+    // 相机提供的向上先验有物理依据；文件中的 +Z 可能因模型侧放而不可靠。
     const bool trusted = up != nullptr;
     for (size_t i = 0; i < oriented.size(); i++) {
         Plane& p = oriented[i];
@@ -416,7 +405,7 @@ AutoAlignResult auto_align(const double* pts, int64_t n, const double* up,
             if (d > 2.0 * opt.tol) above++;
             else if (d < -2.0 * opt.tol) below++;
         }
-        // Up is the side the scene is on -- unless cameras said otherwise.
+        // 无相机先验时，以场景所在侧为上方。
         const bool flip = trusted ? dot(p.n, prior) < 0 : below > above;
         if (flip) {
             for (double& v : p.n) v = -v;
@@ -440,7 +429,7 @@ AutoAlignResult auto_align(const double* pts, int64_t n, const double* up,
         const Plane& g = oriented[(size_t)best];
         res.plane = g;
         rotation_between(g.n, zaxis, R);
-        // After the turn the plane is z = -d.
+        // 旋转后平面为 z = -d。
         lift = g.d;
         res.ground = true;
         res.ground_share = (double)g.inliers / (double)n;
@@ -448,8 +437,7 @@ AutoAlignResult auto_align(const double* pts, int64_t n, const double* up,
         rotation_between(prior, zaxis, R);
     }
 
-    // The walls: whatever stands upright, folded by quarter turns so that the
-    // four faces of a room vote for the same heading.
+    // 将直立墙面方向按四分之一圈折叠，使房间四面墙为同一朝向投票。
     if (opt.yaw) {
         double sx = 0, sy = 0, total = 0, upright = 0;
         auto vote = [&](const double nrm[3], double w) {
@@ -477,7 +465,7 @@ AutoAlignResult auto_align(const double* pts, int64_t n, const double* up,
         }
         const double agree = upright > 0 ? std::sqrt(sx*sx + sy*sy) / upright : 0.0;
         if (agree > 0.35 && upright > 0.08 * total) {
-            const double heading = std::atan2(sy, sx) / 4.0;   // (-45, 45] deg
+            const double heading = std::atan2(sy, sx) / 4.0;   // (-45, 45] 度
             const double c = std::cos(-heading), s = std::sin(-heading);
             const double Z[9] = {c, -s, 0, s, c, 0, 0, 0, 1};
             double RZ[9];
@@ -494,7 +482,7 @@ AutoAlignResult auto_align(const double* pts, int64_t n, const double* up,
     for (int i = 0; i < 9; i++) res.T.R[i] = R[i];
     res.T.t[2] = lift;
     if (opt.centre) {
-        // The median of the turned footprint: a floater does not drag it.
+        // 使用旋转后水平投影的中位数，避免漂浮点拉偏中心。
         const int64_t step = std::max<int64_t>(1, n / 200000);
         std::vector<double> xs, ys;
         for (int64_t i = 0; i < n; i += step) {
@@ -511,5 +499,5 @@ AutoAlignResult auto_align(const double* pts, int64_t n, const double* up,
     return res;
 }
 
-}  // namespace align
-}  // namespace spirula
+}  // 命名空间 align
+}  // 命名空间 spirula

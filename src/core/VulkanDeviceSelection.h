@@ -1,12 +1,7 @@
 #pragma once
-// Shared Vulkan device selection and physical-device identity.
-// Each runtime resolves a selector in its own VkInstance.
-//
-// Header-only: core/*.cpp is also compiled into the CUDA engine, so this
-// file is included only by Vulkan-native targets.
-//
-// Explicit selector, then SS_VK_DEVICE, then Auto; resolved UUIDs survive
-// reordered enumeration.
+// 共享的 Vulkan 设备选择与物理设备标识，各运行时在自己的 VkInstance 中解析。
+// 优先显式选择，其次 SS_VK_DEVICE，最后 Auto；传递 UUID 以抵抗枚举顺序变化。
+// 仅含头文件，仅 Vulkan 原生目标包含，避免将 Vulkan 依赖引入 CUDA 公共源文件。
 
 #include <vulkan/vulkan.h>
 
@@ -26,13 +21,11 @@
 namespace spirula {
 namespace vkselect {
 
-// One physical device as its runtime enumerated it. `index` is that runtime's
-// ordinal and means nothing outside it; `uuid` is the identity to carry.
-// `usable` is the runtime's own baseline, not a claim about any model.
+// index 仅在当前运行时枚举中有效，跨运行时须传递 uuid；usable 表示本运行时的基本要求，不保证支持特定模型。
 struct DeviceRecord {
     int                        index = -1;
     std::string                name;
-    std::string                type;  // discrete|integrated|virtual|cpu|other
+    std::string                type;  // 设备类型标识：discrete|integrated|virtual|cpu|other
     uint64_t                   vram_bytes = 0;
     bool                       usable = false;
     std::string                unusable_reason;
@@ -50,7 +43,7 @@ inline const char* deviceTypeName(VkPhysicalDeviceType t) {
     }
 }
 
-// Auto's first key: discrete > integrated > virtual > CPU > other.
+// Auto 首先按类型排序：独立 GPU > 集成 GPU > 虚拟 GPU > CPU > 其他。
 inline int deviceTypeRank(VkPhysicalDeviceType t) {
     switch (t) {
         case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return 4;
@@ -73,7 +66,7 @@ inline bool uuidEquals(const uint8_t a[VK_UUID_SIZE], const uint8_t b[VK_UUID_SI
     return true;
 }
 
-// The canonical selector spelling: "uuid:" + 32 lowercase hex digits.
+// 规范选择器形式：uuid: 后接 32 个小写十六进制数字。
 inline std::string uuidSelector(const uint8_t uuid[VK_UUID_SIZE]) {
     static const char* hex = "0123456789abcdef";
     std::string s = "uuid:";
@@ -84,13 +77,12 @@ inline std::string uuidSelector(const uint8_t uuid[VK_UUID_SIZE]) {
     return s;
 }
 
-// Empty for a device with no reported UUID -- there is nothing to carry.
+// 设备未报告 UUID 时为空，无法传递稳定标识。
 inline std::string selectorFor(const DeviceRecord& r) {
     return uuidIsZero(r.uuid) ? std::string() : uuidSelector(r.uuid);
 }
 
-// Fills name/type/props/uuid from one enumerated physical device; the caller
-// adds its own vram figure and usability verdict.
+// 从枚举设备填入 name/type/props/uuid；显存大小与可用性由调用方补充。
 inline void probeIdentity(VkPhysicalDevice pd, DeviceRecord* r) {
     VkPhysicalDeviceIDProperties id{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
@@ -104,19 +96,17 @@ inline void probeIdentity(VkPhysicalDevice pd, DeviceRecord* r) {
     std::copy(id.deviceUUID, id.deviceUUID + VK_UUID_SIZE, r->uuid);
 }
 
-// What the caller asked for. `text` is the raw value; `error` explains a
-// Malformed one, so a CLI can report the bad flag before any GPU work.
+// text 保留原始请求，error 说明格式错误，使 CLI 可在启动 GPU 前报告无效选项。
 struct Request {
     enum class Kind { Auto, Ordinal, Name, Uuid, Malformed };
     Kind        kind = Kind::Auto;
     int         ordinal = -1;
     std::string text;
     std::string error;
-    bool        explicit_request = false;  // from the caller, not the environment
+    bool        explicit_request = false;  // 来自调用方而非环境变量
 };
 
-// Whole values only: overflow, every negative other than SfM's -1, and any
-// other malformed spelling is Malformed rather than a guess.
+// 必须完整解析整个值；溢出、除 SfM 的 -1 外的负数及其他非法形式均视为格式错误。
 inline Request parseRequest(const std::string& value) {
     Request r;
     r.text = value;
@@ -185,9 +175,7 @@ inline Request parseRequest(const std::string& value) {
     return r;
 }
 
-// The shared precedence: an explicit CLI/GUI value wins, else a nonempty
-// SS_VK_DEVICE, else Auto. `explicit_set` matters because an explicit Auto
-// (empty selector) must not fall through to the environment.
+// 显式 CLI/GUI 值优先，其次非空 SS_VK_DEVICE，再其次 Auto；explicit_set 区分显式 Auto，避免空选择器误退回环境设置。
 inline Request requestFrom(const std::string& explicit_selector, bool explicit_set) {
     if (explicit_set) {
         Request r = parseRequest(explicit_selector.empty() ? "auto"
@@ -211,14 +199,13 @@ enum class ResolveStatus {
 
 struct Resolution {
     ResolveStatus status = ResolveStatus::Ok;
-    std::string   error;     // user-facing reason, empty when Ok
-    DeviceRecord  device;    // the resolved record; for Unusable, the match
-    std::string   selector;  // canonical uuid:<hex>, empty if none reported
+    std::string   error;     // 面向用户的原因，成功时为空
+    DeviceRecord  device;    // 解析到的记录；不可用时仍保留匹配项
+    std::string   selector;  // 规范 uuid:<hex>，未报告时为空
     bool          ok() const { return status == ResolveStatus::Ok; }
 };
 
-// First record reporting `uuid`, or -1. A driver whose ICD manifest is
-// installed twice reports every GPU twice; all runtimes settle on the first.
+// 返回首个 UUID 匹配项，否则为 -1；重复安装 ICD 清单会导致重复枚举，各运行时统一采用首项。
 inline int findByUuid(const std::vector<DeviceRecord>& devices,
                       const uint8_t uuid[VK_UUID_SIZE]) {
     for (size_t i = 0; i < devices.size(); i++)
@@ -227,7 +214,7 @@ inline int findByUuid(const std::vector<DeviceRecord>& devices,
     return -1;
 }
 
-// Resolution repeats in every runtime and SfM worker; say each thing once.
+// 设备解析会在多个运行时和工作线程中重复，消息仅输出一次。
 inline void warnOnce(const std::string& what) {
     static std::mutex m;
     static std::set<std::string> said;
@@ -235,9 +222,7 @@ inline void warnOnce(const std::string& what) {
     if (said.insert(what).second) std::fprintf(stderr, "warning: %s\n", what.c_str());
 }
 
-// Auto's total order: type rank first, VRAM second. A record with no reported
-// deviceUUID is not a candidate at all: an identity is what the request carries
-// forward, and Vulkan permits an all-zero one.
+// Auto 按设备类型、显存依次排序；未报告 deviceUUID 的设备不参与选择，Vulkan 允许全零 UUID，但其不能提供有效标识。
 inline bool autoCandidate(const DeviceRecord& r) {
     return r.usable && !uuidIsZero(r.uuid);
 }
@@ -249,7 +234,7 @@ inline bool outranks(const DeviceRecord& a, const DeviceRecord& b) {
     return a.vram_bytes > b.vram_bytes;
 }
 
-// Best record with a reported identity, or -1.
+// 返回带有效标识的最佳记录，否则为 -1。
 inline int autoPick(const std::vector<DeviceRecord>& devices) {
     int best = -1;
     for (size_t i = 0; i < devices.size(); i++) {
@@ -325,8 +310,7 @@ inline Resolution resolveRequest(const Request& r,
                      std::to_string(picked) + " (" + devices[picked].name + ")");
     }
 
-    // An ordinal or a name only looks a record up; the identity is what the
-    // caller keeps, so a record that has none cannot answer a request.
+    // 序号或名称仅用于查找，调用方保存的必须是稳定标识；缺少标识的记录不能满足请求。
     if (uuidIsZero(devices[picked].uuid))
         return fail(ResolveStatus::Missing,
                     "device " + std::to_string(picked) + " (" +
@@ -362,5 +346,5 @@ inline Resolution resolveSelector(const std::string& value,
     return resolveRequest(parseRequest(value), devices);
 }
 
-}  // namespace vkselect
-}  // namespace spirula
+}  // 命名空间 vkselect
+}  // 命名空间 spirula

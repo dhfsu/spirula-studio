@@ -1,10 +1,4 @@
-// EXIF orientation: the tag, the pixel transform it names, and the up
-// direction a reconstruction takes from it.
-//
-// The three have to agree or a portrait capture comes out sideways in one
-// place and upright in another, so the marker test below pins them together:
-// a pixel placed at `exifUpInCamera` must land at the top once the pixels are
-// turned by `exifTransform`.
+// 测试 EXIF 方向标签、像素变换和重建向上轴一致；位于 exifUpInCamera 的标记经 exifTransform 后应落到图像上方。
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -31,8 +25,7 @@ static void check(bool ok, const std::string& what) {
 
 namespace {
 
-// A little-endian TIFF block: IFD0 with Orientation and an Exif sub-IFD
-// pointer, the sub-IFD carrying FocalLengthIn35mmFilm and the pixel size.
+// 小端 TIFF：IFD0 保存 Orientation 和 EXIF 子表指针，子表含等效焦距与像素尺寸。
 std::vector<uint8_t> make_tiff(int orientation, int px_w, int px_h, int f35) {
     std::vector<uint8_t> b;
     auto u16 = [&b](unsigned v) {
@@ -50,24 +43,22 @@ std::vector<uint8_t> make_tiff(int orientation, int px_w, int px_h, int f35) {
     };
     b.push_back('I'); b.push_back('I');
     u16(42);
-    u32(8);                       // IFD0 at byte 8
+    u32(8);                       // IFD0 位于字节 8
     const uint32_t ifd0 = 8, n0 = 2;
     const uint32_t sub = ifd0 + 2 + n0 * 12 + 4;
     u16((unsigned)n0);
     entry(0x0112, 3, (uint32_t)orientation);
     entry(0x8769, 4, sub);
-    u32(0);                       // no IFD1
+    u32(0);                       // 无 IFD1
     u16(3);
-    entry(0xA405, 3, (uint32_t)f35);       // FocalLengthIn35mmFilm
-    entry(0xA002, 4, (uint32_t)px_w);      // PixelXDimension
-    entry(0xA003, 4, (uint32_t)px_h);      // PixelYDimension
+    entry(0xA405, 3, (uint32_t)f35);       // EXIF 等效 35 mm 焦距标签
+    entry(0xA002, 4, (uint32_t)px_w);      // EXIF 像素宽度标签
+    entry(0xA003, 4, (uint32_t)px_h);      // EXIF 像素高度标签
     u32(0);
     return b;
 }
 
-// A file whose marker chain readExifSegment can walk: SOI, a decoy APP1 that
-// is XMP rather than Exif, the Exif APP1, then EOI. No picture -- nothing here
-// decodes one.
+// 仅构造 SOI、干扰 XMP APP1、EXIF APP1 与 EOI，不含真实图像，验证段遍历。
 void write_jpeg_with_exif(const std::string& path, const std::vector<uint8_t>& tiff) {
     std::vector<uint8_t> f{0xFF, 0xD8};
     auto app1 = [&f](const std::string& tag, const uint8_t* data, size_t n) {
@@ -88,14 +79,14 @@ void write_jpeg_with_exif(const std::string& path, const std::vector<uint8_t>& t
     out.write((const char*)f.data(), (std::streamsize)f.size());
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 static void check_up_matches_turn();
 static void check_turn_is_invertible();
 static void check_model_up();
 
 static int cmdExifTest(int, char**) {
-    // ---- the tag, through a file ----
+    // ---------------- 从文件读取方向标签 ----------------
     const std::string path = "sfm_exif_test.tmp.jpg";
     write_jpeg_with_exif(path, make_tiff(6, 4000, 3000, 24));
     ExifData e = readExif(path);
@@ -105,7 +96,7 @@ static int cmdExifTest(int, char**) {
     check(e.focal_35mm == 24, "the focal prior reads back");
     check(exifOrientation(path) == 6, "exifOrientation agrees");
 
-    // ---- flattening leaves the prior alone ----
+    // ---------------- 应用方向不改变焦距先验 ----------------
     std::vector<uint8_t> seg = readExifSegment(path);
     check(seg.size() > 6, "the segment comes back raw");
     exifFlattenOrientation(seg.data() + 6, seg.size() - 6, 3000, 4000);
@@ -115,7 +106,7 @@ static int cmdExifTest(int, char**) {
           "flattened: the pixel size is the turned one");
     check(e.focal_35mm == 24, "flattened: the focal prior survives");
 
-    // ---- ... until it is cleared ----
+    // ---------------- 显式清除先验 ----------------
     exifClearFocal(seg.data() + 6, seg.size() - 6);
     e = parseExifTiff(seg.data() + 6, seg.size() - 6);
     check(!e.hasFocal() && exifFocalPx(e, 3000, 4000) == 0,
@@ -124,7 +115,7 @@ static int cmdExifTest(int, char**) {
           "cleared: the other tags are untouched");
     std::remove(path.c_str());
 
-    // ---- an orientation with no tag at all ----
+    // ---------------- 无方向标签 ----------------
     check(readExif("sfm_exif_test.tmp.missing").orientation == 1,
           "a file that is not there is orientation 1");
 
@@ -136,8 +127,7 @@ static int cmdExifTest(int, char**) {
     return fails == 0 ? 0 : 1;
 }
 
-// The transform and the up direction name the same turn: a pixel placed at
-// `exifUpInCamera` must land above the centre once the pixels are turned.
+// 方向变换与向上向量必须一致，标记旋转后位于中心上方。
 static void check_up_matches_turn() {
     for (int o = 1; o <= 8; o++) {
         const int w = 5, h = 3;
@@ -170,7 +160,7 @@ static void check_turn_is_invertible() {
             spirula::orient_pixels(a, w, h, 3, t, m != 0, b);
             int dw = w, dh = h;
             spirula::oriented_size(t, dw, dh);
-            // Undo: mirror first (it was applied last), then turn back.
+            // 逆变换先镜像，再反向旋转。
             spirula::orient_pixels(b, dw, dh, 3, 0, m != 0, un);
             spirula::orient_pixels(un, dw, dh, 3, (4 - t) & 3, false, c);
             check(std::memcmp(a, c, (size_t)n) == 0,
@@ -180,12 +170,9 @@ static void check_turn_is_invertible() {
     }
 }
 
-// The gauge fix: an image whose tag says it was shot in portrait must level
-// the model by the photographer's up, not by the frame's.
+// 竖拍模型应按拍摄者的向上方向调平，而非存储图像的上方。
 static void check_model_up() {
-    // A portrait capture of a world whose up is +Z: the phone is turned, so the
-    // frame's own up (camera -y) lies along +Y and the photographer's up (-x
-    // for orientation 6) along +Z. World -> camera rows, right-handed.
+    // 世界 +Z 朝上，竖拍存储帧的 -y 指向世界 +Y，方向 6 的拍摄者 -x 指向 +Z；矩阵行为右手世界到相机旋转。
     Reconstruction rec;
     for (uint32_t i = 0; i < 2; i++) {
         Image im;
@@ -194,7 +181,7 @@ static void check_model_up() {
         im.name = "p" + std::to_string(i) + ".jpg";
         im.pose.R = Mat3{0, 0, -1, 0, -1, 0, -1, 0, 0};
         im.pose.t = Vec3{0, 0, (double)i};
-        im.exif_orientation = 6;   // stored sideways, turn 90 CW to show
+        im.exif_orientation = 6;   // 横向存储，显示时顺时针旋转 90 度
         rec.images[i] = im;
     }
     const Vec3 plain = meanCameraUp(rec, false);
@@ -204,7 +191,7 @@ static void check_model_up() {
     check(std::abs(exif.z - 2.0) < 1e-9 && std::abs(exif.y) < 1e-9,
           "the tag's up is +Z, which is");
 
-    // The tags a model read off disk does not carry, taken from the files.
+    // 从原图为磁盘模型补齐方向标签。
     const std::string dir = "sfm_exif_test.tmp.d";
     std::filesystem::create_directories(dir);
     for (uint32_t i = 0; i < 2; i++)
@@ -214,7 +201,7 @@ static void check_model_up() {
     for (auto& kv : bare[0].images) kv.second.exif_orientation = 1;
     check(fillExifOrientations(bare, dir) == 2, "the files are read");
     check(bare[0].images[0].exif_orientation == 8, "and their tags land on the model");
-    // A model that already carries one is the authority; nothing is read.
+    // 模型已有标签时以其为准，不重新读取。
     std::vector<Reconstruction> kept{rec};
     check(fillExifOrientations(kept, dir) == 0, "features beat the files");
     check(kept[0].images[0].exif_orientation == 6, "and are left alone");

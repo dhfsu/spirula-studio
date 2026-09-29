@@ -1,11 +1,6 @@
 #pragma once
-// The gauge of a finished model from the video's own sensors: up from the
-// IMU, scale from the accelerometer and from the GPS log, heading and place
-// from the GPS. Every reading is a factor on one small state (a Sim3 plus
-// biases and per-lens nuisances), initialised in closed form and refined by
-// one robust Levenberg-Marquardt solve; a missing sensor is an absent
-// factor, a degenerate one is refused by its own uncertainty. Nothing here
-// touches the poses. docs/notes/imu-gps-for-sfm.md is the design.
+// 由视频传感器确定完整模型规范：IMU 提供向上方向，加速度/GPS 提供尺度，GPS 提供航向与位置。
+// 闭式初始化后，对 Sim3、偏置和逐镜头辅助量做稳健 LM；缺失传感器不生成因子，退化由不确定度拒绝，此处不修改模型位姿。
 
 #include <algorithm>
 #include <cctype>
@@ -27,14 +22,14 @@
 
 namespace sfm {
 
-// One telemetry source and the images it covers.
+// 一个遥测源及其覆盖图像。
 struct SensorCapture {
-    std::string prefix;        // image names under this prefix; "" covers all
-    std::string path;          // for reporting
-    std::string camera;        // the file's camera string
-    double fps = 0;            // frame index in the stem -> seconds
-    double time_offset = 0;    // seconds added to every frame time
-    double readout = 0;        // rolling-shutter readout, seconds
+    std::string prefix;        // 图像路径前缀，空值覆盖全部
+    std::string path;          // 供报告使用
+    std::string camera;        // 文件中的相机名称
+    double fps = 0;            // 主干帧号到秒的换算率
+    double time_offset = 0;    // 加到各帧时间的秒数
+    double readout = 0;        // 滚动快门读出时长，秒
     const SensorTimeline* timeline = nullptr;
 };
 
@@ -42,10 +37,10 @@ enum class SensorMode { Auto, Up, None };
 
 struct SensorGaugeOptions {
     SensorMode mode = SensorMode::Auto;
-    bool gps_full = false;          // fit altitude too (D75 says not to)
-    double gps_max_error = 5.0;     // metres, the RANSAC radius ...
-    double gps_max_error_frac = 0;  // ... or this fraction of the fixes' RMS radius
-    bool refine = true;             // the joint solve after the closed forms
+    bool gps_full = false;          // 是否同时拟合高度，D75 建议默认不拟合
+    double gps_max_error = 5.0;     // RANSAC 绝对半径，米
+    double gps_max_error_frac = 0;  // 或定位 RMS 半径的此比例
+    bool refine = true;             // 闭式解后的联合优化
     bool verbose = false;
 };
 
@@ -54,36 +49,36 @@ enum class SensorNoScale { None, NotAsked, NoSource, ImuWeak, GpsRefused, Disagr
 
 struct SensorGroupReport {
     int capture = 0;
-    std::string name;               // the image-name directory
+    std::string name;               // 图像名所属目录
     ExtrinsicFit fit;
     int frames = 0, triples = 0, triple_inliers = 0;
-    double scale = 0, scale_sigma = 0;   // closed-form, relative sigma
-    double g_norm = 0, g_angle_deg = 0;  // gravity recovered with the scale
-    bool flipped = false;                // the scale came out negative: X negated
+    double scale = 0, scale_sigma = 0;   // 闭式解的相对 sigma
+    double g_norm = 0, g_angle_deg = 0;  // 尺度拟合同时恢复的重力
+    bool flipped = false;                // 尺度为负时将 X 取反
 };
 
 struct SensorGaugeResult {
-    bool applied = false;    // T is the transform to apply
-    bool metric = false;     // ... and its unit is the metre
+    bool applied = false;    // T 为待应用变换
+    bool metric = false;     // 且变换后单位为米
     bool up_from_imu = false;
     bool scale_from_imu = false, scale_from_gps = false;
     bool place_from_gps = false;
-    bool disagree = false;   // IMU and GPS scales differed beyond 3 sigma
+    bool disagree = false;   // IMU 与 GPS 尺度差超过三倍 sigma
     Sim3 T;
     UpConsensus up;
-    std::vector<TimeOffsetFit> time_offsets;   // per capture
+    std::vector<TimeOffsetFit> time_offsets;   // 逐采集序列
     std::vector<SensorGroupReport> groups;
     int frames_timed = 0, frames_untimed = 0;
-    double scale_imu = 0, scale_imu_sigma = 0;   // relative
+    double scale_imu = 0, scale_imu_sigma = 0;   // 相对不确定度
     double scale_gps = 0, scale_gps_sigma = 0;
-    double scale = 1, scale_sigma = 0;           // the joint answer
+    double scale = 1, scale_sigma = 0;           // 联合求解结果
     double tilt_sigma_deg = 0;
     MetricFit gps;
     int gps_frames = 0;
     int lm_iterations = 0;
     double lm_cost0 = 0, lm_cost = 0;
-    SensorFail fail = SensorFail::None;         // why nothing was applied
-    SensorNoScale no_scale = SensorNoScale::None;   // why an applied frame is not metric
+    SensorFail fail = SensorFail::None;         // 未应用任何变换的原因
+    SensorNoScale no_scale = SensorNoScale::None;   // 已应用坐标系仍非公制的原因
 };
 
 namespace sensor_detail {
@@ -114,7 +109,7 @@ inline double huberW(double r, double sigma) {
     return x <= 1.345 ? 1.0 : 1.345 / x;
 }
 
-}  // namespace sensor_detail
+}  // 命名空间 sensor_detail
 
 class SensorGaugeSolver {
 public:
@@ -160,19 +155,19 @@ private:
     const std::vector<SensorCapture>& _caps;
     const SensorGaugeOptions& _opt;
 
-    std::vector<SensorFrame> _frames;            // time-sorted within each group
-    std::vector<std::vector<int>> _group_frames; // frame indices per group
+    std::vector<SensorFrame> _frames;            // 各组内按时间排序
+    std::vector<std::vector<int>> _group_frames; // 各组帧索引
     std::vector<int> _group_capture;
     std::vector<std::string> _group_name;
-    std::vector<Mat3> _X;                        // per group, camera <- IMU
+    std::vector<Mat3> _X;                        // 各组相机 <- IMU 变换
     std::vector<bool> _group_ok;
     std::vector<double> _gyro_sign;
-    std::vector<std::vector<ImuPair>> _pairs;   // per group
+    std::vector<std::vector<ImuPair>> _pairs;   // 逐分组
     std::vector<std::vector<ImuTriple>> _triples;
     Vec3 _mean_up_w;
     Vec3 _up_w{0, 0, 1};
     bool _up_ok = false;
-    std::vector<Vec3> _gps_enu;      // per frame; valid where _gps_ok
+    std::vector<Vec3> _gps_enu;      // 逐帧，仅 _gps_ok 处有效
     std::vector<char> _gps_ok;
 
     void collectFrames(SensorGaugeResult& out) {
@@ -268,9 +263,7 @@ private:
         }
     }
 
-    // The cameras' mean up settles each group's sign on its own; a view
-    // pointing straight up or down has no such axis to speak of, so a group
-    // whose votes oppose the other groups' consensus is negated.
+    // 各组先用相机平均向上轴决定符号；朝天或朝地镜头缺少可靠平均轴，若与其他组共识相反则取反。
     void consensus(SensorGaugeResult& out) {
         for (int pass = 0; pass < 2; pass++) {
             std::vector<Vec3> votes;
@@ -304,7 +297,7 @@ private:
         out.up_from_imu = _up_ok;
     }
 
-    // Consecutive frames of a group, pre-integrated where the IMU allows.
+    // 组内连续帧，在 IMU 覆盖允许时预积分。
     void buildPairs() {
         using namespace sensor_detail;
         _pairs.assign(_group_name.size(), {});
@@ -340,8 +333,7 @@ private:
         return solveImuScale(views, _up_w);
     }
 
-    // Per group: the triples and a scale of its own, which settles the sign
-    // of X. Per capture: the scale that is reported, from every group at once.
+    // 逐组拟合三帧组尺度以确定 X 符号，再联合全部组得到逐采集尺度用于报告。
     void imuScale(SensorGaugeResult& out) {
         using namespace sensor_detail;
         for (size_t g = 0; g < _group_name.size(); g++) {
@@ -395,7 +387,7 @@ private:
             out.scale_imu_sigma = 1.0 / (std::sqrt(den) * std::fabs(out.scale_imu));
             out.scale_from_imu = out.scale_imu > 0 && out.scale_imu_sigma < 0.1 && all_triples >= 10;
         } else if (weak) {
-            out.scale_imu_sigma = 1.0;   // a capture that hardly accelerated: reported as 100%
+            out.scale_imu_sigma = 1.0;   // 几乎无加速时不确定度报告为 100%
         }
     }
 
@@ -440,21 +432,20 @@ private:
         for (size_t i = 0; i < owner.size(); i++)
             if (!out.gps.inlier_mask[i]) _gps_ok[(size_t)owner[i]] = 0;
         out.scale_gps = out.gps.T.scale;
-        // The residual-derived sigma under-states a correlated receiver's
-        // error by ~4x (D74), and the scale sigma is used to weigh it here.
+        // 相关 GPS 误差会使残差估计低约四倍，此处放大尺度 sigma 后再加权（D74）。
         out.scale_gps_sigma = 4.0 * out.gps.scale_unc / 100.0;
         out.scale_from_gps = true;
         out.place_from_gps = true;
     }
 
-    // ---- the joint solve --------------------------------------------------
+    // ---------------- 联合求解 ----------------
 
     struct Params {
         double log_s = 0;
-        Vec3 rot;        // left-multiplied increment on the base rotation
+        Vec3 rot;        // 左乘到基础旋转的增量
         Vec3 t;
-        std::vector<Vec3> bg, ba;        // per capture
-        std::vector<Vec3> lever, dX;     // per group
+        std::vector<Vec3> bg, ba;        // 逐采集序列
+        std::vector<Vec3> lever, dX;     // 逐分组
     };
 
     struct Layout {
@@ -467,7 +458,7 @@ private:
     void assemble(SensorGaugeResult& out) {
         using namespace sensor_detail;
         const bool imu = out.scale_from_imu, gps = out.scale_from_gps;
-        // Disagreement: keep the more certain source and say so.
+        // 来源不一致时保留不确定度更小者并报告。
         bool use_imu = imu, use_gps = gps;
         if (imu && gps) {
             const double z = std::fabs(std::log(out.scale_imu / out.scale_gps)) /
@@ -485,7 +476,7 @@ private:
             return;
         }
 
-        // Base: up to +Z, then the GPS yaw and place, then the scale.
+        // 基础变换先对齐向上到 +Z，再应用 GPS 航向、位置及尺度。
         const Mat3 R_up = rotationUpToZ(_up_w);
         Mat3 R0 = R_up;
         Vec3 t0{0, 0, 0};
@@ -528,7 +519,7 @@ private:
             t = mul(R, mid) * -s;
         }
         if (!any_scale) {
-            // Upright from the IMU, sized as Orient.h sizes a model.
+            // IMU 确定朝向，尺度按 Orient 的归一化规则设置。
             out.T = normalizingTransform(_rec, mul(transpose(R), Vec3{0, 0, 1}));
             out.applied = true;
             out.metric = false;
@@ -554,8 +545,7 @@ private:
     bool _use_imu = false, _use_gps = false;
     double _sig_up = 1, _sig_rot = 1, _sig_trip = 1, _sig_gps = 1;
 
-    // Residuals, each already divided by its sigma; `w` carries the robust
-    // weight assigned at the previous evaluation (IRLS).
+    // 残差已除各自 sigma，w 保存上次求值的 IRLS 稳健权重。
     void residuals(const Params& p, std::vector<double>& r,
                    std::vector<double>* noise = nullptr) const {
         using namespace sensor_detail;
@@ -593,7 +583,7 @@ private:
             for (const ImuTriple& tr : _triples[g]) {
                 const ImuTripleTerms T = imuTripleTerms(_frames, _pairs[g], tr, X[g], p.bg[(size_t)cap],
                                                         p.ba[(size_t)cap], p.lever[g]);
-                // Centres as the response (see solveScale), in the target frame.
+                // 在目标坐标系以相机中心为响应变量，见尺度求解。
                 const Vec3 e = mul(R, T.L) - (mul(R, T.Q) + mul(R, _up_w) * (T.Gs * -9.81)) * (1.0 / s);
                 r.push_back(e.x / _sig_trip);
                 r.push_back(e.y / _sig_trip);
@@ -618,8 +608,8 @@ private:
             for (int k = 0; k < 3; k++) r.push_back((&p.ba[c].x)[k] / 0.2);    // m/s^2
         }
         for (size_t g = 0; g < _group_name.size(); g++) {
-            for (int k = 0; k < 3; k++) r.push_back((&p.lever[g].x)[k] / 0.1);   // metres
-            for (int k = 0; k < 3; k++) r.push_back((&p.dX[g].x)[k] / 0.05);     // rad
+            for (int k = 0; k < 3; k++) r.push_back((&p.lever[g].x)[k] / 0.1);   // 米
+            for (int k = 0; k < 3; k++) r.push_back((&p.dX[g].x)[k] / 0.05);     // 弧度
         }
         if (noise) noise->resize(r.size(), 0.0);
     }
@@ -651,7 +641,7 @@ private:
             add(L.i_lever[g], 3, _use_imu && _group_ok[g] && !_triples[g].empty());
             add(L.i_dX[g], 3, _group_ok[g]);
         }
-        // Yaw is observed by GPS alone; tilt by the up votes alone.
+        // 航向仅由 GPS 观测，倾斜仅由向上投票观测。
         L.active[(size_t)L.i_rot + 2] = _use_gps;
         L.active[(size_t)L.i_rot] = L.active[(size_t)L.i_rot + 1] = _up_ok;
         return L;
@@ -676,8 +666,7 @@ private:
         _sig_up = _sig_rot = _sig_trip = _sig_gps = 1.0;
         std::vector<double> r;
         residuals(p, r);
-        // Same order as residuals(): up, then per group rotation + triples,
-        // then GPS. Recover the block sizes to scale each family by its MAD.
+        // 顺序与 residuals 一致：向上、逐组旋转与三帧组、GPS，恢复块大小后按各类 MAD 缩放。
         size_t pos = 0;
         auto take = [&](size_t n) {
             std::vector<double> v;
@@ -696,7 +685,7 @@ private:
         if (_use_gps)
             for (size_t i = 0; i < _frames.size(); i++)
                 if (_gps_ok[i]) n_gps += _opt.gps_full ? 3 : 2;
-        // The rotation and triple blocks interleave per group; gather them.
+        // 逐组交错存放的旋转与三帧组块需分别汇集。
         std::vector<double> up = take(n_up), rot, trip;
         for (size_t g = 0; g < _group_name.size(); g++) {
             if (!_group_ok[g]) continue;
@@ -739,9 +728,7 @@ private:
         int i_scale = -1;
         for (int i = 0; i < (int)act.size(); i++)
             if (act[(size_t)i] == L.i_s) i_scale = i;
-        // solveScale's correction, in the curvature: the scale column of a
-        // triple row is the noisy pre-integrated regressor, and left alone the
-        // solve would take the attenuation back.
+        // 在曲率矩阵应用尺度回归噪声修正，避免带噪预积分自变量重新引入斜率衰减。
         auto noiseCurvature = [&](double s) {
             if (i_scale < 0) return 0.0;
             double c = 0;
@@ -763,7 +750,7 @@ private:
         double c = cost(r);
         out.lm_cost0 = c;
         double lambda = 1e-3;
-        std::vector<double> J;   // rows x m
+        std::vector<double> J;   // 行数 × m
         bool done = false;
         for (int iter = 0; iter < 20 && !done; iter++) {
             const size_t n = r.size();
@@ -829,7 +816,7 @@ private:
         out.lm_cost = c;
         unpack(L, x, p);
 
-        // Uncertainties from the final curvature.
+        // 由最终曲率估计不确定度。
         {
             const size_t n = r.size();
             std::vector<double> H((size_t)m * (size_t)m, 0.0);
@@ -869,4 +856,4 @@ inline SensorGaugeResult fitSensorGauge(const Reconstruction& rec,
     return solver.run();
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

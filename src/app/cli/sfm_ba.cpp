@@ -1,6 +1,4 @@
-// `spirula-sfm ba` -- one global bundle adjustment of a sparse model, the one
-// the mapper runs, written back out; or the solver on a BAL problem (Bundle
-// Adjustment in the Large), for benchmarking. See src/sfm/ba/README.md.
+// spirula-sfm ba 对稀疏模型运行与建图相同的全局 BA 并写回，也支持 BAL 问题基准测试；参见 src/sfm/ba/README.md。
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -16,8 +14,7 @@
 #include "core/Env.h"
 #include "i18n/catalog/SfmHelp.h"
 
-// spirula::env with a default. (`getenv(x) ?: "d"` is a GNU extension MSVC
-// lacks.)
+// 为 spirula::env 提供默认值；避免 MSVC 不支持的 GNU 扩展 getenv(x) ?: "d"。
 static const char* env_or(const char* suffix, const char* fallback) {
     const char* v = spirula::env(suffix);
     return v ? v : fallback;
@@ -35,9 +32,7 @@ static void writePly(const char* path, const std::vector<double>& pts) {
 }
 
 
-// Printed by `spirula-sfm ba --help` and by `spirula-sfm help ba`. The solver's
-// options are not in the SfmConfig table: nothing else drives them, and the
-// pipeline's own bundle adjustment is configured through --ba-* on `map`.
+// 供 ba --help 与 help ba 共用；独立求解器选项不属于 SfmConfig，流水线 BA 则由 map 的 --ba-* 配置。
 void printBaHelp(FILE* out) {
     namespace H = spirula::i18n::msg::sfmhelp;
     using spirula::i18n::wrap;
@@ -54,9 +49,7 @@ void printBaHelp(FILE* out) {
             std::fprintf(out, "  %s\n", line.c_str());
     }
 
-    // One row per flag: the flag and its value syntax on the left (identifiers,
-    // so untranslated), the sentence for it on the right, wrapped where the
-    // language allows.
+    // 每行一个选项；左侧保留标识符和参数语法，右侧翻译说明并按当前语言换行。
     struct Row { const char* flag; const char* def; const spirula::i18n::Msg* help; };
     static const Row kRows[] = {
         {"--real {float|double|df|cpu}", "double", &H::ba_opt_real},
@@ -96,9 +89,7 @@ void printBaHelp(FILE* out) {
         std::fprintf(out, "%s\n", line.c_str());
 }
 
-// The rig table over a written model's image names, with each member's
-// extrinsic averaged from the poses -- what the mapper's calibration would
-// have found, so --rig builds the same rigged problem it builds.
+// 根据磁盘模型的图像名称构建 rig，并从位姿平均成员外参，使 --rig 生成与建图器相同的装置 BA 问题。
 static sfm::RigTable rigTableForModel(sfm::Reconstruction& rec,
                                       const std::vector<sfm::RigDef>& defs) {
     uint32_t n = 0;
@@ -192,15 +183,12 @@ int cmdBa(int argc, char** argv) {
             else if (a == "--device") {
                 const std::string v = next();
                 const std::string request = v.empty() ? "auto" : v;
-                // Retain the integer spelling at the input boundary; the canonical
-                // UUID is what the solver carries.
+                // 输入边界保留整数写法，求解器内部使用规范 UUID。
                 const spirula::vkselect::Request req = spirula::vkselect::parseRequest(request);
                 if (req.kind == spirula::vkselect::Request::Kind::Malformed)
                     throw std::runtime_error("--device " + request + ": " + req.error);
                 if (req.kind == spirula::vkselect::Request::Kind::Ordinal) opt.device = req.ordinal;
-                // Keep the spelling for every non-ordinal request, Auto included:
-                // an explicit `auto` must resolve as Auto rather than fall through
-                // to the environment.
+                // 保留非序号请求的写法，包括显式 auto，防止它误退回环境变量设置。
                 else opt.device_selector = request;
             }
             else if (a == "--validate") opt.validate = true;
@@ -234,9 +222,7 @@ int cmdBa(int argc, char** argv) {
         return 1;
     }
 
-    // Resolve the request once, before the solve builds anything: a device this
-    // machine cannot honour is a usage error here, not the CPU fallback below
-    // (which exists for a device that genuinely lacks the arithmetic).
+    // 求解前一次性解析设备请求；无效设备应报参数错误，不能借仅用于缺少算术能力的 CPU 回退掩盖。
     {
         const std::string text = !opt.device_selector.empty()
                                      ? opt.device_selector
@@ -253,17 +239,16 @@ int cmdBa(int argc, char** argv) {
         }
     }
 
-    // both debug hooks pin the solver selection they need
+    // 两个调试钩子均固定所需的求解器选择
     if (spirula::env("SFM_DUMP_SG")) opt.solver = SolverSel::Dense;
     const bool cmp_step = spirula::env("SFM_CMP_STEP") != nullptr;
     if (cmp_step) {
         opt.solver = SolverSel::CG;
         opt.cg_fallback = CgFallback::On;
-        opt.cg_model_tol = 0;  // --cg-tol alone sets how exact the step is
+        opt.cg_model_tol = 0;  // 仅由 --cg-tol 控制步长求解精度
     }
 
-    // A directory is a COLMAP sparse model: build the problem the mapper's
-    // global BA builds, with its loss defaults and the rigs its run wrote.
+    // 目录输入视作 COLMAP 稀疏模型，沿用建图器全局 BA 的损失默认值及模型中保存的 rig。
     std::error_code dir_ec;
     const bool is_model = std::filesystem::is_directory(file, dir_ec);
 
@@ -311,8 +296,7 @@ int cmdBa(int argc, char** argv) {
         BundleSolver solver(P, opt);
         solver.init();
         if (cmp_step) {
-            // SS_SFM_CMP_STEP: solve one assembly with both CG and dense, print
-            // the step difference (--cg-tol / --cg-iters control CG accuracy)
+            // SS_SFM_CMP_STEP 使用 CG 与稠密求解器解同一装配系统并打印步长差异；--cg-tol / --cg-iters 控制 CG 精度。
             solver.debugCompareStep((float)atof(env_or("SFM_CMP_STEP_LAMBDA", "0.01")));
             return 0;
         }

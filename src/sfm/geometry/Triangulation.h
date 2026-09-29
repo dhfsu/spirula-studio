@@ -1,7 +1,4 @@
-// Triangulation and triangulation-angle checks (src/sfm/README.md).
-//
-// DLT triangulation from two 3x4 projection matrices, plus the parallax angle
-// between the two viewing rays (COLMAP's min_tri_angle filter, default 1.5 deg).
+// 由两个 3×4 投影矩阵执行 DLT 三角化，并检查视差角，对应 COLMAP 的 min_tri_angle 过滤。
 #pragma once
 
 #include <array>
@@ -12,15 +9,9 @@
 
 namespace sfm {
 
-using Mat34 = std::array<double, 12>;  // 3x4, row-major
+using Mat34 = std::array<double, 12>;  // 3×4，行主序
 
-// Fill the two DLT rows contributed by one unit bearing `b` and its 3x4
-// projection matrix `P`. For a forward ray (b.z above the threshold) this is the
-// classic perspective pair x*P3-P1, y*P3-P2 (x=b.x/b.z) -- bit-identical to the
-// pre-bearing pinhole code, and the only path any rectilinear lens ever takes
-// (its rays never reach ~84 deg). A wide/fisheye ray (small or negative b.z)
-// cannot be perspective-divided, so it uses the general cross-product form
-// b x (P X) = 0, whose two independent rows are well-conditioned for any FOV.
+// 前向视线采用经典 DLT 行 x*P3-P1、y*P3-P2，x=b.x/b.z；宽角或负 b.z 使用 b×(P X)=0 的两个独立行，避免透视除法退化。
 inline void dltRows(double* r0, double* r1, const Vec3& b, const Mat34& P) {
     if (std::fabs(b.z) > 0.1) {
         double x = b.x / b.z, y = b.y / b.z;
@@ -30,21 +21,18 @@ inline void dltRows(double* r0, double* r1, const Vec3& b, const Mat34& P) {
         }
     } else {
         for (int c = 0; c < 4; c++) {
-            r0[c] = b.y * P[8 + c] - b.z * P[4 + c];   // (b x PX) component 0
-            r1[c] = b.z * P[0 + c] - b.x * P[8 + c];   // (b x PX) component 1
+            r0[c] = b.y * P[8 + c] - b.z * P[4 + c];   // (b×PX) 的第 0 分量
+            r1[c] = b.z * P[0 + c] - b.x * P[8 + c];   // (b×PX) 的第 1 分量
         }
     }
 }
 
-// Homogeneous DLT triangulation from two unit bearings (viewing rays in each
-// camera frame) and their 3x4 projection matrices. Returns the inhomogeneous
-// 3D point. FOV-agnostic: forward rays stay bit-identical to the pre-bearing
-// code, wide/fisheye rays use the ray-native form (see dltRows).
+// 由两条单位视线和投影矩阵求齐次 DLT，再返回非齐次三维点；前向与宽角由 dltRows 统一处理。
 inline Vec3 triangulateDLT(const Mat34& P1, const Mat34& P2, const Vec3& b1, const Vec3& b2) {
     double A[4][4];
     dltRows(A[0], A[1], b1, P1);
     dltRows(A[2], A[3], b2, P2);
-    // On the stack: retriangulation calls this millions of times a pass.
+    // 使用栈存储，重三角化每轮会调用数百万次。
     double AtA[16], w[4], V[16];
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) {
@@ -62,7 +50,7 @@ inline Vec3 triangulateDLT(const Mat34& P1, const Mat34& P2, const Vec3& b1, con
     return {h[0] / h[3], h[1] / h[3], h[2] / h[3]};
 }
 
-// Angle (radians) at X between rays to camera centers c1 and c2.
+// 点 X 处指向相机中心 c1/c2 的射线夹角，单位弧度。
 inline double triangulationAngle(const Vec3& X, const Vec3& c1, const Vec3& c2) {
     Vec3 r1 = (X - c1).normalized();
     Vec3 r2 = (X - c2).normalized();
@@ -70,4 +58,4 @@ inline double triangulationAngle(const Vec3& X, const Vec3& c1, const Vec3& c2) 
     return std::acos(c);
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

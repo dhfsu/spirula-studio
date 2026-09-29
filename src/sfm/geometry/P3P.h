@@ -1,18 +1,12 @@
-// P3P minimal solver (3-point absolute pose), ported from PoseLib's lambdatwist
-// implementation (Persson & Nordberg; BSD, the same solver COLMAP uses via
-// PoseLib). Unlike DLT PnP this is robust to near-coplanar / elongated point
-// configurations, which are common early in SfM, so it is the mapper's PnP
-// minimal solver.
-//
-// Input: unit bearing vectors x[i] (normalized camera rays) and world points
-// X[i]; output poses satisfy x_cam = R * X_world + t (world->camera).
+// P3P 三点绝对位姿解，采用 PoseLib 的 Lambda Twist（Persson 与 Nordberg，BSD），对早期 SfM 常见近共面和细长点集更稳健。
+// 输入单位视线 x 与世界点 X，输出满足 x_cam=R X_world+t 的位姿。
 #pragma once
 
 #include <array>
 #include <cmath>
 #include <vector>
 
-#include "sfm/geometry/Essential.h"  // Pose
+#include "sfm/geometry/Essential.h"  // 刚体位姿
 #include "sfm/geometry/LinAlg.h"
 
 namespace sfm {
@@ -28,8 +22,7 @@ inline bool root2real(double b, double c, double& r1, double& r2) {
     return true;
 }
 
-// One real root of x^3 + c2 x^2 + c1 x + c0 = 0; returns true if it is the only
-// real root (used to short-circuit the two-solution branch).
+// 求 x^3+c2 x^2+c1 x+c0=0 的一个实根，若只有一个实根则返回 true，用于跳过双解分支。
 inline bool solveCubicSingleReal(double c2, double c1, double c0, double& root) {
     double a = c1 - c2 * c2 / 3.0;
     double b = (2.0 * c2 * c2 * c2 - 9.0 * c2 * c1) / 27.0 + c0;
@@ -55,7 +48,7 @@ inline Mat3 colsToMat(const Vec3& c0, const Vec3& c1, const Vec3& c2) {
 inline Vec3 col(const Mat3& M, int c) { return {M[c], M[3 + c], M[6 + c]}; }
 inline Vec3 row(const Mat3& M, int r) { return {M[3 * r], M[3 * r + 1], M[3 * r + 2]}; }
 
-// pq extraction: two planes whose intersection encodes the depth ratios.
+// 提取 p/q：两平面的交线编码深度比例。
 inline std::array<Vec3, 2> computePQ(Mat3 C) {
     auto A = [&](int r, int c) -> double& { return C[3 * r + c]; };
     Mat3 J;
@@ -101,7 +94,7 @@ inline void refineLambda(double& l1, double& l2, double& l3, double a12, double 
     }
 }
 
-}  // namespace p3pdetail
+}  // 命名空间 p3pdetail
 
 inline std::vector<Pose> p3p(std::array<Vec3, 3> x, std::array<Vec3, 3> X) {
     using namespace p3pdetail;
@@ -110,7 +103,7 @@ inline std::vector<Pose> p3p(std::array<Vec3, 3> x, std::array<Vec3, 3> X) {
     Vec3 X01 = X[0] - X[1], X02 = X[0] - X[2], X12 = X[1] - X[2];
     double a01 = X01.dot(X01), a02 = X02.dot(X02), a12 = X12.dot(X12);
 
-    // Order so X12 (=BC) is the largest baseline.
+    // 重排使 X12（即 BC）成为最大基线。
     if (a01 > a02) {
         if (a01 > a12) {
             std::swap(x[0], x[2]); std::swap(X[0], X[2]); std::swap(a01, a12);
@@ -207,4 +200,4 @@ inline std::vector<Pose> p3p(std::array<Vec3, 3> x, std::array<Vec3, 3> X) {
     return out;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

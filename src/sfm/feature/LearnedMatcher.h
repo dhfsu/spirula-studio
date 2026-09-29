@@ -1,17 +1,7 @@
 #pragma once
-// The matcher seam: LightGlue behind IFeatureMatcher, and the factory that
-// picks between it and the GPU brute-force matcher.
-//
-// sfm/feature/Matcher.h always said a learned matcher would implement that
-// interface; this is it. What the interface does NOT carry, and what callers
-// therefore have to know, is cost: brute force is ~3.5 ms for a pair, LightGlue
-// is tens of milliseconds, because it runs nine transformer layers over both
-// images' keypoints. It belongs behind pair selection and nowhere else --
-// `--pairs exhaustive` with `--matcher lightglue` on a thousand images is half
-// a million pairs and several hours.
-//
-// Like Extractor.h, nothing here may include an aliked/ header: src/sfm/ builds
-// without the inference layer, and the factory says so at run time.
+// 学习匹配器接口与实现工厂。暴力匹配每对约 3.5 ms，LightGlue 在双图特征上运行九层 Transformer，耗时数十毫秒，必须先筛选图像对。
+// 千张图像使用 exhaustive 配对约有五十万对，可能耗时数小时。
+// 接口不依赖推理层头文件；缺少推理层时由工厂在运行期报错。
 
 #include <memory>
 #include <string>
@@ -21,40 +11,34 @@
 namespace sfm {
 
 struct LightGlueOptions {
-    // "aliked-lightglue" (fetched and cached on first use) or a path to an
-    // .onnx file.
+    // 首次使用时下载并缓存 aliked-lightglue，也可指定 .onnx 文件路径。
     std::string model = "aliked-lightglue";
-    // COLMAP's LightGlueONNXMatchingOptions default.
+    // COLMAP 的 LightGlueONNXMatchingOptions 默认值。
     double min_score = 0.1;
     int    device = -1;
-    // Canonical uuid:<hex>; committed to the shared NN before LightGlue's
-    // weights load. "" leaves NN's own precedence in charge.
+    // 规范形式 uuid:<hex>；加载 LightGlue 权重前提交给共享 NN；空值沿用 NN 自身的设备选择优先级。
     std::string device_selector;
     bool   verbose = true;
 };
 
-// LoMa's matcher. Five released variants, all nine layers; they differ in the
-// embedding width and in which descriptor they were trained against, and both
-// are read off the checkpoint rather than spelled here.
+// LoMa 的五种已发布匹配器均为九层；嵌入宽度和训练所用描述子从权重文件读取。
 struct LomaMatchOptions {
-    // "loma-b", "loma-b128", "loma-r", "loma-l", "loma-g" (fetched and cached)
-    // or a path to an .onnx file. Empty means "whatever --matcher named".
+    // 下载并缓存 loma-b、loma-b128、loma-r、loma-l、loma-g，也可指定 .onnx 路径；空值沿用 --matcher 指定的版本。
     std::string model;
-    // COLMAP's LomaMatchingOptions default, and LoMa's own filter threshold.
+    // COLMAP 的 LomaMatchingOptions 默认值，也是 LoMa 自身的过滤阈值。
     double min_score = 0.1;
     int    device = -1;
-    // Canonical uuid:<hex>; see LightGlueOptions::device_selector.
+    // 规范形式 uuid:<hex>；参见 LightGlueOptions::device_selector。
     std::string device_selector;
     bool   verbose = true;
 };
 
 bool isLearnedMatcher(const std::string& type);
 
-// Throws std::runtime_error naming the type when it is unknown, or when it is
-// learned and this binary has no inference layer.
+// 类型未知，或当前构建缺少所需推理层时，抛出包含类型名称的 std::runtime_error。
 std::unique_ptr<IFeatureMatcher> createFeatureMatcher(const std::string& type,
                                                       const MatchOptions& match,
                                                       const LightGlueOptions& lightglue,
                                                       const LomaMatchOptions& loma);
 
-}  // namespace sfm
+}  // 命名空间 sfm

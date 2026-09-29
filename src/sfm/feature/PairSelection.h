@@ -1,36 +1,6 @@
-// GPU pair selection: decide which pairs are worth full matching by matching a
-// small top-scale descriptor subset of one image against the other image's
-// descriptors, then keeping only each image's best-scoring partners. This is
-// the "pair selection" step commercial SfM pipelines run instead of exhaustive
-// matching; it fills the roadmap's retrieval slot without a vocabulary tree
-// (docs/notes/sfm-design.md D35).
-//
-// Why this form: exhaustive full matching is quadratic in *pair count* -- at
-// the measured 3.5 ms/pair, 1000 images is 500k pairs, ~30 min -- and on
-// sparse collections most of those pairs die in verification anyway.
-// The score used here is a subsample of the true objective:
-// the number of ratio-test survivors when the K largest-scale features of one
-// image are matched against the other image's features, computed by the same
-// GPU brute-force matcher. Scoring stays O(N^2) but with a constant small
-// enough that full matching, now O(N*k), dominates again. A vocabulary tree
-// only becomes interesting when even the reduced O(N^2) sweep hurts (~10k
-// images); its score is also a strictly weaker pair-relevance signal than
-// actually matching descriptors.
-//
-// The scoring is deliberately asymmetric (mini query vs full train). The
-// symmetric mini-vs-mini variant is ~30x cheaper again but was measured and
-// rejected *as the score*: requiring both endpoints of a correspondence to fall
-// in their image's top-K squares the selection loss, and a 256-descriptor train
-// side makes the ratio test toothless (the second-best distance is far), so
-// real pairs score low while junk scores nonzero.
-//
-// It is a perfectly good *shortlist*, though, and that is what it is used for
-// here (D56). The asymmetric score is what decides, but it only has to decide
-// among a few times as many candidates as it will keep -- so the cheap
-// symmetric pass runs over all N^2 pairs and the expensive reliable one over a
-// list linear in N. At 1000 images that is 54 s of the match stage's 107 s
-// turned into single digits, and the saving grows with N because the quadratic
-// term is the one that shrank.
+// GPU 两级图像对筛选：先对全部 N² 对做低成本双侧子集匹配，再对短名单执行可靠的单侧子集对完整特征评分，保留逐图 top-k。
+// 完整穷举按 3.5 ms/对计，千图约需半小时；粗筛约便宜 30 倍，但双侧截断削弱真实对应及距离比判据，不能直接作为最终得分。
+// 两级流程将昂贵部分降为近线性规模，千图测量中筛选从 54 s 降至个位数秒；更大数据才需考虑词汇树（D35/D56）。
 #pragma once
 
 #include <algorithm>
@@ -47,41 +17,25 @@
 namespace sfm {
 
 struct PairSelectionOptions {
-    uint32_t num_features = 512;  // K: per-image top-scale query subset
-    // Train-side cap. Scoring cost is num_features * train_features; the
-    // default full-resolution train side is what makes the score reliable.
-    // 0 = no cap (use every descriptor).
+    uint32_t num_features = 512;  // 每图查询子集的最高等级特征数 K
+    // 训练侧默认保留全部以保证评分可靠，train_features=0 表示不限制。
     uint32_t train_features = 0;
-    uint32_t num_neighbors = 32;  // k: keep each image's k best-scoring partners
-    uint32_t min_score = 4;       // mini-matches below this never qualify a pair
-    // Coarse shortlist pass: both sides capped to this many descriptors, over
-    // every pair, keeping each image's `coarse_neighbors` best. Only the
-    // survivors get the reliable asymmetric score above. 0 scores every pair
-    // the expensive way, which is what a small capture wants -- the shortlist
-    // is only worth its own pass once N^2 is the problem.
+    uint32_t num_neighbors = 32;  // 每图保留得分最高的 k 个伙伴
+    uint32_t min_score = 4;       // 最终得分低于此值不保留
+    // 粗筛限制双侧描述子数并保留 coarse_neighbors 个候选，0 表示直接对全部图像对精确评分。
     uint32_t coarse_features = 256;
     uint32_t coarse_neighbors = 128;
     uint32_t coarse_min_images = 200;
-    // Lowe ratio for the scoring pass. Independent of the full matcher's
-    // ratio: scoring only ranks pairs, so it can afford to be looser.
+    // 评分阶段独立的 Lowe 比值，只用于排序，可比完整匹配更宽松。
     float ratio = 0.8f;
-    // Scoring problems are ~1/32 the size of full matching, so batch more
-    // pairs per submit than the full matcher does.
+    // 评分问题约为完整匹配的 1/32，每次提交可处理更多图像对。
     int batch_pairs = 256;
     int device = -1;
-    std::string device_selector;   // canonical uuid:<hex>; "" = shared precedence
+    std::string device_selector;   // 规范 uuid:<hex>，空值沿用共享优先级
 };
 
-// Gather f's K best-ranked features (K = 0 or >= count keeps everything, but
-// still gathered in rank order). The canonical feature order is by position,
-// deliberately not by rank (D16), so this is an explicit host-side gather;
-// ties break by index.
-//
-// "Rank" is scale for SIFT and the detection score for a detector that has no
-// scale -- FeatureSet::rank picks. Reading `scale` unconditionally, as this
-// did, silently selected an arbitrary 512 keypoints out of an ALIKED set,
-// because every one of them has scale 0. That is the failure mode this whole
-// stage is least able to show: the shortlist still looks populated.
+// 显式按 FeatureSet::rank 收集 top-K，平局按索引；SIFT 用尺度，无尺度检测器用分数。
+// K=0 或大于总数时仍按等级排序收集全部；不能假定学习特征的 scale 非零。
 inline FeatureSet topScaleSubset(const FeatureSet& f, uint32_t K) {
     if (K == 0 || K > f.count()) K = f.count();
     std::vector<uint32_t> idx(f.count());
@@ -107,11 +61,7 @@ inline FeatureSet topScaleSubset(const FeatureSet& f, uint32_t K) {
 
 namespace detail {
 
-// Count the ratio-test survivors of every ordered (query, train) pair on the
-// GPU. `sets` is the matcher's one index space: [0, n) query subsets,
-// [n, 2n) train sides. Only the counts are wanted, so the matcher counts on the
-// spot rather than building (and immediately discarding) half a million match
-// lists.
+// GPU 仅统计每个有序查询、训练对通过比值测试的数量；索引空间前 n 项为查询子集，后 n 项为训练侧，避免创建大量匹配列表。
 inline std::vector<uint32_t> scoreOrderedPairs(
     const std::vector<const FeatureSet*>& sets,
     const std::vector<std::pair<uint32_t, uint32_t>>& pairs, const PairSelectionOptions& opt,
@@ -123,17 +73,12 @@ inline std::vector<uint32_t> scoreOrderedPairs(
     mo.batch_pairs = opt.batch_pairs;
     mo.max_num_matches = 0;
     mo.max_ratio = opt.ratio;
-    // No cross-check: the ratio test against a full-size train side is already
-    // selective, and skipping it means the matcher never dispatches the column
-    // reduction or downloads the train-side results -- at K=256 queries that
-    // cuts the readback per pair from (K + n_train) to K entries, ~33x here.
+    // 完整训练侧的比值测试已具选择性，跳过交叉检查及列结果；K=256 时每对回读由 K+n_train 降至 K，约节省 33 倍。
     mo.cross_check = false;
     BruteForceMatcher matcher(mo);
 
     std::vector<uint32_t> score(pairs.size(), 0);
-    // How often progress is reported, and how much of the list the matcher sees
-    // at once -- it chunks the range itself. A hundredth of the list, so a
-    // selection that is minutes long reports through it and not once at the end.
+    // 每次处理约列表百分之一以持续报告进度，匹配器内部再按预算分块。
     const size_t batch = (size_t)std::max(1, opt.batch_pairs);
     const size_t chunk = std::max(batch, std::min(batch * 64, pairs.size() / 100 + 1));
     std::vector<uint32_t> out;
@@ -146,11 +91,11 @@ inline std::vector<uint32_t> scoreOrderedPairs(
     return score;
 }
 
-// Union of each image's `k` best partners, from unordered (i<j, score) edges.
+// 由无序加权边取各图像 top-k 伙伴的并集。
 inline std::vector<std::pair<uint32_t, uint32_t>> topPartners(
     uint32_t n, const std::vector<std::pair<uint32_t, uint32_t>>& cand,
     const std::vector<uint32_t>& edge_score, uint32_t k, uint32_t min_score) {
-    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> adj(n);  // (score, partner)
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> adj(n);  // （分数，伙伴索引）
     for (size_t e = 0; e < cand.size(); e++) {
         const uint32_t s = edge_score[e];
         if (s < min_score) continue;
@@ -177,12 +122,9 @@ inline std::vector<std::pair<uint32_t, uint32_t>> topPartners(
     return sel;
 }
 
-}  // namespace detail
+}  // 命名空间 detail
 
-// Score candidate pairs and return the union of each image's top-k partners,
-// in lexicographic pair order. Deterministic: the matcher is exact, subset
-// selection and every tie-break are index-ordered. `progress(done, total)` is
-// optional.
+// 候选评分后输出逐图 top-k 并集，按图像对字典序排列；子集与平局均按索引确定，保证可复现。
 inline std::vector<std::pair<uint32_t, uint32_t>> prefilterPairs(
     const std::vector<FeatureSet>& feats, const PairSelectionOptions& opt,
     const std::function<void(size_t, size_t)>& progress = nullptr) {
@@ -191,8 +133,8 @@ inline std::vector<std::pair<uint32_t, uint32_t>> prefilterPairs(
     const size_t all_ordered = (size_t)n * (n - 1);
     const bool coarse = opt.coarse_features > 0 && n >= opt.coarse_min_images;
 
-    // ---- candidates ------------------------------------------------------
-    // Either every pair, or the shortlist a symmetric mini-vs-mini pass keeps.
+    // ---------------- 候选列表 ----------------
+    // 使用全部图像对，或双侧小子集粗筛保留的短名单。
     std::vector<std::pair<uint32_t, uint32_t>> cand;
     size_t done_pairs = 0;
     if (coarse) {
@@ -202,9 +144,7 @@ inline std::vector<std::pair<uint32_t, uint32_t>> prefilterPairs(
             mini[i] = topScaleSubset(feats[i], opt.coarse_features);
             sets[i] = sets[(size_t)n + i] = &mini[i];
         }
-        // Both sides are a few tens of kilobytes, so the whole coarse train
-        // side is resident and the order is free; one direction per pair is
-        // enough to shortlist.
+        // 粗筛两侧仅数十 KB，可全部常驻显存，每对只需一个方向。
         std::vector<std::pair<uint32_t, uint32_t>> ordered;
         ordered.reserve(all_ordered / 2);
         for (uint32_t i = 0; i < n; i++)
@@ -212,8 +152,7 @@ inline std::vector<std::pair<uint32_t, uint32_t>> prefilterPairs(
         std::vector<uint32_t> s =
             detail::scoreOrderedPairs(sets, ordered, opt, 0, all_ordered, progress);
         for (auto& p : ordered) p.second -= n;
-        // min_score belongs to the deciding pass; a shortlist that applies it
-        // would throw away pairs the reliable score has not seen yet.
+        // min_score 仅用于最终评分，不能在粗筛提前丢弃尚未可靠评估的图像对。
         cand = detail::topPartners(n, ordered, s, opt.coarse_neighbors, 1);
         done_pairs = all_ordered / 2;
     } else {
@@ -222,13 +161,8 @@ inline std::vector<std::pair<uint32_t, uint32_t>> prefilterPairs(
             for (uint32_t j = i + 1; j < n; j++) cand.emplace_back(i, j);
     }
 
-    // ---- the deciding score ----------------------------------------------
-    // One index space drives the matcher: [0, n) are the query subsets,
-    // [n, 2n) the train sides, and every scoring pair is (query i, train j).
-    // The train side is the memory cost (the queries are ~32 KB each), so it
-    // gets the optional cap -- and when it is uncapped the view points straight
-    // at the caller's feature sets instead of copying a gigabyte of
-    // descriptors.
+    // ---------------- 最终评分 ----------------
+    // 查询位于 [0,n)，训练位于 [n,2n)；完整训练描述子占主要内存，无上限时直接引用调用方数据，避免 GB 级复制。
     std::vector<FeatureSet> owned(n + (opt.train_features == 0 ? 0 : (size_t)n));
     std::vector<const FeatureSet*> sets(2 * (size_t)n);
     for (uint32_t i = 0; i < n; i++) {
@@ -242,18 +176,14 @@ inline std::vector<std::pair<uint32_t, uint32_t>> prefilterPairs(
         }
     }
 
-    // Both directions of every candidate -- (i queries, j trains) and the
-    // reverse -- and a pair's score is the max of the two. One direction alone
-    // misses pairs whose shared content is top-scale-prominent in only one of
-    // the two images. Train-major order: all queries against one train side
-    // before moving to the next, so the matcher's resident-descriptor allocator
-    // streams each full-size train set through VRAM once instead of thrashing.
+    // 各候选双向评分并取最大值，避免共同内容只在一侧大尺度子集中显著而漏配。
+    // 按训练图优先遍历，使每个完整训练集只需流过显存一次。
     std::vector<std::pair<uint32_t, uint32_t>> ordered;
-    std::vector<size_t> edge_of;  // parallel: which candidate each direction is
+    std::vector<size_t> edge_of;  // 与各方向对应的候选索引
     ordered.reserve(2 * cand.size());
     edge_of.reserve(2 * cand.size());
     {
-        std::vector<std::vector<std::pair<uint32_t, size_t>>> by_train(n);  // (query, edge)
+        std::vector<std::vector<std::pair<uint32_t, size_t>>> by_train(n);  // （查询索引，边索引）
         for (size_t e = 0; e < cand.size(); e++) {
             by_train[cand[e].second].emplace_back(cand[e].first, e);
             by_train[cand[e].first].emplace_back(cand[e].second, e);
@@ -274,4 +204,4 @@ inline std::vector<std::pair<uint32_t, uint32_t>> prefilterPairs(
     return detail::topPartners(n, cand, edge_score, opt.num_neighbors, opt.min_score);
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

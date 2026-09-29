@@ -1,19 +1,5 @@
-// The extractor seam: what `extract` calls, and the factory that decides which
-// one it gets.
-//
-// GPU SIFT (sfm/feature/Sift.h) was the only implementation and the extract
-// stage constructed it directly. That is no longer true -- ALIKED
-// (src/aliked/) implements the same contract -- and the indirection buys two
-// things beyond the obvious:
-//
-//   * the SIFT extractor's Vulkan context is not created when it is not the
-//     one selected, which matters because ALIKED carries the inference layer's
-//     own device and two live devices on one GPU is something this repository
-//     sequences deliberately (AGENTS.md);
-//   * each extractor states what it needs from the loader (color, working
-//     resolution) rather than the CLI knowing per-type rules.
-//
-// Nothing above this seam assumes 128-D uint8, a scale or an orientation.
+// 特征提取接口及实现工厂；仅创建所选提取器的设备上下文，避免 SIFT 与推理层同时占用同一 GPU。
+// 每种提取器声明所需颜色和工作分辨率；接口上层不假定描述子为 128 维 uint8，也不假定存在尺度或方向。
 #pragma once
 
 #include <memory>
@@ -25,74 +11,59 @@
 
 namespace sfm {
 
-// ALIKED's knobs. Deliberately not aliked::ExtractOptions: src/sfm/ must build
-// without the inference layer, so nothing here may include an aliked/ header.
+// SfM 必须能在没有推理层时构建，因此使用独立的 ALIKED 配置，不能包含其模型头文件。
 struct AlikedOptions {
-    // "aliked-n16rot" or "aliked-n32" (fetched and cached on first use), or a
-    // path to an .onnx file. The two released variants differ only in how many
-    // sample positions the descriptor head uses.
+    // 首次使用时下载并缓存 aliked-n16rot 或 aliked-n32，也可指定 .onnx 路径；两版本仅描述子头的采样位置数不同。
     std::string model = "aliked-n16rot";
-    int   max_num_features = 2048;   // COLMAP's AlikedExtractionOptions default
+    int   max_num_features = 2048;   // COLMAP 的 AlikedExtractionOptions 默认值
     double min_score = 0.2;
     bool  verbose = true;
     int   device = -1;
-    // Canonical uuid:<hex>; the learned frontend configures the shared NN with
-    // this before it loads a model, so the int above never selects a device by
-    // itself.
+    // 规范形式 uuid:<hex>；学习前端在加载模型前用它配置共享 NN，不能仅靠上述整数选择设备。
     std::string device_selector;
 };
 
-// LoMa's knobs. Deliberately not loma::ExtractOptions, for the same reason as
-// AlikedOptions: src/sfm/ must build without the inference layer.
+// 独立的 LoMa 配置，与 AlikedOptions 一样，保证 SfM 可脱离推理层构建。
 struct LomaOptions {
-    // Which variant's DESCRIPTOR runs -- "loma-b128" (DeDoDe-B, 128-D) or any
-    // of loma-b / loma-r / loma-l / loma-g (DeDoDe-G, 256-D). The DaD detector
-    // is shared by all five, so this only picks the descriptor.
+    // loma-b128 使用 DeDoDe-B 的 128 维描述子；loma-b / loma-r / loma-l / loma-g 使用 DeDoDe-G 的 256 维描述子。五种版本共享 DaD 检测器。
     std::string variant = "loma-b128";
-    // Paths to .onnx files, overriding what `variant` names. Empty = fetch.
+    // .onnx 路径，覆盖 variant 对应的模型；空值表示下载。
     std::string detector_model;
     std::string descriptor_model;
-    int    max_num_features = 2048;   // COLMAP's LomaExtractionOptions default
-    double min_score = 0.0;           // DaD's density has no useful floor
+    int    max_num_features = 2048;   // COLMAP 的 LomaExtractionOptions 默认值
+    double min_score = 0.0;           // DaD 的密度没有实用的下限
     bool   verbose = true;
     int    device = -1;
-    // Canonical uuid:<hex>; see AlikedOptions::device_selector.
+    // 规范形式 uuid:<hex>；参见 AlikedOptions::device_selector。
     std::string device_selector;
 };
 
 struct IFeatureExtractor {
     virtual ~IFeatureExtractor() = default;
 
-    // One image in, its features out, in the coordinates of `img` (the caller
-    // scales them back to the source file's, D46).
+    // 特征坐标属于 img；调用方负责缩放回原始文件的坐标系（D46）。
     virtual FeatureSet extract(const GrayImage& img) = 0;
 
     virtual const char* name() const = 0;
 
-    // Whether the loader has to decode color. SIFT works on luma; a learned
-    // detector was trained on RGB and must see it.
+    // SIFT 使用亮度；学习检测器以 RGB 训练，必须让加载器解码颜色。
     virtual bool wantsColor() const { return false; }
 };
 
-// Longest edge this extractor should run at when the user did not say, mirroring
-// COLMAP's FeatureExtractionOptions::EffMaxImageSize(): 3200 for SIFT and 1600
-// for either learned frontend, both of which are full-resolution-map bound.
+// 未显式设置时的最长边，与 COLMAP 的 FeatureExtractionOptions::EffMaxImageSize() 一致：SIFT 为 3200，学习前端为 1600；后者受全分辨率特征图开销限制。
 int defaultMaxImageSize(const std::string& type);
 
-// Whether `type` names one of the learned frontends (as opposed to "sift").
+// 判断 type 是否指定学习前端。
 bool isAlikedType(const std::string& type);
 bool isLomaType(const std::string& type);
 
-// Descriptor width a LoMa variant works in -- 128 for loma-b128, 256 for the
-// other four, 0 for anything else. `auto` refuses a --features / --matcher
-// pair that disagrees on it, before spending the extraction.
+// LoMa 描述子宽度：loma-b128 为 128，其余四种为 256，其他类型为 0；auto 在提取前拒绝宽度不一致的 --features / --matcher 组合。
 int lomaDescriptorDim(const std::string& variant);
 
-// Throws std::runtime_error naming the type when it is unknown, or when it is
-// learned and this binary was built without the inference layer.
+// 类型未知，或当前构建缺少所需推理层时，抛出包含类型名称的 std::runtime_error。
 std::unique_ptr<IFeatureExtractor> createFeatureExtractor(const std::string& type,
                                                           const SiftOptions& sift,
                                                           const AlikedOptions& aliked,
                                                           const LomaOptions& loma);
 
-}  // namespace sfm
+}  // 命名空间 sfm

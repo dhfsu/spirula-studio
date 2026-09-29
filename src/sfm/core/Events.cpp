@@ -1,4 +1,4 @@
-// Events.cpp -- see Events.h.
+// 运行事件实现，参见 Events.h。
 
 #include "sfm/core/Events.h"
 
@@ -12,12 +12,11 @@ namespace {
 std::mutex g_mu;
 Sink g_sink;
 
-// The mapping bar's own state, behind its own lock: map_placed is called from
-// the atom workers while a sink runs on whichever thread emitted.
+// 建图进度状态使用独立锁；原子工作线程会调用 map_placed，接收端则在事件发出线程执行。
 std::mutex g_map_mu;
 std::vector<char> g_placed;
 int64_t g_placed_n = 0;
-}  // namespace
+}  // 匿名命名空间
 
 void set_sink(Sink s) {
     std::lock_guard<std::mutex> lk(g_mu);
@@ -29,8 +28,7 @@ bool armed() {
     return (bool)g_sink;
 }
 
-// Verification calls this from its worker pool, so the lock is what orders
-// the stream; a sink must not call back into sfm::events.
+// 验证工作池并发发事件，通过锁保证顺序；接收端不得回调 sfm::events。
 void emit(const Event& e) {
     std::lock_guard<std::mutex> lk(g_mu);
     if (g_sink) g_sink(e);
@@ -75,9 +73,9 @@ void map_placed(uint32_t image) {
         done = ++g_placed_n;
         total = (int64_t)g_placed.size();
     }
-    // Once per image over the whole stage, so there is nothing to rate-limit.
+    // 每阶段每图像只发一次，无需限流。
     progress(Stage::Map, done, total);
 }
 
-}  // namespace events
-}  // namespace sfm
+}  // 命名空间 events
+}  // 命名空间 sfm

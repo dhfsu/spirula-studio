@@ -1,24 +1,7 @@
 #pragma once
 
-// The product name, as data rather than as a literal.
-//
-// Policy: the Latin wordmark stays the logo everywhere, and the localized name
-// is in-text copy -- window titles, About, prose. This is what Blender, Krita
-// and Godot do, and it avoids maintaining five logo lockups.
-//
-// The exception is Chinese, where a Latin-only name genuinely does not take:
-// CJK markets adopt local names whether or not the vendor supplies one, and
-// the failure mode this file exists to prevent is users independently
-// inventing three different ones. 旋影工坊 is written with four characters that
-// are IDENTICAL in Simplified and Traditional, so one name serves both
-// scripts, and 旋 ("spiral, revolve") keeps the sense of *Spirula*.
-//
-// Japanese and Korean pin a transliteration for the same reason -- left alone,
-// スピルラ / スピルーラ / スパイルラ all appear -- but keep "Spirula Studio"
-// beside it, since that is what the window decoration and the download say.
-//
-// Russian keeps the Latin wordmark: Russian technical users do not translate
-// product names, and a Cyrillic gloss belongs in prose, not in a title bar.
+// 品牌名称作为消息数据管理；拉丁字标用于标志，本地化名称用于窗口标题和正文。
+// 中文统一为简繁同形的“旋影工坊”；日语、韩语固定音译并保留 Spirula Studio，避免名称分化。俄语标题保留拉丁品牌名。
 
 #include "i18n/BeginCatalog.h"
 
@@ -36,16 +19,7 @@ SS_MSG(product,
     NL("Spirula Studio"),      RU("Spirula Studio"),
     TR("Spirula Studio"));
 
-// The window decoration.
-//
-// Not `product` on its own: the languages that pin a local name keep the Latin
-// wordmark beside it here, because the title bar is where someone matches the
-// window to the thing they downloaded and to the process in a task manager.
-// The languages that do not translate the name at all just repeat it.
-//
-// Written out per language rather than assembled from `product` and a
-// separator -- a title is copy like any other, and one that reads
-// "<name> - Spirula Studio" is a choice each language gets to make.
+// 窗口标题逐语言完整定义；本地化名称旁保留拉丁品牌，便于与下载文件和任务管理器进程对应，不能由片段拼接。
 SS_MSG(window_title,
     EN("Spirula Studio"),
     JA("スピルラ・スタジオ — Spirula Studio"),
@@ -61,7 +35,7 @@ SS_MSG(window_title,
     RU("Spirula Studio"),
     TR("Spirula Studio"));
 
-// One line, under the wordmark on the home screen and in About.
+// 首页字标下方及关于窗口中的单行介绍。
 SS_MSG(tagline,
     EN("Reconstruct 3D scenes from photos with Gaussian splatting."),
     JA("写真からガウススプラッティングで3Dシーンを再構成します。"),
@@ -92,9 +66,9 @@ SS_MSG(about_line,
     RU("Обучает модели 3D Gaussian Splatting."),
     TR("3D Gaussian Splatting modelleri eğitir."));
 
-}  // namespace brand
-}  // namespace msg
-}  // namespace i18n
-}  // namespace spirula
+}  // 命名空间 brand
+}  // 命名空间 msg
+}  // 命名空间 i18n
+}  // 命名空间 spirula
 
 #include "i18n/EndCatalog.h"

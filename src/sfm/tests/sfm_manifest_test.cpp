@@ -1,8 +1,4 @@
-// The manifest and the YAML subset under it.
-//
-// Two things have to hold for a file people edit by hand: what YAML says is
-// what the config gets, and the same capture written as JSON says the same
-// thing -- so a Python script and a text editor are interchangeable.
+// 测试清单及 YAML 子集，要求 YAML 配置语义准确且与等价 JSON 一致，支持手工编辑与脚本生成。
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -38,7 +34,7 @@ static int cmdManifestTest(int, char**) {
     std::filesystem::remove_all(dir, ec);
     std::filesystem::create_directories(dir, ec);
 
-    // ---- the YAML subset ----
+    // ---------------- YAML 子集 ----------------
     const JsonValue doc = yaml_parse(
         "# comment\n"
         "a: 1\n"
@@ -67,13 +63,12 @@ static int cmdManifestTest(int, char**) {
           "a mapping's later keys line up under the first");
     check(doc.find("after")->str == "done", "the mapping resumes after a sequence");
 
-    // A sequence at its key's own indent is what yaml_write emits, so the
-    // reader has to take it back.
+    // 读取器须接受写入器生成的与键同级缩进序列。
     const JsonValue flat = yaml_parse("k:\n- 1\n- 2\nnext: 3\n");
     check(flat.find("k")->arr.size() == 2, "sequence at the key's own indent");
     check(flat.find("next")->as_int() == 3, "and the next key after it");
 
-    // Writers are fixed points, and JSON reads back as the same value.
+    // 反复写读稳定，JSON 读回相同值。
     const std::string ytext = yaml_write(doc);
     const std::string jtext = json_write(doc);
     check(yaml_write(yaml_parse(ytext)) == ytext, "yaml_write round trips");
@@ -87,7 +82,7 @@ static int cmdManifestTest(int, char**) {
     }
     check(threw, "a tab in the indentation is an error");
 
-    // ---- the manifest ----
+    // ---------------- 数据清单 ----------------
     const std::string yml = dir + "/m.yaml";
     write_file(yml,
                "image_dir: pics\n"
@@ -136,7 +131,7 @@ static int cmdManifestTest(int, char**) {
     check(m.cameras[1].prefix == "cam0" && m.cameras[1].distortion.size() == 2,
           "the group's lens and distortion");
 
-    // The same capture as JSON is the same manifest.
+    // 等价 JSON 产生相同清单。
     const std::string jsn = dir + "/m.json";
     write_file(jsn, manifest_write(m, /*json=*/true));
     Manifest mj = manifest_read(jsn);
@@ -145,7 +140,7 @@ static int cmdManifestTest(int, char**) {
     check(manifest_write(manifest_read(dir + "/m2.yaml")) == manifest_write(m),
           "a written manifest reads back");
 
-    // ---- precedence ----
+    // ---------------- 配置优先级 ----------------
     SfmConfig cfg;
     std::string image_dir;
     check(manifest_apply(m, cfg, {}, image_dir).empty(), "apply succeeds");
@@ -162,8 +157,7 @@ static int cmdManifestTest(int, char**) {
           "a capture's telemetry resolves against the manifest");
     check(cfg.rigs.size() == 2 && cfg.rigs[0].captures[1] == "clip2", "the rigs reach the config");
     {
-        // The definitions against a tree: captures key frames apart, the bare
-        // rig pairs by name, and a conflict is refused.
+        // 验证采集前缀区分同名帧、普通 rig 按名称配对，以及归属冲突被拒绝。
         std::vector<std::string> names = {"clip1/cam0/00001.jpg", "clip1/cam1/00001.jpg",
                                           "clip2/cam0/00001.jpg", "clip2/cam1/00001.jpg",
                                           "clip2/cam1/00002.jpg", "left/a.jpg", "right/a.jpg"};
@@ -199,9 +193,7 @@ static int cmdManifestTest(int, char**) {
     check(image_dir2 == "given/images", "a positional image directory beats the file");
     check(cfg2.camera_mode != "single", "a --camera-mode flag beats the file");
 
-    // --no-masks against a manifest that names a mask_dir. The flag has to
-    // CLAIM the field, not merely clear it: the file fills in afterwards, and
-    // a run told to keep features out of the masks got them back this way.
+    // no-masks 须标记字段已显式设置，不能只清空，否则后应用的清单会重新启用掩码。
     {
         write_file(dir + "/masked.yaml",
                    "image_dir: images\nmask_dir: masks\n");
@@ -225,8 +217,7 @@ static int cmdManifestTest(int, char**) {
               "and then the manifest's mask_dir is what is used");
     }
 
-    // A rig kind fills in the extrinsics it implies and survives a round trip;
-    // an explicit member refine does too.
+    // rig 类型推导外参与显式 refine 均须经读写往返保留。
     {
         write_file(dir + "/kind.yaml",
                    "rigs:\n"
@@ -267,7 +258,7 @@ static int cmdManifestTest(int, char**) {
         check(bad_kind, "an unknown rig kind names itself");
     }
 
-    // An unknown lens is caught where it is written, not 40 minutes in.
+    // 未知镜头模型应在解析时立即报告。
     write_file(dir + "/bad.yaml", "cameras:\n  - prefix: cam0\n    model: banana\n");
     threw = false;
     try {

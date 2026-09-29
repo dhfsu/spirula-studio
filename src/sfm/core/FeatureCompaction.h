@@ -1,4 +1,4 @@
-// Lossless in-memory removal of feature rows no stored match references.
+// 在内存中无损删除未被任何已存储匹配引用的特征行。
 #pragma once
 
 #include <cstddef>
@@ -28,7 +28,7 @@ inline std::runtime_error compactionError(const std::string& what) {
 
 namespace feature_compaction_detail {
 
-// UINT32_MAX is the unused sentinel, so retained endpoint indices end one below it.
+// UINT32_MAX 表示未使用，保留特征的最大索引须比它小 1。
 inline StoredFeatureIndex checkedCompactIndex(uint64_t index) {
     if (index >= uint64_t(kUnusedFeature))
         throw compactionError("compact feature index " + std::to_string(index) +
@@ -36,7 +36,7 @@ inline StoredFeatureIndex checkedCompactIndex(uint64_t index) {
     return static_cast<StoredFeatureIndex>(index);
 }
 
-}  // namespace feature_compaction_detail
+}  // 命名空间 feature_compaction_detail
 
 struct FeatureCompactionStats {
     uint64_t original_features = 0;
@@ -52,11 +52,11 @@ struct FeatureCompactionStats {
 struct FeatureCompactionPlan {
     FeatureCompactionStats stats;
 
-    // Per original feature row: compact index, or UINT32_MAX when unreferenced.
+    // 逐原始特征行保存压缩索引，未引用时为 UINT32_MAX。
     std::vector<std::vector<StoredFeatureIndex>> old_to_new;
     std::vector<uint32_t> compact_counts;
 
-    // Snapshots reject mutation between planning and endpoint remapping.
+    // 快照检查禁止规划与端点重映射之间修改数据。
     std::vector<std::string> image_names;
     std::vector<uint32_t> image_feature_counts;
     std::vector<Camera> cameras;
@@ -141,7 +141,7 @@ inline FeatureCompactionPlan buildFeatureCompactionPlan(const MatchesDatabase& d
             mapped = feature_compaction_detail::checkedCompactIndex(next);
             next++;
         }
-        // Each input feature count is uint32_t, so next cannot exceed UINT32_MAX.
+        // 输入特征数为 uint32_t，因此 next 不会超过 UINT32_MAX。
         if (next > uint64_t(std::numeric_limits<uint32_t>::max()))
             throw compactionError("compact feature count exceeds the file-format range");
         plan.compact_counts[i] = static_cast<uint32_t>(next);
@@ -282,4 +282,4 @@ inline void remapMatches(MatchesDatabase& db, const FeatureCompactionPlan& plan,
     }
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

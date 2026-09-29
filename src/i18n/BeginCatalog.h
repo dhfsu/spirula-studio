@@ -1,18 +1,5 @@
-// Short per-language tag macros for writing catalog entries. Deliberately
-// NOT #pragma once: a translation unit may include several catalogs, and each
-// pairs this file with EndCatalog.h, which #undefs the tags again so EN/JA/...
-// never leak into ordinary code.
-//
-//     #include "i18n/BeginCatalog.h"
-//     namespace spirula::i18n::msg::gui {
-//     SS_MSG(start_training, EN("Start Training"), JA("..."), ...);
-//     }
-//     #include "i18n/EndCatalog.h"
-//
-// The tags are written out by hand because a macro cannot define macros. The
-// canary at the bottom is what keeps that list honest: add a language to
-// SS_LANGUAGES without adding a tag here and the build fails HERE, naming this
-// file, rather than on whichever catalog message happened to compile first.
+// 消息目录的语言标签宏，须与 EndCatalog.h 配对使用；不使用 #pragma once，使同一翻译单元可包含多个目录且标签不会泄漏。
+// 宏无法定义宏，因此标签手工列出；末尾静态检查保证 SS_LANGUAGES 新增语言时必须同步补充标签。
 
 #include "i18n/Message.h"
 
@@ -44,7 +31,7 @@ inline constexpr Msg kTagCanary{
 static_assert(kTagCanary.complete(),
               "i18n: src/i18n/BeginCatalog.h is missing a tag macro for a "
               "language in SS_LANGUAGES -- add it there too");
-}  // namespace detail
-}  // namespace i18n
-}  // namespace spirula
+}  // 命名空间 detail
+}  // 命名空间 i18n
+}  // 命名空间 spirula
 #endif

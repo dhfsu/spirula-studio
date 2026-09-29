@@ -1,28 +1,14 @@
-# One Vulkan link target, `ss_vulkan`, for the three modules that each carry
-# their own Vulkan context: the compute backend, SfM and the inference layer.
-#
-# On macOS the default links MoltenVK statically, because the alternative does
-# not survive being copied: a loader-linked binary records an absolute
-# /opt/homebrew path for libvulkan, and the driver manifest that tells the
-# loader where MoltenVK lives is Homebrew's too, so the binary runs only on the
-# machine that built it. Statically linked, it depends on nothing outside
-# /System and /usr/lib and needs no manifest, no VK_DRIVER_FILES and no
-# installed loader. The cost is that a static build has no loader to load
-# validation layers -- configure with -DSS_MACOS_VULKAN=loader for that.
-#
-# Everywhere else this is the platform loader as found by FindVulkan.
+# 为各自持有上下文的模块提供统一 Vulkan 链接目标 ss_vulkan。
+# macOS 默认静态链接 MoltenVK，使程序仅依赖 /System 和 /usr/lib，避免依赖构建机上的 Homebrew 绝对路径、驱动清单和加载器。
+# 静态构建无法加载验证层，需用 -DSS_MACOS_VULKAN=loader 启用；其他平台使用 FindVulkan 找到的加载器。
 
 set(SS_MOLTENVK_VERSION "1.4.2")
 set(SS_MOLTENVK_DIR "" CACHE PATH
     "Unpacked MoltenVK release (holds MoltenVK/include and MoltenVK/static); \
 empty = fetch the pinned release")
 
-# _ss_fetch_moltenvk(<lib_var> <include_var>)
-#
-# Locates the pinned MoltenVK package, downloading it into the build tree on a
-# miss. The upstream release is the only source of a *universal* static library
-# (Homebrew's is arm64-only), and it carries the Vulkan headers with it, so the
-# macOS build needs no Vulkan SDK and no Homebrew at all.
+# _ss_fetch_moltenvk(<lib_var> <include_var>) 查找固定版本的 MoltenVK，缺失时下载到构建目录。
+# 上游包提供通用架构静态库及 Vulkan 头文件，避免依赖仅含 arm64 的 Homebrew 库或本机 Vulkan SDK。
 function(_ss_fetch_moltenvk lib_var include_var)
     set(_root "${SS_MOLTENVK_DIR}")
     if(NOT _root)
@@ -41,9 +27,7 @@ function(_ss_fetch_moltenvk lib_var include_var)
                     "hand and pass -DSS_MOLTENVK_DIR=/path/to/MoltenVK, or "
                     "build against the loader with -DSS_MACOS_VULKAN=loader.")
             endif()
-            # The release nests everything under a MoltenVK/ directory; keep
-            # the two parts the build reads and drop the ~25 MB of dynamic
-            # framework and iOS slices beside them.
+            # 发行包内容位于 MoltenVK/；仅保留构建所需的两部分，删除约 25 MB 的动态框架与 iOS 切片。
             file(ARCHIVE_EXTRACT INPUT ${_tar} DESTINATION ${_root}
                 PATTERNS "MoltenVK/MoltenVK/include/*"
                          "MoltenVK/MoltenVK/static/*")
@@ -65,7 +49,7 @@ function(_ss_fetch_moltenvk lib_var include_var)
     set(${include_var} ${_inc} PARENT_SCOPE)
 endfunction()
 
-# SfM requires Vulkan headers new enough for its device capability queries.
+# SfM 设备能力查询要求足够新的 Vulkan 头文件。
 set(SS_VULKAN_HEADERS_MIN 277)
 set(SS_VULKAN_HEADERS_VERSION "1.4.357")
 
@@ -81,9 +65,7 @@ function(_ss_vulkan_header_version inc out_var)
     endif()
 endfunction()
 
-# Unpacks the pinned Vulkan-Headers release into the build tree. Header-only
-# and architecture-independent, so this covers every platform whose loader is
-# current but whose headers are not.
+# 将固定版本 Vulkan-Headers 解压到构建目录；纯头文件且与架构无关，适用于加载器较新但系统头文件过旧的平台。
 function(_ss_fetch_vulkan_headers out_var)
     set(_name "Vulkan-Headers-${SS_VULKAN_HEADERS_VERSION}")
     set(_inc ${CMAKE_BINARY_DIR}/${_name}/include)
@@ -105,10 +87,7 @@ function(_ss_fetch_vulkan_headers out_var)
     set(${out_var} ${_inc} PARENT_SCOPE)
 endfunction()
 
-# ss_vulkan_lib()
-#
-# Defines the `ss_vulkan` interface target. Idempotent: the three modules that
-# need Vulkan each call it, and whichever runs first wins.
+# ss_vulkan_lib() 幂等定义 ss_vulkan 接口目标；多个模块均可调用，以首次调用为准。
 function(ss_vulkan_lib)
     if(TARGET ss_vulkan)
         return()
@@ -128,8 +107,7 @@ function(ss_vulkan_lib)
             "-framework CoreGraphics"
             "-framework AppKit")
         target_include_directories(ss_vulkan SYSTEM INTERFACE ${_mvk_inc})
-        # VulkanContext skips VK_KHR_portability_enumeration when the
-        # extension is absent, which it is with no loader in the picture.
+        # 无加载器时缺少 VK_KHR_portability_enumeration，VulkanContext 会在扩展不存在时跳过它。
         return()
     endif()
 

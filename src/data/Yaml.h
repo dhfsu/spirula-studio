@@ -1,17 +1,8 @@
 #pragma once
 
-// Yaml.h -- a practical YAML subset on top of Json.h's value model, plus the
-// two writers, so a file this program reads can be hand-edited or generated.
-//
-// YAML 1.2 is a JSON superset, so `yaml_parse` accepts JSON verbatim: a
-// document opening with `{` or `[` is handed to json_parse, which is exact
-// about it. Everything else is read as block YAML.
-//
-// Supported: block mappings and sequences, single-line flow collections,
-// plain / 'single' / "double" scalars, `|` and `>` block scalars, `#`
-// comments, a leading `---`. NOT supported, and an error rather than a
-// silent misreading: anchors, aliases, tags, multiple documents, and flow
-// collections spanning lines (use JSON for those).
+// 基于 Json.h 值模型实现实用 YAML 子集，并提供 JSON/YAML 写入器。
+// 以 { 或 [ 开头的文档交给 JSON 解析；其余支持块映射、序列、单行流式集合、普通或引号标量、|/> 块标量、注释及起始 ---。
+// 锚点、别名、标签、多文档和跨行流式集合明确报错；需要跨行流式集合时使用 JSON。
 
 #include "data/Json.h"
 
@@ -26,9 +17,9 @@
 namespace yaml_detail {
 
 struct Line {
-    std::string text;    // comments stripped, right-trimmed
-    int indent = 0;      // spaces before the first token
-    int number = 1;      // 1-based, for error messages
+    std::string text;    // 已去除注释及右侧空白
+    int indent = 0;      // 首个记号前的空格数
+    int number = 1;      // 从 1 开始的行号，用于错误消息
     bool blank = true;
 };
 
@@ -36,7 +27,7 @@ struct Line {
     throw std::runtime_error("YAML line " + std::to_string(line) + ": " + why);
 }
 
-// Everything from an unquoted '#' that follows whitespace or starts the line.
+// 未被引号包裹且位于行首或空白之后的 # 起始注释。
 inline std::string strip_comment(const std::string& s) {
     char quote = 0;
     for (size_t i = 0; i < s.size(); i++) {
@@ -69,7 +60,7 @@ inline std::vector<Line> split(const std::string& text) {
         std::string raw = text.substr(i, e - i);
         Line l;
         l.number = n++;
-        // A tab in the indent is never valid YAML and misreads silently.
+        // 缩进中的制表符不符合 YAML 规范，必须报错以免静默误读。
         for (char c : raw) {
             if (c == ' ') continue;
             if (c == '\t') fail(l.number, "tab in indentation");
@@ -81,7 +72,7 @@ inline std::vector<Line> split(const std::string& text) {
         l.indent = (int)ind;
         l.text = body.substr(ind);
         l.blank = l.text.empty();
-        // The raw line is what a block scalar keeps, indentation and all.
+        // 块标量保留原始行及其缩进。
         if (!l.blank) l.text = rtrim(l.text);
         out.push_back(std::move(l));
         if (e == text.size()) break;
@@ -90,18 +81,18 @@ inline std::vector<Line> split(const std::string& text) {
     return out;
 }
 
-// A scalar as YAML types it: `null`/`~`/empty, true/false, a number, or text.
+// 按 YAML 规则解析 null/~ /空值、布尔值、数值或文本。
 inline JsonValue plain_scalar(const std::string& s, int line) {
     JsonValue v;
     if (s.empty() || s == "~" || s == "null" || s == "Null" || s == "NULL")
-        return v;                                  // Null
+        return v;                                  // 空值
     if (s == "true" || s == "True" || s == "TRUE" ||
         s == "false" || s == "False" || s == "FALSE") {
         v.type = JsonValue::Type::Bool;
         v.b = s[0] == 't' || s[0] == 'T';
         return v;
     }
-    // Numbers only when the whole token is one; "1.2.3" and "3 apples" stay text.
+    // 整个记号都是数字时才转为数值；1.2.3 和 3 apples 保持文本。
     const char* b = s.c_str();
     char* endp = nullptr;
     const double d = std::strtod(b, &endp);
@@ -135,10 +126,10 @@ inline std::string unescape_double(const std::string& s, int line) {
     return out;
 }
 
-// One scalar or single-line flow collection, from `s` (already comment-free).
+// 从已去除注释的 s 解析一个标量或单行流式集合。
 inline JsonValue parse_inline(const std::string& s, int line);
 
-// Split a flow collection's body on top-level commas.
+// 仅按集合最外层的逗号拆分。
 inline std::vector<std::string> flow_items(const std::string& s, int line) {
     std::vector<std::string> out;
     int depth = 0;
@@ -160,7 +151,7 @@ inline std::vector<std::string> flow_items(const std::string& s, int line) {
     }
     if (quote) fail(line, "unterminated quote");
     if (depth) fail(line, "unbalanced flow collection");
-    // "[]" and "{}" have no items; "[a,]" has one.
+    // [] 和 {} 无元素；[a,] 只有一个元素。
     std::string tail = cur;
     size_t b = tail.find_first_not_of(" \t");
     if (b != std::string::npos || !out.empty()) out.push_back(cur);
@@ -174,8 +165,7 @@ inline std::string trim(const std::string& s) {
     return s.substr(b, e - b + 1);
 }
 
-// A mapping key, unquoted or quoted, followed by ':'. npos when the text does
-// not open a `key:` pair at all.
+// 解析后接冒号的映射键，可带引号；不以 key: 开头时返回 npos。
 inline size_t key_end(const std::string& s) {
     char quote = 0;
     int depth = 0;
@@ -189,8 +179,7 @@ inline size_t key_end(const std::string& s) {
         if (c == '"' || c == '\'') { quote = c; continue; }
         if (c == '[' || c == '{') depth++;
         if (c == ']' || c == '}') depth--;
-        // ": " or a ':' at end of line ends a key; "a:b" is a plain scalar,
-        // which is what a bare URL or a time of day needs.
+        // 冒号后为空格或行尾时才结束键；a:b 保持普通标量，以支持 URL 和时间。
         if (c == ':' && depth == 0 && (i + 1 == s.size() || s[i + 1] == ' '))
             return i;
     }
@@ -255,8 +244,7 @@ struct Reader {
     }
     const Line& cur() { return lines[i]; }
 
-    // `|` / `>` keep the lines below at deeper indentation, joined by newlines
-    // (literal) or spaces (folded).
+    // | 与 > 读取更深缩进的后续行，分别以换行或空格拼接。
     JsonValue block_scalar(char kind, int parent_indent) {
         i++;
         std::string out;
@@ -279,8 +267,7 @@ struct Reader {
         return v;
     }
 
-    // The value that follows `key:` or `-`: what is on the rest of the line,
-    // or the block indented under it.
+    // key: 或 - 后的值可位于同一行剩余部分，或下方缩进块中。
     JsonValue value_after(const std::string& rest, int parent_indent) {
         const std::string t = trim(rest);
         if (t == "|" || t == ">") return block_scalar(t[0], parent_indent);
@@ -288,8 +275,7 @@ struct Reader {
         i++;
         if (at_end()) return JsonValue{};
         if (cur().indent > parent_indent) return parse_block(cur().indent);
-        // A sequence may sit at its own key's indent rather than under it,
-        // which is what most YAML writers emit and what yaml_write does.
+        // 序列可与所属键同级缩进，兼容常见 YAML 写入器及 yaml_write。
         if (cur().indent == parent_indent &&
             (cur().text == "-" || cur().text.compare(0, 2, "- ") == 0))
             return parse_block(parent_indent);
@@ -305,17 +291,15 @@ struct Reader {
         while (!at_end() && cur().indent == indent) {
             const Line& l = cur();
             if (seq) {
-                // A sequence written at its key's own indent ends where the
-                // enclosing mapping's next key begins.
+                // 与键同级的序列在外层映射的下一个键处结束。
                 if (l.text != "-" && l.text.compare(0, 2, "- ") != 0) break;
                 const std::string rest = l.text.size() > 1 ? l.text.substr(2) : "";
-                // "- key: value" opens a mapping whose later keys line up
-                // under the key, not under the dash.
+                // - key: value 开始映射，后续键应与 key 对齐，而非与短横线对齐。
                 const size_t k = key_end(trim(rest));
                 if (k != std::string::npos && !trim(rest).empty() &&
                     trim(rest)[0] != '[' && trim(rest)[0] != '{') {
                     const int inner = indent + 2 + (int)(rest.size() - trim(rest).size());
-                    // Rewrite the line so the mapping parser sees just the pair.
+                    // 重写该行，仅将键值对交给映射解析器。
                     lines[i].text = trim(rest);
                     lines[i].indent = inner;
                     v.arr.push_back(parse_block(inner));
@@ -324,7 +308,7 @@ struct Reader {
                 v.arr.push_back(value_after(rest, indent));
                 continue;
             }
-            // Likewise a mapping ends where an enclosing sequence resumes.
+            // 外层序列继续时，内层映射结束。
             if (l.text == "-" || l.text.compare(0, 2, "- ") == 0) break;
             const size_t k = key_end(l.text);
             if (k == std::string::npos) fail(l.number, "expected 'key: value'");
@@ -339,15 +323,15 @@ struct Reader {
     }
 };
 
-}  // namespace yaml_detail
+}  // 命名空间 yaml_detail
 
-// YAML, or JSON when the document opens with a flow collection.
+// 文档以流式集合开头时按 JSON 解析，否则按 YAML 解析。
 inline JsonValue yaml_parse(const std::string& text) {
     size_t p = text.find_first_not_of(" \t\r\n");
     if (p != std::string::npos && (text[p] == '{' || text[p] == '['))
         return json_parse(text);
     yaml_detail::Reader r{yaml_detail::split(text), 0};
-    // A leading `---` is a document start, not content.
+    // 起始 --- 是文档标记，不属于内容。
     if (!r.at_end() && r.cur().text == "---") r.i++;
     if (r.at_end()) return JsonValue{};
     const int indent = r.cur().indent;
@@ -372,14 +356,11 @@ inline JsonValue yaml_parse_file(const std::string& path) {
     return yaml_parse(text);
 }
 
-// ---------------------------------------------------------------------------
-// Writers
-// ---------------------------------------------------------------------------
+// ---------------- 写入器 ----------------
 
 namespace yaml_detail {
 
-// The shortest form that reads back as the same double: 0.1 stays "0.1"
-// rather than becoming 0.10000000000000001.
+// 采用能往返恢复同一 double 的最短表示，使 0.1 保持为 0.1，而非 0.10000000000000001。
 inline std::string number_text(double d) {
     if (d == (double)(long long)d && d > -1e15 && d < 1e15)
         return std::to_string((long long)d);
@@ -413,7 +394,7 @@ inline std::string quote_json(const std::string& s) {
     return out + "\"";
 }
 
-// Plain where YAML would read it back unchanged, quoted otherwise.
+// 可按原文往返解析时使用普通标量，否则加引号。
 inline std::string scalar_yaml(const std::string& s) {
     if (s.empty()) return "\"\"";
     static const char* kReserved = "#&*!|>'\"%@`,[]{}:";
@@ -456,8 +437,7 @@ inline void write_json(const JsonValue& v, std::string& out, int indent) {
     }
 }
 
-// `pad` prefixes every line; `first` prefixes the first one instead, which is
-// what folds a mapping's opening key onto its sequence dash.
+// pad 用于各行前缀，首行改用 first，使映射首键可以接在序列短横线之后。
 inline void write_yaml(const JsonValue& v, std::string& out,
                        const std::string& pad, const std::string& first) {
     switch (v.type) {
@@ -481,7 +461,7 @@ inline void write_yaml(const JsonValue& v, std::string& out,
                                     !kv.second.arr.empty());
                 if (block) {
                     out += lead + ":\n";
-                    // A sequence sits at the key's own indent, a mapping under it.
+                    // 序列与键同级缩进，映射则增加缩进。
                     const std::string inner =
                         kv.second.type == JsonValue::Type::Array ? pad : pad + "  ";
                     write_yaml(kv.second, out, inner, inner);
@@ -493,7 +473,7 @@ inline void write_yaml(const JsonValue& v, std::string& out,
     }
 }
 
-}  // namespace yaml_detail
+}  // 命名空间 yaml_detail
 
 inline std::string json_write(const JsonValue& v) {
     std::string out;

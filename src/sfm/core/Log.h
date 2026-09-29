@@ -1,25 +1,7 @@
 #pragma once
 
-// What a reconstruction says while it runs, in the language the user picked.
-//
-// `spirula sfm` is not a third-party tool whose output we pass through: it is
-// this program, run again as a child process, and the person reading its lines
-// in the GUI's terminal is the same person who set the language. So every line
-// a default run prints goes through here and comes out as
-//
-//     [tag] message
-//
-// with both halves translated. The tag names the stage; it is padded to a
-// COMMON DISPLAY WIDTH across the tags of the current language, so the log
-// stays a column even where a tag is two Han characters wide and its
-// neighbour is seven Latin letters. Width is measured in terminal columns
-// (East Asian wide characters count as two), not in bytes or codepoints.
-//
-// What does NOT come through here, on purpose: `--help` (documentation, and
-// what a bug report quotes), the deep diagnostics behind SS_SFM_MAP_PROF and
-// the audit / sub-model / bottom-up paths, and the self-test binaries. Those
-// stay English -- they are read by whoever is debugging the pipeline, and a
-// translated backtrace helps nobody.
+// 重建日志统一输出本地化 [tag] message，按终端显示列宽补齐标签，东亚宽字符占两列。
+// 开发诊断、性能分析和自测保留英文原始输出；帮助由独立帮助模块处理。
 
 #include "i18n/Message.h"
 
@@ -36,69 +18,50 @@
 namespace sfm {
 namespace slog {
 
-// The stage a line came from. One per phase a user can name, not one per file.
+// 日志按用户可识别的阶段分类，而非按源文件分类。
 enum class Tag {
-    Run,       // the `auto` command itself: what it was asked for, and the summary
-    Extract,   // feature detection, including the detector's own counts
-    Match,     // matching, verification and the camera grouping they settle
-    Map,       // the mapper and the passes that assemble its models
-    Merge,     // merging models of a fragmented capture
-    Orient,    // the final gauge fix (map/Orient.h)
-    Device,    // which GPU, and what it can do
+    Run,       // auto 的运行请求与摘要
+    Extract,   // 特征检测及检测器统计
+    Match,     // 匹配、验证与相机分组
+    Map,       // 建图及模型装配
+    Merge,     // 合并分散重建模型
+    Orient,    // 最终坐标规范对齐
+    Device,    // GPU 选择与能力
 };
 
-// Which stream the default sink writes a line to, and how a front end should
-// style it. `Diag` is a developer diagnostic: English, carrying its own
-// bracketed tag inside the text, never translated and never padded.
+// 决定输出流与前端样式；Diag 为带自身标签的英文诊断，原样输出且不补齐本地化标签列。
 enum class Level { Info, Note, Warning, Error, Diag };
 
-// Where lines go; the default prints them exactly as the CLI always has.
-// Process-global: one SfM job per process. The text carries no tag prefix and
-// no WARNING/ERROR word (Diag is verbatim). A sink may call prefix(); it must
-// not log, which would deadlock on the lock ordering lines.
+// 进程级日志接收端，文本不含阶段或警告前缀，Diag 除外；可调用 prefix，但不得再次记日志，否则逐行锁会死锁。
 using Sink = std::function<void(Tag, Level, const std::string&)>;
-void set_sink(Sink s);   // {} restores the printing default
+void set_sink(Sink s);   // 空接收端恢复默认打印行为
 
-// "[extract] " -- localized, bracketed, and padded so every tag in the current
-// language occupies the same number of terminal columns. By value because the
-// cache behind it is rebuilt when the language changes, and the GUI reads this
-// from its reconstruction thread while the printing happens on another.
+// 返回本地化且等宽的方括号标签；按值返回，避免语言切换重建缓存时与其他线程读取竞争。
 std::string prefix(Tag t);
 
-// Terminal columns a UTF-8 string occupies (East Asian wide = 2). Exposed
-// because the summary block aligns its own labels the same way; the counting
-// itself lives in i18n (i18n::display_width), since the CLI and the frame
-// extractor lay out their own tables with it too.
+// UTF-8 显示列宽，东亚宽字符占两列；实现复用 i18n::display_width，供摘要和表格对齐。
 int display_width(const char* s);
 
-// One line to stdout / stderr, tagged and translated. `args` fills the
-// message's {0}, {1}, ... placeholders.
+// 输出带标签的本地化单行，args 填充位置占位符。
 void out(Tag t, const spirula::i18n::Msg& m,
          std::initializer_list<spirula::i18n::Arg> args = {});
 void err(Tag t, const spirula::i18n::Msg& m,
          std::initializer_list<spirula::i18n::Arg> args = {});
-// As err(), with the localized word for WARNING / ERROR in front of the
-// message. Both go to stderr: a warning is not a result.
+// 在消息前添加本地化警告或错误词，均输出到 stderr。
 void warn(Tag t, const spirula::i18n::Msg& m,
           std::initializer_list<spirula::i18n::Arg> args = {});
 void fail(Tag t, const spirula::i18n::Msg& m,
           std::initializer_list<spirula::i18n::Arg> args = {});
 
-// A number rounded for display: num(1.14962, 2) -> "1.15". Needed wherever a
-// printf said %.2f, because i18n::Arg's double conversion is %g and a median
-// angle of 5.49856 degrees is not a thing anyone wanted to read.
+// 按显示精度格式化数字，如 num(1.14962,2) 得到 1.15，避免默认 %g 输出过多无用精度。
 std::string num(double v, int decimals);
 
-// Text that is already formatted (a path, a number, a line built by the
-// caller). Same tag column, no translation -- the `Raw` says so, as ui::*Raw
-// does in the GUI.
+// 已格式化路径、数值或文本原样输出，保持标签列；Raw 显式表示不翻译。
 void out_raw(Tag t, const std::string& text);
 void err_raw(Tag t, const std::string& text);
 
-// A developer diagnostic: printf-formatted, verbatim to stderr, no newline of
-// its own. Write the bracketed tag into `fmt` -- these stay English and are
-// not padded into the localized tag column.
+// printf 格式开发诊断，原样写 stderr，自身不添加换行；fmt 应含英文标签，不参与本地化列对齐。
 void diag(Tag t, const char* fmt, ...) SFM_LOG_PRINTF(2, 3);
 
-}  // namespace slog
-}  // namespace sfm
+}  // 命名空间 slog
+}  // 命名空间 sfm

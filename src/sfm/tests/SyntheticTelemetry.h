@@ -1,6 +1,4 @@
-// A synthetic capture for the sensor tests: a walking trajectory with a
-// known IMU-to-lens rotation, IMU noise, biases, a GPS log, a clock offset,
-// and its reconstruction in a random gauge.
+// 传感器合成采集，含步行轨迹、已知 IMU 外参、噪声、偏置、GPS、时钟偏移及任意规范下重建。
 #pragma once
 
 #include <cmath>
@@ -16,32 +14,30 @@
 namespace synth_telemetry {
 using namespace sfm;
 
-// ---- the synthetic world ---------------------------------------------------
+// ---------------- 合成世界 ----------------
 
 struct Scenario {
     double duration = 120;
-    double motion = 1.0;       // 0 = a camera that never moves
-    double turning = 1.0;      // 0 = a camera that never rotates
+    double motion = 1.0;       // 0 表示相机不平移
+    double turning = 1.0;      // 0 表示相机不旋转
     bool gps = true;
     bool stale_gps = false;
-    bool mirrored = false;     // IMU axes reported left-handed
-    double clock_offset = 0;   // IMU clock ahead of the video by this many seconds
+    bool mirrored = false;     // IMU 以左手坐标轴报告
+    double clock_offset = 0;   // IMU 时钟领先视频的秒数
     Vec3 bg{0.004, -0.003, 0.002};
     Vec3 ba{0.03, -0.02, 0.05};
     double gyro_noise = 0.002, accel_noise = 0.02;
-    // A camera writing a fused attitude and one accelerometer reading per
-    // frame instead of a raw gyro: the DJI Osmo 360.
+    // 模拟 DJI Osmo 360：输出融合姿态及逐帧加速度，不提供原始陀螺。
     bool attitude_only = false;
-    double accel_rate = 0;   // 0 keeps the 1 kHz the gyro is written at
+    double accel_rate = 0;   // 0 保持陀螺的 1 kHz 频率
     unsigned seed = 7;
 };
 
-// Camera-to-world pose of the walk at t: an arc with a bob and a wobble.
+// t 时刻相机到世界位姿，圆弧轨迹叠加上下与方向摆动。
 inline void poseAt(const Scenario& sc, double t, Mat3& R_wc, Vec3& p) {
     const double m = sc.motion, q = sc.turning;
     const double w = 2 * M_PI / 60;
-    // A walk round a circle with speed changes and turns of about 0.5 m/s^2:
-    // the low-frequency accelerations frames a second apart can see.
+    // 绕圆步行并改变速度，约 0.5 m/s² 加速度，可由间隔一秒的帧观测到。
     const double th = (w * t + 0.12 * std::sin(0.5 * t) + 0.03 * std::sin(1.3 * t + 0.7)) * m;
     const double rad = 15 + 0.6 * std::sin(0.9 * t) * m;
     p = {rad * std::cos(th) + 0.03 * std::sin(2 * M_PI * 2 * t) * m,
@@ -49,12 +45,12 @@ inline void poseAt(const Scenario& sc, double t, Mat3& R_wc, Vec3& p) {
          1.5 + 0.02 * std::sin(2 * M_PI * 2 * t + 0.4) * m + 0.4 * std::sin(0.31 * t) * m};
     const double yaw = (th + 0.5 * std::sin(0.7 * t)) * q, pitch = 0.35 * std::sin(0.45 * t + 1.0) * q,
                  roll = 0.25 * std::sin(0.83 * t + 2.0) * q;
-    // Camera looks along +z of a frame that is yawed/pitched/rolled; y down.
+    // 相机沿带偏航、俯仰和滚转的 +z 观察，y 向下。
     const Mat3 Rz = angleAxisToRotation({0, 0, yaw});
     const Mat3 Rx = angleAxisToRotation({pitch, 0, 0});
     const Mat3 Ry = angleAxisToRotation({0, roll, 0});
-    // Base: camera z = world x (forward), camera y = world -z (down), camera x = world -y.
-    const Mat3 base = {0, -1, 0, 0, 0, -1, 1, 0, 0};   // columns are camera axes in world
+    // 基础坐标：相机 z=世界 x，相机 y=世界 -z，相机 x=世界 -y。
+    const Mat3 base = {0, -1, 0, 0, 0, -1, 1, 0, 0};   // 各列为世界中的相机轴
     R_wc = mul(mul(mul(Rz, Rx), Ry), transpose(base));
 }
 
@@ -77,7 +73,7 @@ inline Telemetry synthesize(const Scenario& sc, const Mat3& R_ci) {
         poseAt(sc, ti, R1, p1);
         poseAt(sc, ti + h, R2, p2);
         const Vec3 acc_w = (p2 - p1 * 2.0 + p0) * (1.0 / (h * h));
-        // omega in the camera frame from the finite-difference of R_wc.
+        // 由 R_wc 的有限差分求相机坐标角速度。
         const Mat3 dR = mul(transpose(R0), R2);
         const Vec3 omega_c = rotationToAngleAxis(dR) * (1.0 / (2 * h));
         const Mat3 R_wi = mul(R1, R_ci);
@@ -102,7 +98,7 @@ inline Telemetry synthesize(const Scenario& sc, const Mat3& R_ci) {
         for (double ti = 0; ti <= sc.duration; ti += 0.1) {
             Mat3 R;
             Vec3 p;
-            const double tf = sc.stale_gps ? 0.0 : std::floor(ti);   // 1 Hz updates
+            const double tf = sc.stale_gps ? 0.0 : std::floor(ti);   // 每秒更新一次
             poseAt(sc, tf, R, p);
             std::mt19937 rj((unsigned)(tf * 1000) + sc.seed);
             const double e = p.x + 1.0 * N(rj), n = p.y + 1.0 * N(rj), u = p.z + 3.0 * N(rj);
@@ -120,8 +116,7 @@ inline Telemetry synthesize(const Scenario& sc, const Mat3& R_ci) {
     return t;
 }
 
-// The reconstruction: one image per second, poses in a random gauge M
-// (world = M(model)), so the solver has to find M.
+// 每秒一张图，位姿置于任意模型规范，world=M(model)，要求求解器恢复 M。
 inline Reconstruction synthesizeModel(const Scenario& sc, const Sim3& M, double fps_frames = 1.0) {
     Reconstruction rec;
     Camera cam;
@@ -150,4 +145,4 @@ inline Reconstruction synthesizeModel(const Scenario& sc, const Sim3& M, double 
     return rec;
 }
 
-}  // namespace synth_telemetry
+}  // 命名空间 synth_telemetry

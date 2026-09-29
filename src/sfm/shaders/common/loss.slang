@@ -1,11 +1,6 @@
 #pragma once
-// Robust loss functions. s is the squared residual norm; following Ceres,
-// the total cost is sum(0.5 * rho(s)) and residual/Jacobian are scaled by
-// sqrt(rho'(s)) (Triggs correction omitted -- fine for LM line quality).
-//
-// The loss is selected at shader-compile time with -DLOSS_*; the scale
-// parameter (delta for Huber, c for Cauchy) comes in at runtime via push
-// constant so it can be set per-problem without recompiling.
+// 稳健损失总成本为 sum(0.5*rho(s))，s 为残差范数平方，残差与雅可比乘 sqrt(rho'(s))，不做 Triggs 修正。
+// 损失类型编译期选择，Huber delta 或 Cauchy c 通过推送常量逐问题设置。
 
 #include "real.slang"
 
@@ -20,8 +15,7 @@ struct TrivialLoss : ILoss {
 };
 
 struct HuberLoss : ILoss {
-    // rho(s) = s                     if s <= d^2
-    //          2 d sqrt(s) - d^2     otherwise
+    // s<=d² 时 rho(s)=s，否则 rho(s)=2d sqrt(s)-d²。
     static Real cost(Real s, float param) {
         Real d2 = Real(param) * Real(param);
         if (s <= d2) return s;

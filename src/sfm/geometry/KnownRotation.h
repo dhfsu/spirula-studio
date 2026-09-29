@@ -1,10 +1,5 @@
-// Two-view geometry and absolute pose with the rotation supplied by a sensor
-// (docs/notes/sensor-priors.md). With R known the epipolar constraint
-// b2^T [t]x R b1 = 0 is linear in t and two correspondences fix it (Kneip,
-// Chli and Siegwart, BMVC 2011), so the RANSAC samples two points instead of
-// seven and keeps only what that rotation can explain: a copy of the scene
-// elsewhere, or equipment that moves with the camera, is thrown out however
-// consistent it is with some other geometry.
+// 已知传感器旋转 R 时，b2^T[t]x R b1=0 对平移线性，两组对应即可求解。
+// 两点 RANSAC 仅保留该旋转能解释的匹配，排除其他位置的重复结构或随相机移动的设备。
 #pragma once
 
 #include <cmath>
@@ -20,17 +15,13 @@
 namespace sfm {
 
 struct KnownRotationOptions {
-    RansacOptions ransac;   // max_error in radians (the Sampson error on the sphere)
+    RansacOptions ransac;   // 球面 Sampson 误差阈值，单位弧度
     int min_num_inliers = 15;
-    // Past this share of the inliers explained by the rotation alone, the
-    // pair is a panorama and t is noise (TwoViewOptions::max_H_inlier_ratio).
+    // 仅旋转可解释的内点比例超过此值时视为全景运动，平移不可靠。
     double max_rotation_only_ratio = 0.8;
-    // How far the given rotation may be off, radians: a calibration good to
-    // a degree is far coarser than a pixel, and a rotation taken as exact
-    // lost half its pairs (docs/notes/sensor-priors.md, section 4).
+    // 旋转先验允许误差，单位弧度；角度级标定不能当作像素级精确旋转，否则曾丢失约一半图像对。
     double rot_sigma = 0;
-    // Another starting pose for the refinement, the free estimate's when it
-    // has one: the two-point fit under a wrong rotation can start it badly.
+    // 可选用自由估计作为另一个精化初值，避免错误旋转下的两点解初始位置过差。
     const Pose* start = nullptr;
     KnownRotationOptions() {
         ransac.max_error = 0.003;
@@ -40,19 +31,18 @@ struct KnownRotationOptions {
 
 struct KnownRotationGeometry {
     bool ok = false;
-    bool panoramic = false;   // R alone explains the pair; `pose.t` is undetermined
+    bool panoramic = false;   // 仅 R 已能解释图像对，pose.t 不确定
     std::vector<char> inlier_mask;
     int num_inliers = 0;
-    int rotation_only = 0;    // correspondences with b2 ~ R b1
-    int loose_inliers = 0;    // under the gate the prior's sigma widened
-    double moved_deg = 0;     // how far the refinement took R from the prior
-    Pose pose;                // R as refined, unit t (camera 1 is the world)
+    int rotation_only = 0;    // 满足 b2~R b1 的对应
+    int loose_inliers = 0;    // 按先验 sigma 放宽门限后的数量
+    double moved_deg = 0;     // 精化旋转偏离先验的角度
+    Pose pose;                // 精化后的 R 与单位 t，以相机 1 为世界坐标系
 };
 
 namespace known_rotation_detail {
 
-// The smallest-eigenvalue direction of sum m m^T: the translation every
-// epipolar normal is orthogonal to.
+// sum m m^T 的最小特征向量为与所有极线法向正交的平移方向。
 inline bool leastNormal(const std::vector<Vec3>& m, const std::vector<int>& idx, Vec3& t) {
     std::vector<double> N(9, 0.0), ev, V;
     for (int i : idx) {
@@ -72,7 +62,7 @@ inline bool leastNormal(const std::vector<Vec3>& m, const std::vector<int>& idx,
 }
 
 
-// Signed Sampson error on the sphere (the square root of sampsonSqBearing).
+// 带符号球面 Sampson 误差，即平方误差的带符号平方根。
 inline double sampsonBearing(const Mat3& E, const Vec3& b1, const Vec3& b2) {
     const Vec3 Eb1 = mul(E, b1);
     const Vec3 Etb2 = mul(transpose(E), b2);
@@ -83,9 +73,7 @@ inline double sampsonBearing(const Mat3& E, const Vec3& b1, const Vec3& b2) {
     return den > 1e-30 ? num / std::sqrt(den) : 1e15;
 }
 
-// IRLS Levenberg-Marquardt over (d, a, b), R = Exp(d) R0 from `pose`, t moved
-// in its tangent plane: the masked Sampson residuals over `radius` under a
-// Cauchy loss (so the loose gate's far outliers lose their pull) plus d / sigma.
+// 对 R=Exp(d)R0 与平移切平面参数执行 IRLS LM；残差由 radius 归一化并使用 Cauchy 损失，另加 d/sigma 旋转先验。
 inline double refineNearRotation(const std::vector<Vec3>& b1, const std::vector<Vec3>& b2,
                                  const std::vector<char>& mask, const Mat3& R0, double sigma,
                                  double radius, Pose& pose, int iters = 20) {
@@ -202,9 +190,9 @@ inline double refineNearRotation(const std::vector<Vec3>& b1, const std::vector<
     return c0;
 }
 
-}  // namespace known_rotation_detail
+}  // 命名空间 known_rotation_detail
 
-// `R` takes camera-1 bearings into camera 2: b2 ~ R b1 + t-parallax.
+// R 将相机 1 视线转到相机 2：b2~R b1+t 引起的视差。
 inline KnownRotationGeometry estimateTwoViewKnownRotation(const std::vector<Vec3>& b1,
                                                           const std::vector<Vec3>& b2,
                                                           const Mat3& R,
@@ -215,8 +203,7 @@ inline KnownRotationGeometry estimateTwoViewKnownRotation(const std::vector<Vec3
     if (n < 2) return g;
     const double strict = opt.ransac.max_error;
     const double loose = strict + 2.5 * opt.rot_sigma;
-    // m_k = (R b1) x b2: t must be orthogonal to every one of them, and a
-    // vanishing m_k is a ray the rotation alone explains.
+    // m_k=(R b1)×b2，平移必须与其正交；m_k 为零表示仅旋转即可解释。
     std::vector<Vec3> m(n);
     std::vector<char> rot_only(n, 0);
     int rot_only_loose = 0;
@@ -245,7 +232,7 @@ inline KnownRotationGeometry estimateTwoViewKnownRotation(const std::vector<Vec3
     ro.max_error = loose;
     RansacReport<Vec3> rep = loransac<Vec3>(n, 2, fit, refit, res, ro);
     if (!rep.success || rep.num_inliers < opt.min_num_inliers) {
-        // Nothing but the rotation: a panorama, or no geometry at all.
+        // 只剩旋转，属于全景运动或无有效几何。
         if (rot_only_loose >= opt.min_num_inliers) {
             g.ok = g.panoramic = true;
             for (int k = 0; k < n; k++) rot_only[k] = m[k].norm() < sin_loose ? 1 : 0;
@@ -255,7 +242,7 @@ inline KnownRotationGeometry estimateTwoViewKnownRotation(const std::vector<Vec3
         }
         return g;
     }
-    // The sign of t: whichever puts more loose inliers in front of both cameras.
+    // 选择使更多宽松内点位于双相机前方的 t 符号。
     const Mat34 P1 = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     Pose pose{R, rep.model};
     int best = -1;
@@ -274,8 +261,7 @@ inline KnownRotationGeometry estimateTwoViewKnownRotation(const std::vector<Vec3
             pose = cand;
         }
     }
-    // Then the rotation moves as far as the prior allows, from the loose fit
-    // and from the caller's start; the strict radius decides between them.
+    // 从宽松拟合与调用方初值分别精化，旋转受先验限制，最终按严格半径选择。
     g.loose_inliers = rep.num_inliers;
     const double thr2 = strict * strict;
     auto countStrict = [&](const Pose& p) {
@@ -318,9 +304,7 @@ inline KnownRotationGeometry estimateTwoViewKnownRotation(const std::vector<Vec3
     return g;
 }
 
-// PnP with the rotation given: b x (R X + t) = 0 is linear in t, so two
-// correspondences solve it and the RANSAC needs no P3P. The result is judged
-// on the same residual `ransacPnP` uses, so the two are comparable.
+// 固定旋转 PnP 的 b×(R X+t)=0 对 t 线性，两点即可求解；按与 ransacPnP 相同残差评分以便比较。
 inline PnPResult ransacPnPKnownRotation(const std::vector<Vec3>& X, const std::vector<Vec3>& b,
                                         const Mat3& R, double focal, double max_error_px = 4.0,
                                         unsigned seed = 0, int max_trials = 1000) {
@@ -329,7 +313,7 @@ inline PnPResult ransacPnPKnownRotation(const std::vector<Vec3>& X, const std::v
     if (n < 2) return out;
     std::vector<Vec3> Y(n);
     for (int k = 0; k < n; k++) Y[k] = mul(R, X[k]);
-    // Normal equations of [b]x t = -[b]x Y over the sample.
+    // 在样本上构建 [b]x t=-[b]x Y 的正规方程。
     auto solve = [&](const std::vector<int>& s) {
         std::vector<Pose> out2;
         Mat3 N{};
@@ -343,7 +327,7 @@ inline PnPResult ransacPnPKnownRotation(const std::vector<Vec3>& X, const std::v
         if (std::fabs(det3(N)) < 1e-18) return out2;
         const Pose p{R, mul(inverse3(N), rhs)};
         for (int k : s)
-            if ((Y[k] + p.t).dot(b[k]) <= 0) return out2;   // behind the camera
+            if ((Y[k] + p.t).dot(b[k]) <= 0) return out2;   // 位于相机后方
         out2.push_back(p);
         return out2;
     };
@@ -361,16 +345,14 @@ inline PnPResult ransacPnPKnownRotation(const std::vector<Vec3>& X, const std::v
     return out;
 }
 
-// The same for a rig frame: every lens's correspondences at once, the frame
-// rotation given, the frame translation from two of them
-// (RigPnPMember / ransacRigPnP in AbsolutePose.h are the free-rotation form).
+// rig 帧的固定旋转 PnP 联合各镜头对应，由两组对应求帧平移。
 inline RigPnPResult ransacRigPnPKnownRotation(const std::vector<RigPnPMember>& members,
                                               const Mat3& R_frame, unsigned seed = 0,
                                               int max_trials = 1000) {
     RigPnPResult out;
     struct Entry {
         int m, i;
-        Vec3 Y;   // R_m R_f X + t_m: the camera-frame point less R_m t_f
+        Vec3 Y;   // R_m R_f X+t_m，即相机点减去 R_m t_f
     };
     std::vector<Entry> pool;
     std::vector<double> inv2(members.size(), 0.0);
@@ -425,4 +407,4 @@ inline RigPnPResult ransacRigPnPKnownRotation(const std::vector<RigPnPMember>& m
     return out;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

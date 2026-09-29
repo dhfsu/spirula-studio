@@ -21,8 +21,7 @@ namespace sfm {
 namespace {
 
 #if SS_HAVE_ALIKED || SS_HAVE_LOMA
-// Commit the resolved UUID to NN before learned model allocation; empty keeps
-// NN's own precedence.
+// 加载学习模型前，将解析出的 UUID 交给 NN；空值沿用 NN 自身的设备选择优先级。
 inline void configureLearnedDevice(const std::string& selector) {
     if (!selector.empty()) nn::configure_device(selector);
 }
@@ -40,19 +39,8 @@ private:
 
 #if SS_HAVE_ALIKED
 
-// ALIKED behind the same contract.
-//
-// The conversions in both directions are the whole of it, and each is a
-// convention this repository already fixed elsewhere:
-//
-//   * input -- the loader's optional RGB companion buffer, which `extract`
-//     already asks for so it can colour the point cloud. ALIKED normalizes by
-//     1/255 and nothing else, so the bytes go straight through.
-//   * output -- keypoints have no scale and no orientation, because the
-//     detector has neither. They carry a detection score instead, which
-//     `FeatureSet::rank` and features.bin v5 exist for. Leaving `scale` at 0
-//     is deliberate: a fabricated scale would be silently wrong wherever one
-//     is used as a size.
+// ALIKED 输入沿用加载器为点云着色提供的 RGB 字节，仅按 1/255 归一化。
+// 检测器不提供尺度或方向，检测分数存入 FeatureSet::rank 和 features.bin v5；scale 保持 0，避免伪造尺度影响后续计算。
 class AlikedFrontend : public IFeatureExtractor {
 public:
     explicit AlikedFrontend(const AlikedOptions& opt) : opt_(opt) {
@@ -78,11 +66,7 @@ public:
         const aliked::Features f =
             ext_.extract(img.rgb.data(), img.width, img.height, aopts_);
 
-        // Canonical order by position, exactly as GPU SIFT emits (D16). The
-        // extractor's own order comes from a partial_sort by score, and a
-        // score-sorted index would bias every downstream tie-break -- the
-        // matcher's cap, the mapper taking the first 3D point a feature
-        // corresponds to -- toward high-scoring features.
+        // 按位置采用与 GPU SIFT 相同的规范顺序（D16）；沿用提取器的分数排序会让匹配数量上限和首个三维对应点等平局判定偏向高分特征。
         std::vector<uint32_t> idx(f.keypoints.size());
         for (uint32_t i = 0; i < idx.size(); i++) idx[i] = i;
         std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) {
@@ -119,9 +103,7 @@ private:
 
 #if SS_HAVE_LOMA
 
-// LoMa behind the same contract. What differs from ALIKED is the descriptors:
-// 128-D or 256-D depending on the variant, and NOT unit norm, so a cosine
-// threshold has to normalize for itself (COLMAP's LOMA_BRUTEFORCE does).
+// LoMa 描述子因版本不同为 128 维或 256 维，且未归一化；余弦阈值需自行归一化，COLMAP 的 LOMA_BRUTEFORCE 也如此。
 class LomaFrontend : public IFeatureExtractor {
 public:
     explicit LomaFrontend(const LomaOptions& opt) : opt_(opt) {
@@ -148,9 +130,7 @@ public:
         const loma::Features f =
             ext_.extract(img.rgb.data(), img.width, img.height, lopts_);
 
-        // Canonical order by position, exactly as GPU SIFT emits (D16): the
-        // extractor's own order is by score, and a score-sorted index would
-        // bias every downstream tie-break toward high-scoring features.
+        // 按位置采用与 GPU SIFT 相同的规范顺序（D16）；沿用提取器的分数排序会使后续平局判定偏向高分特征。
         std::vector<uint32_t> idx(f.keypoints.size());
         for (uint32_t i = 0; i < idx.size(); i++) idx[i] = i;
         std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) {
@@ -185,11 +165,10 @@ private:
 
 #endif  // SS_HAVE_LOMA
 
-}  // namespace
+}  // 匿名命名空间
 
 bool isAlikedType(const std::string& type) { return type.rfind("aliked", 0) == 0; }
-// The five released variants, spelled out: a near miss should be a usage error
-// at parse time, not a download that 404s halfway through a run.
+// 显式列出五个已发布版本，使拼写错误在解析时报告，避免运行到一半下载时才返回 404。
 bool isLomaType(const std::string& type) {
     return type == "loma-b" || type == "loma-b128" || type == "loma-r" ||
            type == "loma-l" || type == "loma-g";
@@ -218,8 +197,7 @@ std::unique_ptr<IFeatureExtractor> createFeatureExtractor(const std::string& typ
     if (isAlikedType(type)) {
 #if SS_HAVE_ALIKED
         AlikedOptions opt = aliked;
-        // --features names the checkpoint, so an explicit --aliked-model is
-        // only needed to point at a file on disk.
+        // --features 已指定权重名称；仅在使用本地文件时需要显式设置 --aliked-model。
         if (opt.model.empty() || isAlikedType(opt.model)) opt.model = type;
         return std::make_unique<AlikedFrontend>(opt);
 #else
@@ -232,8 +210,7 @@ std::unique_ptr<IFeatureExtractor> createFeatureExtractor(const std::string& typ
 #if SS_HAVE_LOMA
         LomaOptions opt = loma_opt;
         opt.variant = type;
-        // --features names the variant, and the variant names the descriptor:
-        // loma-b128 was trained on DeDoDe-B, the other four on DeDoDe-G.
+        // --features 指定版本及其描述子：loma-b128 使用 DeDoDe-B 训练，其余四种使用 DeDoDe-G。
         if (opt.descriptor_model.empty())
             opt.descriptor_model = loma::descriptor_for_matcher(type);
         if (opt.descriptor_model.empty())
@@ -254,4 +231,4 @@ std::unique_ptr<IFeatureExtractor> createFeatureExtractor(const std::string& typ
                              "loma-b128)");
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

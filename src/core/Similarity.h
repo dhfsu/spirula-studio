@@ -1,11 +1,7 @@
 #pragma once
 
-// A similarity of 3-space, p' = s * R * p + t with s > 0 and R a proper
-// rotation: the only transform a rigid scene can be given without changing
-// what it is. Double throughout -- a geo-referenced model sits millions of
-// units from its origin, where float resolves a metre.
-//
-// R is row-major. Header-only, host-only.
+// 三维相似变换 p' = s * R * p + t，s > 0，R 为行主序正旋转。
+// 全程使用 double，避免距离原点数百万单位的地理模型在 float 中只剩米级精度；仅含头文件，供主机使用。
 
 #include <cmath>
 
@@ -30,14 +26,14 @@ struct Sim3 {
         for (int r = 0; r < 3; r++)
             out[r] = s * (R[r*3+0]*x + R[r*3+1]*y + R[r*3+2]*z) + t[r];
     }
-    // A direction: rotated, neither scaled nor moved.
+    // 方向仅旋转，不缩放或平移。
     void rotate(const double v[3], double out[3]) const {
         const double x = v[0], y = v[1], z = v[2];
         for (int r = 0; r < 3; r++)
             out[r] = R[r*3+0]*x + R[r*3+1]*y + R[r*3+2]*z;
     }
 
-    // Row-major 3x4 [s*R | t], the layout every viewport matrix here uses.
+    // 行主序 3×4 [s*R | t]，与视口矩阵布局一致。
     template <typename T>
     void to_3x4(T out[12]) const {
         for (int r = 0; r < 3; r++) {
@@ -45,8 +41,7 @@ struct Sim3 {
             out[r*4+3] = (T)t[r];
         }
     }
-    // The 3x3 block is taken to be s*R; the rotation is re-orthonormalized,
-    // so a matrix that went through float comes back a rotation.
+    // 将 3×3 块视为 s*R，并重新正交化旋转，消除 float 往返造成的偏差。
     template <typename T>
     static Sim3 from_3x4(const T a[12]) {
         Sim3 o;
@@ -65,8 +60,7 @@ struct Sim3 {
         return o;
     }
 
-    // Gram-Schmidt on the rows, third row from the cross product so the
-    // result is a proper rotation whatever rounding did to the input.
+    // 按行执行 Gram-Schmidt，第三行由叉积得到，保证舍入误差后仍为正旋转。
     void orthonormalize() {
         double* a = R; double* b = R + 3; double* c = R + 6;
         double n = std::sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
@@ -92,7 +86,7 @@ struct Sim3 {
         return o;
     }
 
-    // (w, x, y, z), unit, w >= 0.
+    // 单位四元数 (w, x, y, z)，w >= 0。
     void quat(double q[4]) const {
         const double m00 = R[0], m01 = R[1], m02 = R[2];
         const double m10 = R[3], m11 = R[4], m12 = R[5];
@@ -125,7 +119,7 @@ struct Sim3 {
         for (int i = 0; i < 3; i++) o.t[i] = d[i];
         return o;
     }
-    // Rotation by `angle` radians about the unit `axis` through `pivot`.
+    // 绕经过 pivot 的单位轴 axis 旋转 angle 弧度。
     static Sim3 rotation_about(const double axis[3], double angle,
                                const double pivot[3]) {
         Sim3 o;
@@ -149,7 +143,7 @@ private:
     void reset_rotation() {
         for (int i = 0; i < 9; i++) R[i] = i % 4 == 0 ? 1.0 : 0.0;
     }
-    // Choose t so that `pivot` maps to itself.
+    // 选择 t，使 pivot 映射到自身。
     void pin(const double pivot[3]) {
         double q[3];
         rotate(pivot, q);
@@ -157,7 +151,7 @@ private:
     }
 };
 
-// a after b: (a * b)(p) = a(b(p)).
+// 先应用 b，再应用 a：(a * b)(p) = a(b(p))。
 inline Sim3 operator*(const Sim3& a, const Sim3& b) {
     Sim3 o;
     o.s = a.s * b.s;
@@ -171,4 +165,4 @@ inline Sim3 operator*(const Sim3& a, const Sim3& b) {
     return o;
 }
 
-}  // namespace spirula
+}  // 命名空间 spirula

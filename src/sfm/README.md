@@ -2,7 +2,7 @@
 
 A standalone SfM pipeline — images in, a COLMAP `sparse/` model out — with a
 GPU compute backend (Vulkan + Slang) and no heavy dependencies. It exists to
-replace the `colmap` subprocess: `spirula sfm` is the CLI, and the native GUI
+replace the `colmap` subprocess: `spirula-sfm` is the CLI, and the native GUI
 will drive the same library in-process instead of shelling out
 (`docs/notes/sfm-port-plan.md` phase 5).
 
@@ -53,7 +53,7 @@ images/ ──► extract ──► features/ ─┐
                                                             sparse/0 ► training
 ```
 
-`spirula sfm auto` runs all of it from two knobs, `--quality` and `--data-type`.
+`spirula-sfm auto` runs all of it from two knobs, `--quality` and `--data-type`.
 
 `--progress-dir DIR` adds a second, optional output: `model.bin` (the poses and
 a subsample of the points as they stand, coloured) and `pairs.bin` (per binned
@@ -282,24 +282,24 @@ a variant that was trimmed out is a clear runtime error, not a crash.
 ## Running
 
 ```bash
-spirula sfm auto IMAGES/ -o WORKSPACE/          # images -> sparse model
-spirula sfm auto -o ws/                         # ./images + ./masks, all defaults
-spirula sfm auto IMAGES/ -o ws/ --data-type video --quality medium
-spirula sfm auto IMAGES/ -o ws/ --masks MASKS/  # drop keypoints on masked pixels
-spirula sfm auto IMAGES/ -o ws/ --camera-model opencv-fisheye
+spirula-sfm auto IMAGES/ -o WORKSPACE/          # images -> sparse model
+spirula-sfm auto -o ws/                         # ./images + ./masks, all defaults
+spirula-sfm auto IMAGES/ -o ws/ --data-type video --quality medium
+spirula-sfm auto IMAGES/ -o ws/ --masks MASKS/  # drop keypoints on masked pixels
+spirula-sfm auto IMAGES/ -o ws/ --camera-model opencv-fisheye
 
-spirula sfm extract IMAGES/ -o feats/
-spirula sfm match   feats/ -o matches.bin
-spirula sfm map     matches.bin feats/ -o sparse/ --images IMAGES/
-spirula sfm map     matches.bin feats/ -o sparse/ --no-compact-unused-features
-spirula sfm merge   sparse/ -o merged/
-spirula sfm ba      sparse/0 refined/0          # the mapper's global BA on a model
-spirula sfm ba      sparse/0 sparse/0 --real cpu  # ... in place, on the host
+spirula-sfm extract IMAGES/ -o feats/
+spirula-sfm match   feats/ -o matches.bin
+spirula-sfm map     matches.bin feats/ -o sparse/ --images IMAGES/
+spirula-sfm map     matches.bin feats/ -o sparse/ --no-compact-unused-features
+spirula-sfm merge   sparse/ -o merged/
+spirula-sfm ba      sparse/0 refined/0          # the mapper's global BA on a model
+spirula-sfm ba      sparse/0 sparse/0 --real cpu  # ... in place, on the host
 ```
 
-`spirula sfm --help` lists the commands, `spirula sfm <command> --help` (or
-`spirula sfm help <command>`) prints that command's usage, its options with
-their defaults and worked examples, and `spirula sfm --version` prints the
+`spirula-sfm --help` lists the commands, `spirula-sfm <command> --help` (or
+`spirula-sfm help <command>`) prints that command's usage, its options with
+their defaults and worked examples, and `spirula-sfm --version` prints the
 package version. A usage error names the flag, says what was wrong with it and
 points at `--help`; it always exits 1, because `auto` spends exit codes 2 and 3
 on *the reconstruction* being absent or partial.
@@ -527,7 +527,7 @@ the exit status is 4.
 `merge` accepts a single model when a metric reference is given: there is
 nothing to merge, and it re-gauges the model in place. That is the way to put
 metres on a finished reconstruction without rebuilding it —
-`spirula sfm merge ws/sparse --in-place --metric-gps horizontal --images ws/images`.
+`spirula-sfm merge ws/sparse --in-place --metric-gps horizontal --images ws/images`.
 
 The scale and orientation uncertainties are **reported and never gated on**.
 They come from the inlier residuals assuming uncorrelated noise, and measured
@@ -640,11 +640,11 @@ docs/notes/sfm-rig-constraints.md). A definition names its **members** as path
 prefixes; the images under them with the same path form a **frame**:
 
 ```bash
-spirula sfm auto IMAGES/ -o ws/ --rig cam0,cam1            # cam0/x.jpg + cam1/x.jpg
-spirula sfm auto IMAGES/ -o ws/ --rig 'clip1,clip2:cam0,cam1'   # one rig behind two videos
-spirula sfm auto IMAGES/ -o ws/ --rig '*:cam0,cam1'        # ... behind every top-level folder
-spirula sfm auto IMAGES/ -o ws/ --rig cam0,cam1 --rig cam2,cam3   # two rigs
-spirula sfm auto IMAGES/ -o ws/ --rig dual-fisheye=cam0,cam1     # a 360 camera's two lenses
+spirula-sfm auto IMAGES/ -o ws/ --rig cam0,cam1            # cam0/x.jpg + cam1/x.jpg
+spirula-sfm auto IMAGES/ -o ws/ --rig 'clip1,clip2:cam0,cam1'   # one rig behind two videos
+spirula-sfm auto IMAGES/ -o ws/ --rig '*:cam0,cam1'        # ... behind every top-level folder
+spirula-sfm auto IMAGES/ -o ws/ --rig cam0,cam1 --rig cam2,cam3   # two rigs
+spirula-sfm auto IMAGES/ -o ws/ --rig dual-fisheye=cam0,cam1     # a 360 camera's two lenses
 ```
 
 The form with captures keeps frames apart per capture (a stem repeats across
@@ -655,7 +655,7 @@ its rotation until the model has a scale) and, with `refine:`, which of its
 parameters bundle adjustment may move: `all`, `axial` (the rotation and the
 translation along the lens's own optical axis), `baseline` (that translation
 alone), `translation` or `none`. Members without extrinsics are estimated from
-the frames against the first member that has them. `spirula sfm map` takes
+the frames against the first member that has them. `spirula-sfm map` takes
 `--rig` too. An image claimed by two rigs, or a member no image matches, is an
 error.
 
@@ -776,9 +776,9 @@ a video's frames, or a folder shot in a walk. It is told to the run as path
 prefixes, exactly as a rig is:
 
 ```bash
-spirula sfm auto IMAGES/ -o ws/ --sequence .              # the whole folder, in name order
-spirula sfm auto IMAGES/ -o ws/ --sequence cam0,cam1      # a dual-fisheye video's two tracks
-spirula sfm auto IMAGES/ -o ws/ --sequence clip1 --sequence clip2   # two clips, each in order
+spirula-sfm auto IMAGES/ -o ws/ --sequence .              # the whole folder, in name order
+spirula-sfm auto IMAGES/ -o ws/ --sequence cam0,cam1      # a dual-fisheye video's two tracks
+spirula-sfm auto IMAGES/ -o ws/ --sequence clip1 --sequence clip2   # two clips, each in order
 ```
 
 Images under two members with the same path share one *position* (cam0/00017

@@ -1,14 +1,7 @@
 #pragma once
 
-// Json.h -- minimal dependency-free JSON parser for the standalone CLI's
-// dataset readers (transforms.json etc.). Header-only, recursive descent,
-// no external deps. Supports the full JSON grammar plus two Python
-// json.dump extensions that appear in this project's files: Infinity /
-// -Infinity and NaN literals.
-//
-// Not a general-purpose library: values are held by copy (fine for
-// transforms.json-sized inputs), numbers are always double, and parse
-// errors throw std::runtime_error with a byte offset.
+// 无外部依赖的递归下降 JSON 解析器，供数据集读取使用，支持完整 JSON 及 Python json.dump 的 Infinity、-Infinity、NaN 扩展。
+// 值按副本存储，数值统一为 double；解析错误抛出带字节偏移的 std::runtime_error。
 
 #include <cstdint>
 #include <cstdio>
@@ -29,14 +22,14 @@ struct JsonValue {
     double      num = 0.0;
     std::string str;
     std::vector<JsonValue> arr;
-    // Insertion-ordered; transforms.json keys are few, linear find is fine.
+    // 保持插入顺序；transforms.json 的键很少，线性查找足够。
     std::vector<std::pair<std::string, JsonValue>> obj;
 
     bool is_null()   const { return type == Type::Null; }
     bool is_object() const { return type == Type::Object; }
     bool is_array()  const { return type == Type::Array; }
 
-    // Object lookup; nullptr when absent (or not an object).
+    // 对象键不存在或当前值不是对象时返回 nullptr。
     const JsonValue* find(const std::string& key) const {
         if (type != Type::Object) return nullptr;
         for (const auto& [k, v] : obj)
@@ -45,8 +38,7 @@ struct JsonValue {
     }
     bool has(const std::string& key) const { return find(key) != nullptr; }
 
-    // Typed accessors with defaults. Numbers stored in JSON as ints are
-    // doubles here; as_int truncates.
+    // 带默认值的类型访问；整数同样存为 double，as_int 截断小数。
     double as_double(double def = 0.0) const {
         return type == Type::Number ? num : def;
     }
@@ -143,7 +135,7 @@ struct Parser {
                 case 't': s += '\t'; break;
                 case 'u': {
                     uint32_t cp = parse_hex4();
-                    if (cp >= 0xD800 && cp <= 0xDBFF) {   // surrogate pair
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {   // UTF-16 代理项对
                         if (end - p < 2 || p[0] != '\\' || p[1] != 'u')
                             fail("unpaired surrogate");
                         p += 2;
@@ -216,7 +208,7 @@ struct Parser {
         if (consume("true"))  { out.type = JsonValue::Type::Bool; out.b = true;  return out; }
         if (consume("false")) { out.type = JsonValue::Type::Bool; out.b = false; return out; }
         if (consume("null"))  { return out; }
-        // Python json.dump extensions.
+        // Python json.dump 的非有限数扩展。
         if (consume("Infinity"))  { out.type = JsonValue::Type::Number; out.num = std::numeric_limits<double>::infinity();  return out; }
         if (consume("-Infinity")) { out.type = JsonValue::Type::Number; out.num = -std::numeric_limits<double>::infinity(); return out; }
         if (consume("NaN"))       { out.type = JsonValue::Type::Number; out.num = std::nan("");  return out; }
@@ -225,12 +217,11 @@ struct Parser {
     }
 };
 
-}  // namespace json_detail
+}  // 命名空间 json_detail
 
 
 inline JsonValue json_parse(const std::string& text) {
-    // A UTF-8 BOM is what Notepad and PowerShell put in front of a file that
-    // was edited by hand, and a config lost to one is lost silently.
+    // 允许 Notepad 和 PowerShell 在手工编辑文件前写入的 UTF-8 BOM。
     const size_t at = text.compare(0, 3, "\xEF\xBB\xBF") == 0 ? 3 : 0;
     json_detail::Parser ps{text.data() + at, text.data() + text.size(),
                            text.data()};

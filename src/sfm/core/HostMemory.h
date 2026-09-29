@@ -1,12 +1,11 @@
 #pragma once
-// How much physical memory the machine has, or 0 when the platform will not
-// say. Callers that need a working number must supply their own fallback.
+// 查询物理内存，平台不支持时返回 0，调用方自行提供回退值。
 
 #include <cstddef>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN   // rpcndr.h's `#define small char` reaches far from here
+#define WIN32_LEAN_AND_MEAN   // rpcndr.h 的 small 宏可能污染此处的标识符
 #endif
 #include <windows.h>
 #else
@@ -27,4 +26,4 @@ inline size_t physicalRamBytes() {
     return 0;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

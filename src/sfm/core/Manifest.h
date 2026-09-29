@@ -1,14 +1,6 @@
 #pragma once
 
-// What a front end hands a run, as a file rather than as a command line.
-//
-// The camera-group settings used to travel as `--camera-model PREFIX=MODEL`
-// and `--focal DIR=PX`, re-resolved against the filesystem in the child; a
-// manifest states them once, in a file a person can read and edit. It is also
-// where per-image priors go when there is something producing them -- GPS,
-// IMU gravity, range data -- so a new sensor is a new key, not a new flag.
-//
-// Read as YAML or JSON (data/Yaml.h takes both); written as either.
+// 前端以 YAML/JSON 清单描述相机分组、镜头配置和传感器先验，避免子进程重复推导；支持两种格式读写。
 
 #include "sfm/SfmConfig.h"
 #include "sfm/core/Rig.h"
@@ -20,63 +12,53 @@
 
 namespace sfm {
 
-// One camera group: the images it covers, and what is known about the lens.
+// 相机组的图像覆盖范围及已知镜头参数。
 struct ManifestCamera {
-    // Path prefix under the image directory: "cam0" covers cam0/00017 and
-    // cam0/sub/x, and nothing else. Empty is the dataset-wide default.
+    // 图像目录内的路径前缀，cam0 匹配其子路径，空值表示全局默认。
     std::string prefix;
-    std::string model;               // empty = the run's --camera-model
-    double focal = 0;                // pixels; 0 = no prior
-    std::vector<double> distortion;  // the model's BA order; empty = zeros
+    std::string model;               // 空值沿用本次运行的 --camera-model
+    double focal = 0;                // 像素焦距，0 表示无先验
+    std::vector<double> distortion;  // 模型 BA 顺序，空值表示全零
 };
 
-// One source video and the telemetry it carries. `telemetry` is the video
-// itself or a file the reader knows; frames under `prefix` are timed by the
-// source frame index in their stem over `fps` (0 = the file's own rate).
+// 遥测来源可为视频或支持的独立文件；prefix 下图像按文件主干帧号除以 fps 定时，0 使用视频自身帧率。
 struct ManifestCapture {
     std::string prefix;
     std::string telemetry;
     double fps = 0;
-    double time_offset = 0;   // seconds added to every frame time
+    double time_offset = 0;   // 加到所有帧时间上的秒数
 };
 
 struct Manifest {
-    // Exactly as the file spells them; `manifest_apply` resolves a relative
-    // one against `base_dir`, so a manifest and the capture beside it move
-    // together and a round trip through the writer does not rewrite the path.
+    // 保存清单中的原始路径写法，应用时再相对 base_dir 解析，避免读写往返擅自改写路径。
     std::string image_dir;
     std::string mask_dir;
-    // The manifest's own directory, set by manifest_read. Not written out.
+    // manifest_read 设置的清单目录，不写回文件。
     std::string base_dir;
     bool mask_flipped = false;
     bool has_mask_flipped = false;
 
-    std::string camera_mode;         // "single" | "folder" | "image"; empty = default
+    std::string camera_mode;         // single|folder|image，空值使用默认
     std::vector<ManifestCamera> cameras;
     std::vector<ManifestCapture> captures;
-    // Rigs: members are path prefixes like the cameras', frames are the
-    // images sharing a path under them; a member may carry its cam_from_rig
-    // (quaternion w,x,y,z and a translation) when it is known.
+    // rig 成员使用路径前缀，同一后缀路径的图像组成一帧；可提供 cam_from_rig 四元数 (w,x,y,z) 和平移。
     std::vector<RigDef> rigs;
-    // Sequences: `members:` path prefixes as a rig's, the images under them
-    // taken in file-name order (sfm/core/Sequence.h).
+    // 序列成员同样按路径前缀指定，图像按文件名顺序排列。
     std::vector<SequenceDef> sequences;
 
-    std::string image_gamut;         // empty = leave the run's own
-    int image_linear = -1;           // -1 unset, 0 no, 1 yes
+    std::string image_gamut;         // 空值沿用运行配置
+    int image_linear = -1;           // -1 未设置，0 禁用，1 启用
 };
 
-// Throws std::runtime_error naming the file and line on a malformed one.
+// 格式错误时抛出包含文件和行号的 std::runtime_error。
 Manifest manifest_read(const std::string& path);
 
-// YAML unless `json`. Round trips through manifest_read.
+// 默认写 YAML，json 为真时写 JSON，均可由 manifest_read 读回。
 std::string manifest_write(const Manifest& m, bool json = false);
 
-// Fold into a config. `seen` names the flags the command line already set;
-// those win, exactly as an explicit flag beats a preset. Returns "" or why
-// the manifest cannot be applied.
+// 将清单并入配置，seen 中的显式命令行字段优先；成功返回空字符串，否则返回不能应用的原因。
 std::string manifest_apply(const Manifest& m, SfmConfig& cfg,
                            const std::set<std::string>& seen,
                            std::string& image_dir);
 
-}  // namespace sfm
+}  // 命名空间 sfm

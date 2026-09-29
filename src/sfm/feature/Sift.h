@@ -1,15 +1,5 @@
-// GPU SIFT extractor: host-side orchestration of sfm/shaders/sift/sift.slang.
-//
-// Owns a VkContext, builds the Gaussian scale-space layout (offsets, per-octave
-// dimensions, per-step blur kernels) on the host, uploads the image, and drives
-// the pyramid -> DoG -> extrema -> orientation -> descriptor dispatches. The
-// GPU stages append into device-side lists behind atomic counters; the host
-// reads a count back between stages to size the next dispatch (fine for a batch
-// extractor -- these are not the latency-critical local-BA solves of phase 4).
-//
-// Parameters mirror COLMAP's SiftExtractionOptions defaults (docs/porting-
-// colmap.md). The compile-time pyramid constants here MUST match the
-// static const block at the top of sift.slang.
+// GPU SIFT 的主机调度，构造高斯金字塔布局并驱动金字塔、DoG、极值、方向及描述子阶段。
+// 设备通过原子计数追加列表，阶段间回读数量决定后续分派；参数参考 COLMAP，金字塔常量必须与 sift.slang 一致。
 #pragma once
 
 #include <algorithm>
@@ -33,26 +23,25 @@
 namespace sfm {
 
 struct SiftOptions {
-    int max_num_features = 8192;      // top-K by scale kept (COLMAP semantics)
+    int max_num_features = 8192;      // 按尺度保留 top-K，与 COLMAP 一致
     int num_octaves = 4;
     int max_num_orientations = 2;
     double peak_threshold = 0.02 / 3.0;
     double edge_threshold = 10.0;
     int device = -1;
-    // Canonical uuid:<hex> (core/VulkanDeviceSelection.h). Wins over the
-    // ordinal above; "" leaves the shared precedence in charge.
+    // 规范 uuid:<hex> 优先于序号，空值沿用共享设备选择。
     std::string device_selector;
     bool profile = false;
     bool verbose = true;
-    std::string spv_path;             // override embedded "sift" blob
-    // Device-list capacities; extraction warns if a list saturates.
+    std::string spv_path;             // 覆盖嵌入的 sift 模块
+    // 下列设备列表容量饱和时发出警告。
     uint32_t max_raw_keypoints = 262144;
     uint32_t max_oriented_keypoints = 262144;
 };
 
 class SiftExtractor {
 public:
-    // Pyramid constants -- keep in lockstep with sift.slang.
+    // 金字塔常量必须与 sift.slang 同步。
     static constexpr int S = 3;
     static constexpr int GAUSS_PER_OCT = S + 3;  // 6
     static constexpr int DOG_PER_OCT = S + 2;    // 5
@@ -60,7 +49,7 @@ public:
     static constexpr int FIRST_OCTAVE = -1;
     static constexpr int KP_STRIDE = 6;
     static constexpr int OKP_STRIDE = 8;
-    static constexpr int kNumBins = 2048;  // log2(scale) histogram for top-K
+    static constexpr int kNumBins = 2048;  // top-K 使用 log2(scale) 直方图
 
     explicit SiftExtractor(const SiftOptions& opt) : opt_(opt) {
         VkContextOptions vo;
@@ -72,11 +61,7 @@ public:
 
     VkContext& ctx() { return ctx_; }
 
-    // Extract from one image. Buffers/pipelines are allocated on first use and
-    // reused across calls; a larger image than any seen so far grows the
-    // size-dependent buffers (and rebinds the descriptor set). For a batch,
-    // process largest-first (SiftExtractor::extractDir does) so this happens
-    // exactly once.
+    // 首次创建缓冲与流水线，后续复用；遇到更大图像扩展尺寸相关缓冲并重绑描述符，批量按最大图优先可只分配一次。
     FeatureSet extract(const GrayImage& img) {
         if (img.width < 4 || img.height < 4)
             throw std::runtime_error("image too small for SIFT");
@@ -94,7 +79,7 @@ public:
     }
 
 private:
-    // ---- pyramid layout ----
+    // ---------------- 金字塔布局 ----------------
     struct Level { uint32_t off, w, h; };
 
     void planPyramid(int w0, int h0) {
@@ -122,9 +107,7 @@ private:
         gaussFloats_ = goff;
         dogFloats_ = doff;
 
-        // Per-step blur kernels. Step 0 = initial blur of the upsampled image
-        // (nominal sigma 1.0 in octave-0 px) up to SIGMA0. Steps 1..GAUSS_PER_OCT-1
-        // = incremental blur within an octave (identical across octaves).
+        // 第 0 步将上采样图像从 octave-0 的 sigma=1.0 模糊至 SIGMA0；后续为各 octave 相同的增量模糊核。
         weights_.clear();
         stepOff_.clear();
         stepRad_.clear();
@@ -141,7 +124,7 @@ private:
             }
             for (double v : k) weights_.push_back((float)(v / sum));
         };
-        double sigmaNominal = 1.0;  // 0.5 * 2 after upsample, in octave-0 pixels
+        double sigmaNominal = 1.0;  // 上采样后为 0.5 * 2，以 octave-0 像素计
         addKernel(std::sqrt(std::max(SIGMA0 * SIGMA0 - sigmaNominal * sigmaNominal, 0.01)));
         for (int s = 1; s < GAUSS_PER_OCT; s++) {
             double sp = SIGMA0 * std::pow(2.0, (s - 1) / (double)S);
@@ -153,11 +136,8 @@ private:
     const Level& gL(int o, int s) const { return gLevels_[o * GAUSS_PER_OCT + s]; }
     const Level& dL(int o, int d) const { return dLevels_[o * DOG_PER_OCT + d]; }
 
-    // ---- allocation + descriptor set ----
-    // Reallocate when first called or when a larger image than any so far needs
-    // bigger size-dependent buffers. Fixed-size buffers (keypoint lists, etc.)
-    // are sized from options and never grow. Process largest-first (extractDir)
-    // to make this run exactly once per batch.
+    // ---------------- 分配与描述符 ----------------
+    // 仅首次或更大图像时扩展尺寸相关缓冲，关键点列表等按选项固定；最大图优先使每批只需一次分配。
     void ensureAllocated() {
         size_t needImg = (size_t)(W0_ / 2) * (H0_ / 2);
         if (setup_ && gaussFloats_ <= capGauss_ && dogFloats_ <= capDog_ && needImg <= capImg_ &&
@@ -176,7 +156,7 @@ private:
     }
 
     void allocate() {
-        plannedOnce_ = false;  // fresh buffers hold nothing; re-upload the tables
+        plannedOnce_ = false;  // 新缓冲为空，需重新上传布局表
         bImg_ = ctx_.createBuffer((VkDeviceSize)(W0_ / 2) * (H0_ / 2) * 4);
         bGauss_ = ctx_.createBuffer((VkDeviceSize)gaussFloats_ * 4);
         bDog_ = ctx_.createBuffer((VkDeviceSize)dogFloats_ * 4);
@@ -197,9 +177,7 @@ private:
                                 bGlev_.buf, bDlev_.buf, bKp_.buf, bKpCnt_.buf, bOkp_.buf,
                                 bOkpCnt_.buf, bDesc_.buf, bHist_.buf, bFokp_.buf, bSelCnt_.buf});
 
-        // Pipelines depend only on the (fixed) descriptor-set layout, so load
-        // them once even if the descriptor set is later rebound to grown buffers
-        // (an identical layout stays pipeline-compatible).
+        // 流水线仅依赖固定描述符布局，缓冲扩展重绑定后仍兼容，只需加载一次。
         if (!pipelinesLoaded_) {
             size_t words = 0;
             if (!opt_.spv_path.empty()) {
@@ -218,12 +196,7 @@ private:
                 "orient",   "scale_hist", "select_topk", "descriptor"};
     }
 
-    // The image changes every call; the blur weights and the level tables only
-    // change when planPyramid() produces a different layout, which for a batch
-    // sorted largest-first is a handful of times over thousands of images.
-    // Each upload is its own fenced submit (VkContext::upload), so re-sending
-    // three unchanged buffers per image was three device round trips per image
-    // for nothing.
+    // 图像每次变化，模糊权重与层表仅在金字塔布局改变时上传，避免每图三次无效栅栏往返。
     void uploadInputs(const GrayImage& img) {
         ctx_.upload(bImg_, img.data.data(), img.data.size() * 4);
         if (planKey_ == lastPlanKey_ && plannedOnce_) return;
@@ -247,7 +220,7 @@ private:
         plannedOnce_ = true;
     }
 
-    // ---- dispatch helpers ----
+    // ---------------- 分派辅助函数 ----------------
     static Push pk(uint32_t a, uint32_t b = 0, uint32_t c = 0, uint32_t d = 0, uint32_t e = 0,
                    uint32_t f = 0, uint32_t g = 0, uint32_t h = 0) {
         Push p;
@@ -267,14 +240,13 @@ private:
         ctx_.dispatch(cb, name, grid(w, 16), p, grid(h, 16));
     }
 
-    // One pyramid is 0.83 s on a 2-CU RADV iGPU at 3200 px and past its 2 s
-    // watchdog at 5000, so it is submitted in pieces of the budget's size.
+    // 双计算单元 RADV 集显上 3200 px 金字塔耗时 0.83 s，5000 px 会超过 2 s 看门狗，须按预算分段提交。
     void runPyramid() {
         VkCommandBuffer cb = ctx_.begin();
         for (int o = 0; o < octaves_; o++) {
             const Level& g0 = gL(o, 0);
             if (o == 0) {
-                // upsample original -> gauss(0,0), then in-place blur to SIGMA0
+                // 原图上采样到 gauss(0,0)，再原地模糊至 SIGMA0
                 img2d(cb, "upsample", g0.w, g0.h,
                       pk(g0.off, (uint32_t)(W0_ / 2), (uint32_t)(H0_ / 2), g0.w, g0.h));
                 ctx_.barrier(cb);
@@ -302,7 +274,7 @@ private:
         submitTimed(cb, pyramidBudget_, pyramidWork_);
     }
 
-    // separable blur src->dst using step kernel `step`; requires src != tmp usage
+    // 使用 step 核执行可分离模糊，源缓冲不能与临时缓冲混用
     void blur(VkCommandBuffer& cb, uint32_t srcOff, uint32_t dstOff, uint32_t w, uint32_t h,
               int step) {
         uint32_t woff = stepOff_[step], r = stepRad_[step];
@@ -352,8 +324,7 @@ private:
         return n;
     }
 
-    // orient and descriptor are one thread per keypoint: 392 and 222 ms for one
-    // image's dispatch on a 2-CU RADV iGPU, so they go in keypoint ranges.
+    // 方向与描述子每关键点一线程；双计算单元集显单图曾分别耗时 392/222 ms，因此按关键点范围分段。
     uint32_t runOrient(uint32_t nkp) {
         VkCommandBuffer cb = ctx_.begin();
         ctx_.fillZero(cb, bOkpCnt_);
@@ -381,17 +352,14 @@ private:
         return n;
     }
 
-    // GPU top-K by scale: histogram-select a scale threshold that keeps ~K of
-    // the largest-scale oriented keypoints, then compact the survivors into
-    // `fokp` so only they are described.  Returns the survivor count (>= K by a
-    // small, single-bin overshoot; the host applies the exact cut later).
+    // GPU 用尺度直方图选阈值并压缩到 fokp，仅为保留点计算描述子；末桶可略超过 K，主机随后精确截断。
     uint32_t runSelect(uint32_t nokp) {
         if (nokp == 0) return 0;
         uint32_t K = (uint32_t)opt_.max_num_features;
-        float threshold = 0.0f;  // keep all (scales are strictly positive)
+        float threshold = 0.0f;  // 尺度严格为正，保留全部
 
         if (opt_.max_num_features > 0 && nokp > K) {
-            // log2(scale) range for the histogram, from the pyramid geometry.
+            // 由金字塔几何确定 log2(scale) 直方图范围。
             double lo = 0.5 * SIGMA0 * std::exp2((double)FIRST_OCTAVE);
             double hi = SIGMA0 * std::exp2((S + 1.0) / S) *
                         std::exp2((double)(octaves_ - 1 + FIRST_OCTAVE)) * 1.5;
@@ -407,8 +375,7 @@ private:
 
             std::vector<uint32_t> hist(kNumBins);
             ctx_.download(bHist_, hist.data(), hist.size() * 4);
-            // Accumulate from the high-scale end until we have >= K, keeping the
-            // last bin included (smallest overshoot, never selects nothing).
+            // 从大尺度端累计到至少 K，保留最后一个桶，使超量最小且不会误选为空。
             uint64_t run = 0;
             int thrBin = 0;
             for (int b = kNumBins - 1; b >= 0; b--) {
@@ -464,20 +431,8 @@ private:
             kps[i] = {p[0], p[1], p[2], p[3], 0.0f};
         }
 
-        // Exact top-K cut on the (already small) survivor list, by scale, then a
-        // canonical output order.
-        //
-        // Both need a *total* order, because the GPU appends keypoints through
-        // atomics and the device order varies run to run. Leaving ties to that
-        // order made features.bin -- and so match indices, the seed pair and
-        // the whole reconstruction -- irreproducible (D16).
-        //
-        // The emitted order is by *position*, deliberately not by scale.
-        // Downstream tie-breaks are index-ordered (the matcher's max_num_matches
-        // cap, the mapper taking the first 3D point a feature corresponds to),
-        // so a scale-sorted index would quietly bias all of them toward
-        // large-scale, poorly-localized features. Position is uncorrelated with
-        // feature quality, which is what a canonical order should be.
+        // 主机按尺度精确截断，再按位置输出；两次排序都必须为全序，以消除 GPU 原子追加顺序的不确定性（D16）。
+        // 不能按尺度编号，否则下游按索引打破平局时会偏向大尺度、定位较差的特征。
         auto byScale = [&](uint32_t a, uint32_t b) {
             const Keypoint& p = kps[a];
             const Keypoint& q = kps[b];
@@ -518,7 +473,7 @@ private:
 
     SiftOptions opt_;
     VkContext ctx_;
-    // Pyramid work is pixels x taps; orient and descriptor count keypoints.
+    // 金字塔工作量按像素数×核采样数估计，方向与描述子按关键点数估计。
     spirula::SubmitBudget pyramidBudget_, orientBudget_, descBudget_;
     double pyramidWork_ = 0;
     int W0_ = 0, H0_ = 0, octaves_ = 0;
@@ -532,11 +487,11 @@ private:
     GpuBuffer bHist_, bFokp_, bSelCnt_;
 
     bool setup_ = false, pipelinesLoaded_ = false;
-    // Which pyramid layout the device-side weight/level tables currently hold.
+    // 当前设备权重和层表对应的金字塔布局。
     std::pair<int, int> planKey_{0, 0}, lastPlanKey_{-1, -1};
     bool plannedOnce_ = false;
     size_t capGauss_ = 0, capDog_ = 0, capImg_ = 0, capTmp_ = 0, capGlev_ = 0, capDlev_ = 0,
            capW_ = 0;
 };
 
-}  // namespace sfm
+}  // 命名空间 sfm

@@ -1,4 +1,4 @@
-// Equirectangular BA seam behavior through cost, Jacobian assembly and solve.
+// 测试等距柱状 BA 接缝在代价、雅可比装配和求解中的行为。
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -131,8 +131,7 @@ Result evaluate(BAProblem P, RealCfg real, const char* loss) {
     return out;
 }
 
-// Pixels are gauge-invariant; the poses and points are not, and nothing here
-// fixes the gauge (map/Bundle.h), so two solves may settle at different ones.
+// 像素对规范变换不变，但位姿和点不变性不成立；未固定规范的两次求解可落在不同坐标系。
 double reprojectionGap(const BAProblem& P, const Result& a, const Result& b) {
     double worst = 0;
     for (uint32_t o = 0; o < P.num_obs; o++) {
@@ -164,7 +163,7 @@ bool testVariant(const BAProblem& base, RealCfg real, const char* loss) {
     const double g_err = relativeMax(device.g, host.g);
     const double final_err = std::fabs(device.final - host.final) / std::max(1.0, host.final);
     const double reproj_px = reprojectionGap(base, device, host);
-    // rAtan2 is approximate; fp64 CPU/device projection parity is about 1 ppm.
+    // rAtan2 为近似，CPU/GPU 双精度投影一致性约为百万分之一。
     const double assembly_tol = real == RealCfg::F32 ? 2e-5 : 2e-6;
     const double solve_tol = real == RealCfg::F32 ? 1e-2 : 1e-5;
     const double reproj_tol_px = real == RealCfg::F32 ? 5e-3 : 5e-5;
@@ -194,6 +193,6 @@ int run(int, char**) {
     return ok ? 0 : 1;
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 int main(int argc, char** argv) { return sfmTestMain(argc, argv, run); }

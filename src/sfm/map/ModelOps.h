@@ -1,16 +1,5 @@
-// The vocabulary of operations on a *set* of reconstructions.
-//
-// A capture that does not come back as one model needs the same five things
-// whatever produced the pieces: merge what belongs together, break what does
-// not, register the images nobody claimed, drop the copies, and cut a model
-// that has written two places on top of each other. Both mappers need them with
-// the identical thresholds, so they live here and neither owns them; the
-// schedule that drives them is sfm/map/Assemble.h.
-//
-// Everything here is a free function over `Mapper`'s public operations. The
-// memo is the one piece of state: passes are skipped for models they have
-// already seen in this shape, which is what keeps a schedule that runs them
-// repeatedly from paying for them repeatedly.
+// 模型集合的共享操作：合并、拆分、补配、去重与切开折叠，由 Assemble 调度，两种建图器使用相同阈值。
+// 通过模型状态摘要跳过已处理且未变化的结果，避免重复支付昂贵检查成本。
 #pragma once
 
 #include <algorithm>
@@ -31,111 +20,36 @@
 
 namespace sfm {
 
-// The thresholds every pass here is judged by, shared by both mappers. Named
-// for the manage loop that used to drive them (D44), and kept as one struct
-// because they are one policy: what may be merged, what may be broken, and what
-// counts as evidence for either.
+// 统一的模型管理策略阈值，规定合并、拆分及所需证据，两种建图器共用。
 struct ManagerOptions {
     MergeOptions merge;
     bool do_merge = true;
-    bool do_grow = true;      // register unregistered images into existing models
-    bool do_reseed = true;    // look for models among images still uncovered
-    // Audit a merged model's poses against the correspondence graph and
-    // re-register what it cannot support (Mapper::audit). Off means a merged
-    // model is only bundle-adjusted, which cannot undo a gross misplacement.
-    //
-    // **Off**, on measurement (D71). The repair moves an image to a pose chosen
-    // by a RANSAC over correspondences the image does not own, and that pose is
-    // -- in the audit's own words -- supported by evidence "weaker than
-    // registration demands". At a handful of images that is a good trade. At
-    // scale it is not: on a 5356-image capture the audit repaired 77 images and
-    // took AUC@10 from **93.5 to 65.0**, and on a 7620-image one it repaired 558
-    // and cost 7 points. It is also the most expensive pass in the pipeline --
-    // 421 s of a 2076 s run there, 242 s of a 2005 s run here -- so it was
-    // buying that with the largest bill of any finishing pass.
-    //
-    // The refinement it used to end with still happens either way (auditModels
-    // falls back to Mapper::refine), so what is switched off is the repair
-    // alone. D44's case for it -- rig frames left tens of degrees apart by a
-    // merge of two drifted halves -- is real and predates the seam validator
-    // (D45) and the splice test, which refuse that merge outright now. If it
-    // recurs, it wants a repair that de-registers rather than guesses.
+    bool do_grow = true;      // 向已有模型补配未注册图像
+    bool do_reseed = true;    // 在未覆盖区域寻找新模型
+    // 审查修复默认关闭，但精化保留；5356 图修复 77 图使 AUC@10 93.5->65.0，耗时 421/2076 s，7620 图修复 558 图损失 7 分，耗时 242/2005 s。
+    // 弱于正常配准的修复证据在大规模上不可靠，应先用接缝与拼接检查拒绝坏合并（D71）。
     bool do_audit = false;
-    // What an audit's repair pass may grow a model to, as a fraction of what it
-    // already held (see Mapper::audit). 0 leaves it uncapped, which is a full
-    // incremental growth pass hiding inside a repair; the assembler has a growth
-    // schedule of its own and overrides this with it.
+    // 审查修复后的最大增长比例，0 不限制；装配器会按自身增长计划覆盖，避免隐藏完整增量重建。
     double audit_growth_frac = 0;
-    // A model this fraction of whose images another (larger) model also holds
-    // carries nothing of its own: growth has made it a duplicate. It is
-    // dropped rather than written as a reconstruction in its own right.
+    // 模型大部分图像已被更大结果覆盖时视为重复，不单独写出。
     double redundant_ratio = 0.9;
-    // Cameras whose focal deviates from the population consensus by more than
-    // this factor are refit before merging (see refitOutlierCameras). A model
-    // built on a runaway focal cannot align with anything, and on a rig every
-    // model is looking at the same physical cameras.
-    double focal_consensus_tol = 0.15;  // 0 disables
-    // Cross-seam agreement required of a merge (Mapper::checkSeam). A verified
-    // pair whose two images end up on opposite sides of the seam is evidence
-    // the alignment never saw; the merged model has to reproduce most of them.
-    // 0 disables the check.
-    double seam_min_agreement = 0.6;   // fraction of tested cross-seam pairs
-    double seam_min_pair_fraction = 0.5;  // ... of a pair's matches, to call it holding
-    int seam_min_pairs = 10;           // below this there is nothing to judge on
-    // ... and that pair fraction is a *ceiling*, not the bar. The bar is what
-    // the model's own non-crossing pairs achieve, times this (D68). A verified
-    // pair is not ground truth: on a repetitive interior some of them join two
-    // places that merely look alike, and there the same measurement over pairs
-    // nobody doubts comes back far below 0.5 -- so a fixed bar asks a correct
-    // merge to beat evidence the capture does not contain, and refuses it.
-    //
-    // Measured on a 7620-image capture that is half building interior: the
-    // assembler refused 41 of 43 merges, and merging the models it wrote
-    // afterwards with no seam test at all recovered 268 images and 3 points of
-    // AUC@10. It only ever loosens -- min() with the fraction above -- so a
-    // capture whose pairs are trustworthy is judged exactly as before.
-    double seam_relative_bar = 0.6;    // 0 uses seam_min_pair_fraction flat
-    int seam_reference_pairs = 400;    // non-crossing pairs sampled for it
-    // A merge that fails the test above is not necessarily wrong -- it may
-    // merely be out of true (D64). The test measures pixels on a model no
-    // bundle adjustment has seen: the incoming half arrives under one
-    // similarity, so two components that are each sound but drifted differently
-    // sit a fraction of a degree apart across the seam, and at 8 px on an
-    // 800 px focal that is the whole tolerance. Every cross-seam pair then
-    // fails, and a merge of two large correct components is refused.
-    //
-    // What separates that from a wrong merge is not how many pairs hold, but
-    // how much of a pair the model explains when it does not: a seam that is
-    // out of true still explains a fifth of a typical pair's matches, two
-    // different places explain none. So a refusal whose median pair is above
-    // `seam_rescue_frac` earns one coarse refinement of the merged model and a
-    // second verdict; the refinement is kept when it passes.
-    // Only *failed* rescues are charged against the budget. A refinement that
-    // bought a merge is not overhead -- the model is kept in its refined form,
-    // so it is work the next pass does not repeat. What has to be bounded is a
-    // capture where the rescue never works, and eight wasted refinements is
-    // enough to establish that.
-    double seam_rescue_frac = 0.2;     // 0 disables the rescue
-    int seam_max_rescues = 8;          // refinements it may waste before giving up
-    // Break a model whose own verified pairs do not agree with it
-    // (Mapper::splitInconsistent). Only pairs with at least
-    // `split_min_matches` are trusted to vote, and a resulting group smaller
-    // than `split_min_group` is de-registered rather than written out.
+    // 组焦距偏离总体共识超过此倍数时，合并前重新拟合，避免错误焦距使模型无法对齐。
+    double focal_consensus_tol = 0.15;  // 0 禁用焦距共识重拟合
+    // 接缝验证要求模型解释未参与对齐的跨缝双视图证据，阈值 0 可禁用检查。
+    double seam_min_agreement = 0.6;   // 通过检查的跨缝图像对比例
+    double seam_min_pair_fraction = 0.5;  // 单对匹配至少解释的比例
+    int seam_min_pairs = 10;           // 少于此图像对数无法判断
+    // 实际接缝门限取固定上限与内部一致性乘比例的较小者（D68）；7620 图数据固定门限曾拒绝 43 次中的 41 次，禁用后恢复 268 图及 3 分 AUC。
+    double seam_relative_bar = 0.6;    // 0 表示直接使用固定 seam_min_pair_fraction
+    int seam_reference_pairs = 400;    // 建立基线所用的非跨缝采样对数
+    // 失败接缝若仍能解释典型对约五分之一匹配，可尝试一次粗精化复判；成功结果直接保留，仅失败救援消耗预算（D64）。
+    double seam_rescue_frac = 0.2;     // 0 禁用接缝救援
+    int seam_max_rescues = 8;          // 放弃前允许的失败救援精化次数
+    // 拆分仅采用匹配数达标的验证边，过小组撤销配准而不单独输出。
     bool do_split = true;
     int split_min_matches = 30;
     size_t split_min_group = 10;
-    // Folded models: two similar-looking parts of the capture written on top of
-    // each other (findDuplicateStructure). Detected from missing structure, not
-    // from disagreement, because a fold agrees with itself.
-    //
-    // On by default since D46, when the verdict stopped being the conflict
-    // *rate* -- which does not separate a fold from a dense capture -- and
-    // became what the implied split would cost. Measured with the same options
-    // on real-world datasets, the rate is *higher* on the sound model; the cut
-    // differs by a hundredfold, because two places written on top of each other
-    // never shared structure to  begin with, while cutting a sound model always
-    // runs through structure it genuinely shares.
-    // See DuplicateOptions::max_cut_fraction.
+    // 默认检查折叠，通过缺失共同结构发现错误重叠；冲突率不能区分密集正确采集，实际切割损失才是判据，真伪折叠可相差百倍（D46）。
     bool do_duplicate_split = true;
     DuplicateOptions duplicate;
     bool verbose = true;
@@ -144,24 +58,16 @@ struct ManagerOptions {
 struct ManagerStats {
     size_t rounds = 0;
     size_t merges = 0, merges_refused = 0;
-    size_t grown_images = 0;       // images registered by growth passes
+    size_t grown_images = 0;       // 增长阶段新增配准图像数
     size_t reseeded_models = 0;
     size_t dropped_redundant = 0;
     size_t audited_out = 0, audited_repaired = 0;
     size_t cameras_refit = 0;
     size_t seam_checked = 0, seam_refused = 0, seam_skipped = 0;
     size_t seam_rescued = 0, seam_rescue_failed = 0;
-    // What the merges looked like on both sides of the verdict: the median
-    // cross-seam pair's explained fraction and how many pairs there were to
-    // judge on, summed so the report can average them. The accepted ones are
-    // the reference the refused ones have to be read against -- a threshold is
-    // only defensible if the two populations are actually separated.
-    // `rescue_gain` is how much the rescue's refinement moved that median when
-    // it did not work, which says whether the seam is out of true or wrong.
+    // 分别累计接受与拒绝合并的接缝解释比例及证据数量，便于评估门限区分度；rescue_gain 记录失败救援对中位解释比例的改善。
     double seam_refused_median = 0, seam_passed_median = 0, seam_rescue_gain = 0;
-    // Summed over judged merges: the bar each was held to, and what the model's
-    // own non-crossing pairs explained. Both are needed to read the two medians
-    // above -- a low refused median is only damning against a high bar (D68).
+    // 累计实际门限和内部非跨缝一致性，辅助解释低拒绝分数是否真低于该数据可达到的基线（D68）。
     double seam_bar_sum = 0, seam_reference_sum = 0;
     size_t seam_refused_pairs = 0, seam_passed = 0;
     size_t splits = 0, duplicate_splits = 0, split_dropped = 0;
@@ -169,19 +75,15 @@ struct ManagerStats {
     size_t covered_before = 0, covered_after = 0;
 };
 
-// Models are moved and re-indexed by every pass, so a pass that wants to skip
-// what it has already done cannot remember an index. It remembers the shape --
-// registered images and 3D points -- which changes whenever anything touched
-// the model, and whose collisions cost one skipped attempt that was
-// overwhelmingly likely to be a no-op anyway.
+// 模型索引会重排，以图像和点数量描述状态以跳过重复工作；偶然摘要碰撞最多漏掉一次通常无效的尝试。
 struct ModelMemo {
     using Signature = std::pair<uint32_t, size_t>;
     static Signature of(const Reconstruction& m) {
         return {m.numRegistered(), m.points3D.size()};
     }
-    std::set<Signature> barren;   // a growth pass could not extend these
-    std::set<Signature> audited;  // already checked in this shape
-    std::set<Signature> split;    // already examined for a bad seam
+    std::set<Signature> barren;   // 此前增长未能扩展的模型状态
+    std::set<Signature> audited;  // 已检查过的模型状态
+    std::set<Signature> split;    // 已审查接缝的模型状态
     void clear() {
         barren.clear();
         audited.clear();
@@ -189,20 +91,13 @@ struct ModelMemo {
     }
 };
 
-// Movement at the frame corner, in pixels, below which a joint refinement is
-// taken to have changed nothing anyone downstream can act on -- well under the
-// registration and filtering tolerances, which are a few pixels.
+// 以图像角点像素变化判断联合精化是否产生可影响后续决策的改变，门限远小于配准、过滤容差。
 inline constexpr double kJointBaMovedPx = 1.0;
 
-// How far apart the components' intrinsics are, in pixels at the frame corner.
-//
-// This is the quantity a joint refinement exists to close (D45): a component
-// that fitted its own focal to its own noise. When the components already agree
-// to under a pixel there, the solve is a bundle adjustment over the whole
-// capture that ends where it started.
+// 各分量内参在图像角点造成的最大像素差；已达亚像素一致时无需为消除内参分歧再做整场景 BA。
 inline double focalSpreadPx(const std::vector<Reconstruction>& models) {
-    std::map<uint32_t, std::pair<double, double>> range;  // id -> (min f, max f)
-    std::map<uint32_t, double> radius;                    // ... and its frame corner
+    std::map<uint32_t, std::pair<double, double>> range;  // 相机 ID ->（最小焦距，最大焦距）
+    std::map<uint32_t, double> radius;                    // 以及对应图像角点
     for (const Reconstruction& m : models)
         for (const auto& kv : m.cameras) {
             auto it = range.find(kv.first);
@@ -223,21 +118,8 @@ inline double focalSpreadPx(const std::vector<Reconstruction>& models) {
     return px;
 }
 
-// The cross-seam agreement test, as a merge validator (D45).
-//
-// Every test MergeSession can run by itself is computed from the evidence the
-// alignment already used, and repeated structure satisfies all of it -- a fold
-// agrees with itself. This one asks the correspondence graph instead: do the
-// verified two-view geometries that cross the seam still hold in the merged
-// model? It is the only test that separates "these two places look the same"
-// from "these two places are the same".
-//
-// The bottom-up tree needs it as much as the manage loop does. Its levels
-// perform hundreds of merges, and without this they run with nothing watching
-// for repeated structure at all.
-// The rescue (see ManagerOptions::seam_rescue_frac) makes this a judge that can
-// repair what it judges: a marginal verdict is re-taken on a refined model, and
-// the refinement is what gets committed when the second verdict passes.
+// 接缝验证查询预先验证的跨模型双视图几何，避免仅用对齐自身证据认可重复结构（D45）。
+// 边缘失败可粗精化后再判，通过则保留修复结果；flat 与 bottom-up 均共用此验证。
 inline std::function<std::string(Reconstruction&, const Reconstruction&, const Sim3&,
                                  const MergeCounts&)>
 seamValidator(Mapper& mapper, const ManagerOptions& opt, ManagerStats* st = nullptr) {
@@ -250,13 +132,9 @@ seamValidator(Mapper& mapper, const ManagerOptions& opt, ManagerStats* st = null
     const double rescue_frac = opt.seam_rescue_frac;
     const double rel_bar = opt.seam_relative_bar;
     const size_t ref_pairs = (size_t)std::max(0, opt.seam_reference_pairs);
-    // Shared by every merge this validator is handed to, so the budget bounds
-    // the pass rather than each attempt in it.
+    // 全部合并尝试共享救援预算，不能每次重新获得预算。
     auto budget = std::make_shared<int>(std::max(0, opt.seam_max_rescues));
-    // The reference is a property of the capture's matches, not of one seam, so
-    // it is measured once and reused -- but only once there were enough pairs
-    // to measure it on, since the first merge of a run may join two models too
-    // small to say anything. -1 = not yet established.
+    // 内部一致性基线在证据足够后测量并复用，-1 表示尚未建立，小模型首次合并可能证据不足。
     auto reference = std::make_shared<double>(-1.0);
     const double max_splice = opt.merge.max_splice_conflict_ratio;
     return [mp, max_err, pair_frac, min_agree, min_pairs, rescue_frac, rel_bar, ref_pairs,
@@ -266,24 +144,14 @@ seamValidator(Mapper& mapper, const ManagerOptions& opt, ManagerStats* st = null
         std::set<uint32_t> src_side;
         for (const auto& kv : src.images)
             if (kv.second.registered) src_side.insert(kv.first);
-        // A merge the splice test would have refused, sent here because its
-        // alignment is too well determined for "these are different places" to
-        // be the explanation (D64). Judging it as it stands measures the same
-        // unreconciled shapes a second time, so it is refined first, always.
+        // 共享位姿非常可靠但共享点不一致时，先精化协调两侧漂移，再进行独立验证，避免重复惩罚同一未优化形状误差（D64）。
         const bool contested =
             counts.points_spliced &&
             counts.splice_conflicts > max_splice * (double)counts.points_spliced;
-        // A model too large to bundle-adjust on this device still gets judged,
-        // on the geometry it arrived with. That is a harsher test than the
-        // arbitration intends, but it is evidence, and refusing a merge because
-        // the machine is small is not.
+        // 设备容不下精化时仍按原几何评估，不能仅因机器内存较小直接拒绝合并。
         if (contested && !mp->refineIfItFits(merged, /*coarse=*/true))
             if (st) st->seam_rescue_failed++;
-        // What this capture's own pairs achieve inside the merged model, which
-        // is the reference the seam is judged against (D68). Measured on the
-        // merged model rather than once per capture: it is the same pairs and
-        // the same code, and a model that has just absorbed another is the
-        // thing whose seam is in question.
+        // 在当前合并模型中测量非跨缝图像对一致性，作为其接缝的比较基线（D68）。
         double bar = pair_frac;
         if (rel_bar > 0 && ref_pairs) {
             if (*reference < 0) {
@@ -296,9 +164,7 @@ seamValidator(Mapper& mapper, const ManagerOptions& opt, ManagerStats* st = null
             if (st) st->seam_reference_sum += *reference >= 0 ? *reference : bar / rel_bar;
         }
         Mapper::SeamCheck sc = mp->checkSeam(merged, src_side, max_err, bar);
-        // Nothing to judge on. Counted, because "the test passed" and "the test
-        // could not run" are different facts and a merge tree that accumulates
-        // the second one is merging unwatched.
+        // 单独统计因证据不足而跳过的检查，不能将其混为验证通过。
         if (sc.tested < min_pairs) {
             if (st) st->seam_skipped++;
             return "";
@@ -308,20 +174,13 @@ seamValidator(Mapper& mapper, const ManagerOptions& opt, ManagerStats* st = null
             if (st) {
                 st->seam_passed++;
                 st->seam_passed_median += sc.median_frac;
-                // A merge the splice test would have refused, carried by the
-                // cross-seam evidence once its two halves were reconciled: the
-                // case the arbitration exists for.
+                // 原本会因拼接冲突拒绝的模型，经精化后由独立接缝证据支持，属于仲裁成功。
                 if (contested) st->seam_rescued++;
             }
             return "";
         }
 
-        // Close, but not converged: optimize the seam and ask again. The
-        // refinement is coarse on purpose -- the question is whether the two
-        // halves can be reconciled at all, and whatever keeps this model will
-        // solve it properly. A model that comes back passing is kept in its
-        // refined form, so the work is not repeated downstream either. A
-        // contested merge has already had exactly this and does not get it twice.
+        // 接近通过但尚未收敛时粗精化并复判，成功保留精化结果；已为拼接仲裁精化过的候选不能重复救援。
         if (!contested && rescue_frac > 0 && sc.median_frac >= rescue_frac && *budget > 0) {
             Reconstruction fixed = merged;
             Mapper::SeamCheck s2;
@@ -332,7 +191,7 @@ seamValidator(Mapper& mapper, const ManagerOptions& opt, ManagerStats* st = null
                 merged = std::move(fixed);
                 return "";
             }
-            --*budget;  // only the wasted ones are charged
+            --*budget;  // 仅失败救援计入预算
             if (st) {
                 st->seam_rescue_failed++;
                 if (s2.tested) st->seam_rescue_gain += s2.median_frac - sc.median_frac;
@@ -353,7 +212,7 @@ seamValidator(Mapper& mapper, const ManagerOptions& opt, ManagerStats* st = null
     };
 }
 
-// Distinct images any model registers.
+// 所有模型配准的不同图像集合。
 inline std::set<uint32_t> coveredImages(const std::vector<Reconstruction>& models) {
     std::set<uint32_t> ids;
     for (const Reconstruction& m : models)
@@ -362,9 +221,7 @@ inline std::set<uint32_t> coveredImages(const std::vector<Reconstruction>& model
     return ids;
 }
 
-// COLMAP orders written models by 3D point count, descending
-// (ReconstructionManager::Write), so sparse/0 is the model with the most
-// structure. Every pass that ranks models uses the same order.
+// 所有模型排序均按三维点数降序，保持 sparse/0 为结构最多者。
 inline void sortModels(std::vector<Reconstruction>& models) {
     std::stable_sort(models.begin(), models.end(),
                      [](const Reconstruction& a, const Reconstruction& b) {
@@ -372,21 +229,10 @@ inline void sortModels(std::vector<Reconstruction>& models) {
                      });
 }
 
-// ---- the passes ---------------------------------------------------------
+// ---------------- 模型处理步骤 ----------------
 
-// Models that growth has turned into copies of what is already kept.
-//
-// Against the *union* of the models kept before it, not against one of them at
-// a time. Testing one at a time misses the case that actually occurs: on a
-// 5356-image capture the run ended with models of 5249, 5168, 3770 and 1389
-// images where each of the last three was 98-100% inside the union of the
-// others and none was 90% inside any single one, because their images were
-// split between two bigger models. Largest first, so what a model is measured
-// against is only ever models that outrank it.
-// `follow` arrays are reordered and filtered with the models. The bottom-up
-// tree carries a per-model "this one merged" flag across this pass, and losing
-// it would make its final audit re-check every model instead of the ones with a
-// new seam.
+// 按大模型优先，将每个模型与此前保留模型的图像并集比较，不能仅逐一比较。
+// 5356 图结果中的多个模型虽不被任一单模型覆盖 90%，却被其他模型并集覆盖 98–100%；follow 标记须同步重排和过滤。
 inline std::vector<Reconstruction> dropRedundantModels(std::vector<Reconstruction> models,
                                                        const ManagerOptions& opt,
                                                        ManagerStats& st,
@@ -428,17 +274,7 @@ inline std::vector<Reconstruction> dropRedundantModels(std::vector<Reconstructio
     return out;
 }
 
-// Break models the correspondence graph says are not one thing.
-//
-// The merge pass refuses a bad merge before it commits, but models arrive here
-// that were never merged and are wrong anyway -- a chain of registrations
-// through repeated structure does the same damage, and D41's own output has
-// models like that. Splitting them is what makes the rest of the loop work:
-// each piece is a sound reconstruction, and the merge pass gets to try again
-// with the seam test watching.
-//
-// Only models that changed since they were last split are re-examined, so a
-// split and a merge cannot chase each other round after round.
+// 按对应图拆开内部几何矛盾的模型，即使它从未经历合并也可能因重复结构配准出错；仅重查变化后的状态，避免拆分、合并循环。
 inline std::vector<Reconstruction> splitInconsistentModels(Mapper& mapper,
                                                            std::vector<Reconstruction> models,
                                                            const ManagerOptions& opt,
@@ -474,11 +310,7 @@ inline std::vector<Reconstruction> splitInconsistentModels(Mapper& mapper,
     return out;
 }
 
-// Break a model that has written two places on top of each other. This is the
-// failure the agreement split above cannot see -- a fold agrees with itself --
-// and it is detected from what the model is *missing*: images it places in the
-// same spot looking the same way, with no structure in common
-// (findDuplicateStructure).
+// 检查同位同向图像缺少共同结构的折叠，普通一致性检查无法发现内部自洽的错误叠合。
 inline std::vector<Reconstruction> splitFoldedModels(Mapper& mapper,
                                                      std::vector<Reconstruction> models,
                                                      const ManagerOptions& opt, ModelMemo& memo,
@@ -500,9 +332,7 @@ inline std::vector<Reconstruction> splitFoldedModels(Mapper& mapper,
         std::vector<Reconstruction> parts =
             splitDuplicateStructure(m, dr, opt.split_min_group, &dropped, &cut,
                                     opt.duplicate.min_fold_overlap);
-        // The conflicts say a fold is possible; the cut says whether the split
-        // is cheap. Only a genuine fold is both (D46) -- cutting a sound model
-        // always runs through structure it really does share.
+        // 冲突说明可能折叠，低切割代价说明可分离，两者同时满足才接受（D46）。
         if (parts.size() <= 1 || !foldSplitAccepted(dr, cut, opt.duplicate)) {
             if (opt.verbose && parts.size() > 1)
                 slog::diag(slog::Tag::Map,
@@ -547,24 +377,13 @@ inline std::vector<Reconstruction> splitFoldedModels(Mapper& mapper,
     return out;
 }
 
-// ---- camera consensus ----------------------------------------------------
-//
-// Every model of one capture is looking at the same physical cameras, so a
-// camera id that one model puts at a wildly different focal from the rest is
-// that model's mistake -- the focal search landing in a bad basin, kept by a BA
-// that had too few images to contradict it.
-//
-// The fix is to give them the consensus intrinsics and re-run the mapper's
-// refinement, which re-fits the poses and structure to them. If that was the
-// only thing wrong, the model comes back consistent with everything else; if it
-// was not, refinement filters it down and the merge tests still refuse it.
-// Weighted by image count, so the consensus comes from the models with the
-// evidence.
+// ---------------- 相机参数共识 ----------------
+// 按支持图像数求共享镜头内参共识，替换偏离严重模型的整套相机参数，再精化位姿与结构；仍有错误者会被过滤或合并检查拒绝。
 inline void refitOutlierCameras(Mapper& mapper, std::vector<Reconstruction>& models,
                                 const ManagerOptions& opt, ManagerStats& st) {
-    if (models.size() < 3) return;  // no population to take a consensus from
-    std::map<uint32_t, std::vector<std::pair<double, uint32_t>>> focals;  // id -> (f, weight)
-    std::map<uint32_t, uint32_t> widest;  // id -> most images any model gives it
+    if (models.size() < 3) return;  // 没有足够总体数据求共识
+    std::map<uint32_t, std::vector<std::pair<double, uint32_t>>> focals;  // 相机 ID ->（焦距，权重）
+    std::map<uint32_t, uint32_t> widest;  // 相机 ID -> 任一模型提供的最大支持图像数
     for (const Reconstruction& m : models) {
         std::map<uint32_t, uint32_t> used;
         for (const auto& kv : m.images)
@@ -578,16 +397,9 @@ inline void refitOutlierCameras(Mapper& mapper, std::vector<Reconstruction>& mod
     }
     std::map<uint32_t, double> consensus;
     for (const auto& kv : focals) {
-        // A camera group of one image has no population to be an outlier of:
-        // its focal is fitted from that image alone in every model that holds
-        // it, so another model's value is not better evidence, and "refitting"
-        // costs a full bundle adjustment of the whole model to swap one guess
-        // for another. On an internet collection, where every image is its own
-        // camera (D20), that fired on hundreds of cameras and made the pass the
-        // longest stage of the run.
+        // 单图相机组没有更可靠群体共识，禁止为替换同样无依据的猜测执行整模型 BA；网络照片集合中这曾成为最慢阶段。
         if (widest[kv.first] < 2 || kv.second.size() < 3) continue;
-        // Weighted median: the model with the most images decides ties, and a
-        // couple of runaway small models cannot move it.
+        // 按图像数加权中位数，平局由最大模型决定，避免少量小模型发散值拖动共识。
         std::vector<std::pair<double, uint32_t>> v = kv.second;
         std::sort(v.begin(), v.end());
         uint64_t total = 0;
@@ -611,9 +423,7 @@ inline void refitOutlierCameras(Mapper& mapper, std::vector<Reconstruction>& mod
                 bad.push_back(kv.first);
         }
         if (bad.empty()) continue;
-        // Take the whole camera from the model that owns the consensus focal,
-        // not just its focal: the distortion terms of a camera that ran away are
-        // fitted to the same mistake.
+        // 复制共识来源的整套相机而非仅焦距，因为发散畸变也可能在补偿同一错误。
         for (uint32_t id : bad) {
             const Camera* donor = nullptr;
             for (const Reconstruction& other : models) {
@@ -641,16 +451,7 @@ inline void refitOutlierCameras(Mapper& mapper, std::vector<Reconstruction>& mod
     }
 }
 
-// Check every model that has changed, and refine it.
-//
-// A merged model is two halves glued along a seam that has never been optimized
-// as one, and a single similarity cannot place both halves of a drifted model
-// correctly -- it fits the overlap and misplaces what is far from it. Bundle
-// adjustment cannot walk a misplacement back, so the mapper first asks the
-// correspondence graph whether every image belongs where the model puts it
-// (Mapper::audit) and re-registers the ones that do not. Models nothing has
-// touched keep their exact shape and are skipped, so this costs nothing on a
-// dataset with nothing to fix.
+// 仅对变化模型执行配置启用的审查与精化，未变化者保持原值；单一相似变换不能消除两侧漂移，接缝需联合几何处理。
 inline std::vector<Reconstruction> auditModels(Mapper& mapper, std::vector<Reconstruction> models,
                                                const ManagerOptions& opt, ModelMemo& memo,
                                                ManagerStats& st) {
@@ -676,4 +477,4 @@ inline std::vector<Reconstruction> auditModels(Mapper& mapper, std::vector<Recon
     return models;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

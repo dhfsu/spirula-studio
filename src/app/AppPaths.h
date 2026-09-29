@@ -1,33 +1,23 @@
 #pragma once
 
-// Where the app keeps things, and where it finds its own siblings.
-//
-// Three questions with platform-specific answers that several modules ask,
-// answered once: the settings directory, the cache directory (model
-// checkpoints, the COLMAP vocabulary tree), and where this executable is --
-// which is how the GUI runs a reconstruction, since that is `spirula sfm`, i.e.
-// this same binary again.
+// 统一解析应用设置目录、缓存目录及当前可执行文件的位置。
+// GUI 通过自身路径启动重建子进程；设置与大型模型缓存分开存放。
 
 #include <string>
 
 namespace app {
 
-// Created on first call. Roaming config on Windows, $XDG_CONFIG_HOME on Linux.
+// 首次调用时创建；Windows 使用漫游配置目录，Linux 使用 XDG_CONFIG_HOME。
 std::string config_dir();
 
-// Created on first call. LOCALAPPDATA on Windows, $XDG_CACHE_HOME on Linux.
-// Large downloads live here, so it is deliberately not the config directory.
+// 首次调用时创建；Windows 使用 LOCALAPPDATA，Linux 使用 XDG_CACHE_HOME；大型下载独立于配置目录。
 std::string cache_dir();
 
-// The running executable and the directory holding it, resolved once; both ""
-// if they cannot be determined. Spawning a tool goes through exe_path()
-// (`<exe_path> sfm auto ...`): a PATH lookup could reach a different build.
+// 当前可执行文件及其目录仅解析一次，无法确定时均为空；启动工具必须使用 exe_path()，防止 PATH 指向其他构建。
 std::string exe_path();
 std::string exe_dir();
 
-// macOS only. A Finder launch inherits launchd's PATH -- /usr/bin:/bin:
-// /usr/sbin:/sbin -- so colmap, ffmpeg and python3 are invisible to the bundle
-// though a shell finds them. Appends, so an inherited PATH still wins.
+// 仅用于 macOS；Finder 继承 launchd 的精简 PATH，无法找到常见第三方工具，因此在末尾追加搜索路径，保留已有路径优先级。
 void add_desktop_search_paths();
 
-}  // namespace app
+}  // 命名空间 app

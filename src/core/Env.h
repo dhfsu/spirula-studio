@@ -1,15 +1,7 @@
 #pragma once
 
-// The one way this program reads an environment variable.
-//
-// Every knob is SS_<suffix>. The old SSPLAT_<suffix> spelling still works and
-// warns once per run; delete the fallback below together with the CMake option
-// aliases in CMakeLists.txt.
-//
-//   if (const char* d = spirula::env("VK_DEVICE")) ...
-//
-// Header-only on purpose: the standalone tool binaries link neither the engine
-// nor each other, and this is small enough not to need a home.
+// 环境变量的统一读取入口，使用 SS_<suffix>，兼容 SSPLAT_<suffix> 并在每次运行中警告一次。
+// 例如 spirula::env("VK_DEVICE")；仅含头文件，使独立工具无需链接引擎即可使用。
 
 #include <atomic>
 #include <cstdio>
@@ -18,7 +10,7 @@
 
 namespace spirula {
 
-// Value of SS_<suffix>, or of the deprecated SSPLAT_<suffix>, or nullptr.
+// 返回 SS_<suffix>、兼容的 SSPLAT_<suffix>，或 nullptr。
 inline const char* env(const char* suffix) {
     std::string name = "SS_";
     name += suffix;
@@ -28,15 +20,10 @@ inline const char* env(const char* suffix) {
     name += suffix;
     const char* v = std::getenv(name.c_str());
     if (v) {
-        // One shot for the whole process: enough to prompt a rename, and safe
-        // to call from the worker threads that read these knobs.
+        // 进程内仅提示一次，支持工作线程并发调用。
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true))
-            // English, and one of the few things that is. This header is
-            // deliberately dependency-free -- the standalone tool binaries
-            // include it and link neither the engine nor the i18n library --
-            // and the sentence is about the spelling of an environment
-            // variable, read by whoever typed one.
+            // 此头文件不依赖引擎或国际化库；环境变量拼写警告保留英文。
             std::fprintf(stderr,
                          "warning: %s is deprecated; use SS_%s "
                          "(SSPLAT_* is reported once per run)\n",
@@ -45,10 +32,10 @@ inline const char* env(const char* suffix) {
     return v;
 }
 
-// Set to anything other than "0" -- the shape most of the knobs want.
+// 已设置且值不为 0 时视为启用。
 inline bool env_on(const char* suffix) {
     const char* v = env(suffix);
     return v && v[0] && !(v[0] == '0' && v[1] == '\0');
 }
 
-}  // namespace spirula
+}  // 命名空间 spirula

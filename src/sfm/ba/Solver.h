@@ -1,11 +1,6 @@
-// Levenberg-Marquardt driver: owns GPU buffers, records each iteration
-// (assembly -> dense Cholesky or implicit-Schur PCG -> updates) and runs the
-// accept/reject loop on the host. An iteration goes to the device in as many
-// submits as the watchdog budget needs (core/SubmitBudget.h), so a large
-// problem on a slow GPU does not lose the device. Path selection, VRAM budget
-// and the dense fallback: sfm/ba/README.md. A device that can run none of the
-// scalar configurations gets `RealCfg::CPU`, and every entry point delegates
-// to bacpu::Solver -- the same LM loop and linear solvers, on the host.
+// LM 主机驱动，管理 GPU 缓冲、装配、稠密 Cholesky 或隐式 Schur PCG，以及步长接受/拒绝。
+// 按 SubmitBudget 拆分提交，避免慢 GPU 上的大问题触发看门狗；路径与内存预算见 sfm/ba/README.md。
+// 设备不支持任何算术配置时转到主机双精度 bacpu::Solver，沿用相同 LM 与线性求解流程。
 #pragma once
 
 #include <chrono>
@@ -31,12 +26,7 @@
 #include "sfm/core/Cancel.h"
 #include "sfm/core/Log.h"
 
-// Can this device run the kernels compiled for `c`?
-//   double - fp64 arithmetic, and an fp64 atomic add for the reductions
-//   float  - an fp32 atomic add
-//   df     - neither; the emulated double-float pair reduces through int64
-//            atomics
-//   cpu    - nothing at all; it runs on the host (sfm/ba/SolverCpu.h)
+// 设备算术能力：double 需要 fp64 运算与原子加，float 需要 fp32 原子加，df 使用双浮点模拟与 int64 原子操作，CPU 不需要设备能力。
 inline bool realSupportedByDevice(RealCfg c, const VkDeviceCaps& caps) {
     switch (c) {
         case RealCfg::F64:
@@ -51,20 +41,17 @@ inline bool realSupportedByDevice(RealCfg c, const VkDeviceCaps& caps) {
     return false;
 }
 
-// The closest thing to `want` the device can run: fp64, else the host. Neither
-// fp32-based configuration is in the chain -- `float` stalls the normal
-// equations above ~1e-7 relative accuracy and `df` buys its ~48 bits with
-// CAS-loop atomics; both stay available on request (../README.md).
+// 默认从 fp64 回退到主机双精度；float 正规方程精度约停在 1e-7，df 用 CAS 原子循环换取约 48 位精度，两者仅显式选择。
 inline RealCfg pickRealForDevice(RealCfg want, const VkDeviceCaps& caps) {
     if (realSupportedByDevice(want, caps)) return want;
     if (realSupportedByDevice(RealCfg::F64, caps)) return RealCfg::F64;
     return RealCfg::CPU;
 }
 
-// Cache capabilities by canonical UUID; ordinals may change between enumerations.
+// 按规范 UUID 缓存设备能力，枚举序号可能变化。
 inline const VkDeviceCaps& cachedDeviceCaps(const std::string& selector) {
     static std::mutex m;
-    static std::map<std::string, VkDeviceCaps> cache;  // node-based: references stay valid
+    static std::map<std::string, VkDeviceCaps> cache;  // 节点式容器保证引用保持有效
     std::lock_guard<std::mutex> g(m);
     auto it = cache.find(selector);
     if (it == cache.end())
@@ -74,23 +61,18 @@ inline const VkDeviceCaps& cachedDeviceCaps(const std::string& selector) {
 
 class BundleSolver {
     enum class LinSolve { DenseObs, DensePair, CG };
-    // Preconditioner block stride; matches kCamBlk in cg.slang.
+    // 预条件块步长必须与 cg.slang 的 kCamBlk 一致。
     static constexpr uint32_t kCamBlk = kMaxPlainDof * (kMaxPlainDof + 1) / 2;
 
 public:
-    // With `shared` the solver runs on a caller-owned persistent context:
-    // device, pipelines and descriptor machinery are created once and reused
-    // across solver instances (the mapper's periodic global BAs), and only the
-    // problem-sized buffers are per-instance -- created in init(), freed in
-    // the destructor. Without it the solver owns a scoped context, the old
-    // behavior (ba_main, selftests).
+    // shared 指定调用方持有的持久上下文，跨 BA 复用设备、流水线和描述符设施；仅问题大小的缓冲由求解器分配与释放。
+    // 未指定时求解器独占有作用域的上下文。
     BundleSolver(BAProblem& P, const SolverOptions& opt, VkContext* shared = nullptr)
         : P_(P), opt_(opt), owned_(shared ? nullptr : new VkContext),
           ctx_(shared ? *shared : *owned_) {}
 
     ~BundleSolver() {
-        // Persistent context: return this problem's VRAM now, not at ctx
-        // teardown. (Owned context frees everything in ~VkContext anyway.)
+        // 共享上下文下须立即归还本问题显存，不能等上下文销毁；独占上下文由析构统一释放。
         if (!owned_)
             for (GpuBuffer* b : ownBufs_) ctx_.destroyBuffer(*b);
     }
@@ -103,8 +85,7 @@ public:
             prof_t0 = t1;
             return dt;
         };
-        // An explicit request resolves even against a live context and never
-        // falls back to CPU or capability; only an implicit one may.
+        // 显式设备请求即使已有上下文仍需解析，不能静默回退 CPU 或按能力改选设备。
         const bool explicit_req =
             !opt_.device_selector.empty() || opt_.device >= 0;
         const bool validate_request =
@@ -119,8 +100,7 @@ public:
                      res.status != spirula::vkselect::ResolveStatus::NoDevice)
                 throw std::runtime_error(res.error);
         }
-        // The identity is what a shared context is; an ordinal says nothing
-        // across instances. Refuse before any capability choice or allocation.
+        // 共享上下文必须比较稳定标识，不能跨实例比较序号；能力选择与分配前拒绝不匹配。
         if (ctx_.initialized() && !selector_.empty() &&
             selector_ != ctx_.selector())
             throw std::runtime_error("requested device " + selector_ +
@@ -133,9 +113,7 @@ public:
                                     : cachedDeviceCaps(selector_);
             RealCfg real = pickRealForDevice(opt_.real, caps);
             if (real != opt_.real) {
-                // Once per (asked, got) pair: the mapper builds a solver per
-                // global BA, and a hundred identical lines say nothing the
-                // first one did not.
+                // 每种请求、实际配置组合仅提示一次，避免周期 BA 重复输出相同消息。
                 static std::mutex said_mu;
                 static std::set<std::pair<int, int>> said;
                 bool first;
@@ -160,8 +138,8 @@ public:
         vopt.needFloat64 = opt_.real == RealCfg::F64;
         vopt.needFloatAtomics = opt_.real != RealCfg::DF64;
         vopt.needInt64Atomics = opt_.real == RealCfg::DF64;
-        vopt.selector = selector_;      // canonical identity; empty = the shared precedence
-        vopt.deviceIndex = opt_.device; // legacy ordinal, only when no UUID was resolved
+        vopt.selector = selector_;      // 规范标识；空值沿用共享选择优先级
+        vopt.deviceIndex = opt_.device; // 兼容序号，仅在未解析 UUID 时使用
         vopt.validate = opt_.validate;
         vopt.profile = opt_.profile;
         if (!ctx_.initialized()) ctx_.init(vopt);
@@ -210,16 +188,14 @@ public:
         bPointsBak_ = mkReal(3 * (uint64_t)P_.num_points);
         bPairEntries_ = mkUint(std::max<size_t>(P_.pair_entries.size() + tcEnt_.size(), 2));
         bPairChunks_ = mkUint(std::max<size_t>(P_.pair_chunks.size() + tcChk_.size(), 2));
-        // S/g are rebuilt from the per-observation Jacobians on every path, so
-        // a rejected step needs no snapshot of them -- only Bp, which the
-        // point back-substitution overwrites in place.
+        // 所有路径都从逐观测雅可比重建 S/g，拒绝步骤无需备份；仅 Bp 会被点回代原地覆盖，必须保存。
         bBp0_ = mkReal(3 * (uint64_t)P_.num_points);
         bJc_ = mkReal(P_.jc_total);
         bRes_ = mkReal(2 * (uint64_t)P_.num_obs);
         bW_ = mkReal(9 * (uint64_t)P_.num_points);
         bYp_ = mkReal(needS && P_.use_pair_schur ? 6 * (uint64_t)P_.num_obs : 1);
         bY_ = mkReal(std::max<uint64_t>(P_.n_dim, 34 * (uint64_t)tcN_));
-        // CG path buffers (1-element dummies when unused)
+        // CG 缓冲，未使用时分配单元素占位
         bCamRanges_ = mkUint(cgAllocated_ ? P_.num_images + 1 : 1);
         bCamObs_ = mkUint(cgAllocated_ ? P_.num_obs : 1);
         bCamChunks_ = mkUint(cgAllocated_ ? P_.cam_chunks.size() : 3);
@@ -233,8 +209,7 @@ public:
         bCgScal_ = mkReal(16);
         bCgPart_ = mkReal(cgAllocated_ ? 2 * (uint64_t)npart : 1);
         bPrecBlocks_ = mkUint(cgAllocated_ ? P_.prec_blocks.size() : 4);
-        // Prior tables (prior.slang), one element each when there are none: a
-        // shared context binds the same count for every solve.
+        // 无先验时各表保留一个元素，使共享上下文描述符绑定数量稳定。
         const uint32_t npe = hasPriors_ ? prior_.numEntries() : 0;
         bPriorRows_ = mkUint(hasPriors_ ? P_.num_frames + 1 : 1);
         bPriorCols_ = mkUint(npe);
@@ -245,8 +220,7 @@ public:
             kDlPoses + (P_.pose_dim + P_.exts.size()) * rs > VkContext::stagingCapacity())
             throw std::runtime_error("pose priors: the parameter readback exceeds the staging buffer");
 
-        // binding order must match sfm/shaders/ba/ba.slang + cg.slang; atomic views
-        // alias the same VkBuffer at the odd bindings
+        // 绑定顺序须与 ba.slang 和 cg.slang 一致；奇数绑定的原子视图别名到同一个 VkBuffer。
         std::vector<VkBuffer> binds = {
             bObs_.buf, bObsImage_.buf, bObsPoint_.buf, bImageInfo_.buf, bGroupInfo_.buf,
             bPoses_.buf, bIntr_.buf, bPoints_.buf, bObsRanges_.buf, bModelObs_.buf, bJcOff_.buf,
@@ -273,22 +247,14 @@ public:
                     &bPriorRows_, &bPriorCols_, &bPriorErow_, &bPriorBlk_, &bPriorG_};
         double t_buf = prof_lap();
         ctx_.createDescriptors(binds);
-        // Fresh-from-the-driver allocations happen to arrive zeroed; memory
-        // recycled within a persistent context does not -- it still holds the
-        // previous solve's data, and any kernel that accumulates into a
-        // buffer it assumes zero would inherit garbage. Make the guarantee
-        // explicit instead of allocation-dependent. (After createDescriptors:
-        // begin() binds the descriptor set, which must not still reference
-        // the previous solve's freed buffers.)
+        // 持久上下文复用内存可能残留旧数据，所有累加缓冲必须显式清零；先更新描述符，再 begin，避免仍引用已释放缓冲。
         {
             VkCommandBuffer cb = ctx_.begin();
             for (GpuBuffer* b : ownBufs_) ctx_.fillZero(cb, *b);
             ctx_.submit(cb);
         }
 
-        // Only the entry points this problem dispatches: a cold driver cache
-        // spends ~90 ms compiling each of the module's seventy-odd, and
-        // loadPipelines skips what a shared context already built.
+        // 仅加载本问题实际使用的入口，冷驱动缓存每入口编译约 90 ms；共享上下文已创建的流水线可复用。
         std::vector<std::string> entries = {
             "point_prep", "point_update", "cam_update", "intr_update",
             std::string("dp_accum") + schurSuffix_,
@@ -330,10 +296,7 @@ public:
             entries.push_back(costEntry(mr));
             entries.push_back(jacEntry(mr));
         }
-        // A shared context keeps its pipelines across solver instances; the
-        // caller owning it must keep (real, loss) fixed, since the module is
-        // compiled per pair (runGlobalBA's cache does -- the mapper never
-        // varies them mid-run).
+        // 共享上下文的 real/loss 必须保持一致，模块按该组合编译；runGlobalBA 的缓存确保此约束。
         if (!opt_.spv_path.empty()) {
             ctx_.loadPipelines(opt_.spv_path, entries);
         } else {
@@ -354,9 +317,7 @@ public:
         }
         double t_pipe = prof_lap();
 
-        // Upload static data + initial parameters, in one submit. Seventeen
-        // fenced copies were most of a small solve's cost once several solvers
-        // share a device (see VkContext::uploadMany).
+        // 将静态数据与初始参数合并到一次提交；十七次带栅栏复制曾占共享设备小问题的大部分开销。
         std::vector<uint8_t> obs, poses, exts, intr, points;
         packReals(obs, P_.obs_xy.data(), P_.obs_xy.size(), opt_.real);
         packReals(poses, P_.poses.data(), P_.poses.size(), opt_.real);
@@ -370,8 +331,7 @@ public:
             gi.push_back(g.n_intr);
             gi.push_back(g.model);
         }
-        // Per image: frame, member, group, and whether the frame is shared
-        // (which decides store vs. accumulate in cg_bmul).
+        // 逐图像保存帧、成员、分组及帧是否共享，决定 cg_bmul 覆盖写入还是累加。
         std::vector<uint32_t> frame_images(P_.num_frames, 0);
         for (uint32_t i = 0; i < P_.num_images; i++) frame_images[P_.image_frame[i]]++;
         std::vector<uint32_t> ii;
@@ -443,8 +403,7 @@ public:
                        P_.n_dim, stats_.solver, stats_.vram_mb);
     }
 
-    // The host solver works on the problem's own parameter vectors, so upload
-    // and download are the identity there.
+    // CPU 求解器直接操作问题的主机参数，上传下载均无需复制。
     void uploadParams() {
         if (cpu_) return;
         std::vector<uint8_t> poses, exts, intr, points;
@@ -486,9 +445,8 @@ public:
         return readCost() + priorCost(hostPoses_, hostExts_);
     }
 
-    // ---- priors (sfm/ba/Priors.h) ----
-    // Evaluated on the host against a mirror of the device's poses: assembled
-    // at the accepted parameters, costed at the trial ones an iteration reads back.
+    // ---------------- 先验 ----------------
+    // 主机以设备位姿镜像求值：在已接受参数处装配，在试探参数回读后计算代价。
 
     double priorCost(const std::vector<double>& poses, const std::vector<double>& exts) const {
         return hasPriors_ ? prior_.cost(P_, poses.data(), exts.data()) : 0.0;
@@ -505,8 +463,7 @@ public:
         ctx_.uploadMany(up, 2);
     }
 
-    // The iteration's cost readback, plus the priors at the parameters the
-    // same command buffer read back into the staging buffer.
+    // 读取本轮设备代价，并用同一命令缓冲回读的参数计算先验代价。
     double readTotalCost() {
         double c = readCost();
         if (!hasPriors_) return c;
@@ -531,7 +488,7 @@ public:
         stats_.initial_cost = cost;
         int noimprov = 0;
 
-        bool reuse = false;  // after a reject, the assembly still matches the params
+        bool reuse = false;  // 拒绝步恢复参数后，已有装配仍与参数一致
         double reject_mult = 2.0;
         int consec_fallbacks = 0;
         auto last_ckpt = std::chrono::steady_clock::now();
@@ -544,9 +501,7 @@ public:
                            reuse ? " (reuse)" : "");
 
             LinSolve path = useCG_ ? LinSolve::CG : densePath_;
-            // A few CG iterations do not repay building A_c, and a stale one
-            // only costs iterations: it is rebuilt every third solve, or once
-            // the damping has moved tenfold.
+            // CG 迭代少时不值得重建 A_c；每三次求解或阻尼变化十倍才重建，过期矩阵仅影响迭代数。
             tcUse_ = tcN_ && !tcOff_ && lastCg_ > kTcMinIters;
             const bool tcBuild = tcUse_ && (!tcHave_ || tcAge_ >= 2 ||
                                             std::fabs(std::log(damping / tcLambda_)) > std::log(10.0));
@@ -569,9 +524,7 @@ public:
                 bool conv;
                 double cg_iters;
                 readCgStatus(conv, cg_iters);
-                // CG stopped before its first step (r.z or p.Sp not positive):
-                // retried without A_c, then a failed step that raises the damping
-                // -- S went indefinite by rounding below ~1e-9 on Gram blocks of 1e23.
+                // 若 r.z 或 p.Sp 非正导致 CG 尚未迈步，先禁用 A_c 重试，再提高阻尼；1e23 量级 Gram 块曾在约 1e-9 相对舍入下失去正定性。
                 if (cg_iters == 0 && !conv && tcUse_) {
                     tcUse_ = tcBuild_ = false;
                     restore_pending_ = true;
@@ -592,21 +545,18 @@ public:
                 lastCg_ = conv ? cg_iters : 1e9;
                 if (conv) {
                     consec_fallbacks = 0;
-                    // adapt the recorded iteration cap to the observed count
+                    // 根据实际迭代数调整记录的上限
                     cgMaxit_ = std::min<uint32_t>(
                         std::max<uint32_t>((uint32_t)(1.5 * cg_iters) + 8, 16),
                         (uint32_t)opt_.cg_max_iters);
                 } else {
                     uint32_t usedCap = cgMaxit_;
                     cgMaxit_ = (uint32_t)opt_.cg_max_iters;
-                    // a truncated-CG step is still a damped descent step; keep
-                    // it if it improved the cost and only pay for the dense
-                    // re-solve when the step would be rejected anyway
+                    // 截断 CG 仍可给出阻尼下降步；改善代价则保留，仅原本会拒绝时才支付稠密重算成本。
                     bool stepOk = std::isfinite(newCost) && newCost <= cost * (1.0 + opt_.rtol);
                     if (stepOk) consec_fallbacks = 0;
                     if (haveFallback_ && !stepOk) {
-                        // discard the step and redo this iteration with the
-                        // dense solver, reusing the assembly (reject flow)
+                        // 丢弃当前步，复用装配并改用稠密求解器重算本轮
                         if (opt_.verbose)
                             sfm::slog::diag(sfm::slog::Tag::Map,
                                        "iter %3d: CG hit %u-iteration cap, dense fallback",
@@ -616,10 +566,10 @@ public:
                         recordIteration((float)damping, true, densePath_);
                         endSeg();
                         newCost = readTotalCost();
-                        tcHave_ = false;  // the dense solve reused u_S
+                        tcHave_ = false;  // 稠密求解复用了 u_S
                         stats_.cg_fallbacks++;
                         if (++consec_fallbacks >= 3) {
-                            useCG_ = false;  // CG is not paying off; stay dense
+                            useCG_ = false;  // CG 效益不足，后续保持稠密求解
                             stats_.solver = "cg->dense";
                             if (opt_.verbose)
                                 sfm::slog::diag(sfm::slog::Tag::Map,
@@ -631,10 +581,7 @@ public:
 
             if (std::isfinite(newCost) && newCost <= cost * (1.0 + opt_.rtol)) {
                 if (newCost / cost >= 1.0 - opt_.rtol) {
-                    // tie-zone accept: count toward patience and nudge lambda
-                    // UP -- shrinking it on micro-improvements lets it
-                    // collapse and the solver stall in an ill-conditioned
-                    // plateau (observed with the df config on 871)
+                    // 极小改善计入耐心阈值并提高 lambda，避免阻尼持续缩小使求解停滞于病态平台；df 的 871 图问题观察到此现象。
                     if (++noimprov >= opt_.patience) { cost = newCost; break; }
                 } else {
                     noimprov = 0;
@@ -645,8 +592,7 @@ public:
                 acceptTrialParams();
                 reuse = false;
                 reject_mult = 2.0;
-                // 5 s of progress costs one parameter download (~20 ms for
-                // 4M points); an iteration of a small solve never reaches it.
+                // 每 5 s 保存一次参数；四百万点回读约 20 ms，小问题通常达不到该间隔。
                 const auto now = std::chrono::steady_clock::now();
                 if (opt_.checkpoint && now - last_ckpt > std::chrono::seconds(5)) {
                     downloadParams();
@@ -654,21 +600,19 @@ public:
                     last_ckpt = now;
                 }
             } else {
-                // reject: restore parameters; the assembly snapshot stays valid
+                // 拒绝时恢复参数，装配快照仍有效
                 restore_pending_ = true;
                 if (!std::isfinite(newCost)) {
                     if (++noimprov >= opt_.patience) break;
                 } else
                     noimprov = 0;
-                // rejects are cheap (assembly is reused), so search lambda
-                // finely at first, but escalate on consecutive rejects
+                // 拒绝可复用装配，初期细调 lambda，连续拒绝时加快提升
                 damping *= reject_mult;
                 reject_mult = std::min(reject_mult * 2.0, 32.0);
                 reuse = true;
             }
         }
-        // The last iteration may have been rejected; what the caller downloads
-        // must be the last *accepted* parameters.
+        // 最后一轮可能被拒绝，最终下载必须返回最后一次接受的参数。
         flushRestore();
         stats_.final_cost = cost;
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -677,17 +621,14 @@ public:
     }
 
     const SolverStats& stats() const { return cpu_ ? cpu_->stats() : stats_; }
-    // The scalar type actually in use, which init() may have stepped down from
-    // what SolverOptions asked for (see pickRealForDevice). Anything that packs
-    // or unpacks solver buffers from outside has to ask -- packing `double`
-    // into buffers a `df` kernel reads gives silent garbage, not an error.
+    // init 可能改变实际标量配置，外部打包必须查询实际类型；将 double 字节写入 df 缓冲会静默产生错误数据。
     RealCfg real() const { return opt_.real; }
-    // GPU-path handles; the host solver has no context and no device buffers.
+    // 仅 GPU 路径有上下文与设备缓冲
     VkContext& ctx() { return ctx_; }
     GpuBuffer& bufS() { return bS_; }
     GpuBuffer& bufG() { return bG_; }
 
-    // debug: run one full assembly (no factor/solve) so S and g can be dumped
+    // 调试：仅完整装配，不分解求解，以便导出 S 与 g
     void debugAssemble(float damping) {
         if (cpu_) return cpu_->assembleOnly(damping);
         uploadPriors(damping);
@@ -696,8 +637,7 @@ public:
         endSeg();
     }
 
-    // debug: the assembled S (packed lower triangle) and g, from whichever path
-    // ran, as doubles
+    // 调试：将任一路径装配出的压缩下三角 S 和 g 转为 double
     std::vector<double> debugPackedS() {
         if (cpu_) return cpu_->packedS();
         std::vector<uint8_t> raw(bS_.size);
@@ -708,8 +648,7 @@ public:
     }
     std::vector<double> debugG() { return cpu_ ? cpu_->gradient() : downloadG(); }
 
-    // debug: solve the same assembly with both paths and report the step
-    // difference (requires the cg+fallback configuration)
+    // 调试：同一装配分别使用 CG 与稠密路径求解并比较步长，需要启用 CG 回退配置
     double debugCompareStep(float damping) {
         if (cpu_) return cpu_->compareStep(damping);
         if (!useCG_ || !haveFallback_)
@@ -725,7 +664,7 @@ public:
         double cg_iters;
         readCgStatus(conv, cg_iters);
         beginSeg();
-        recordAssembly(damping, true, densePath_);  // reuse the same assembly
+        recordAssembly(damping, true, densePath_);  // 复用同一次装配
         recordCholesky();
         endSeg();
         std::vector<double> xd = downloadG();
@@ -742,7 +681,7 @@ public:
         return rel;
     }
 
-    // Factor the packed S in place and solve against g (sfm_cholesky_test).
+    // 原地分解压缩 S 并对 g 求解，供 sfm_cholesky_test 使用。
     void cholesky() {
         beginSeg();
         recordCholesky();
@@ -750,9 +689,7 @@ public:
     }
 
 private:
-    // The dof tiers the kernels are built at (ba.slang): the Schur kernels at
-    // four, the CG ones at two. A problem pays only for the widest camera it
-    // uses, and only a refined member extrinsic reaches the rig tier.
+    // Schur 内核编译四档自由度，CG 编译两档；仅按本问题最宽相机选择，只有可优化成员外参需要 rig 档。
     void pickTiers() {
         uint32_t maxDof = 0;
         for (uint32_t i = 0; i < P_.num_images; i++)
@@ -778,22 +715,17 @@ private:
         return std::string(kModels[mr.model].jac_entry) + (mr.rig ? "_rig" : "");
     }
 
-    // Choose the linear solver path from the problem shape, the options and
-    // the VRAM budget, and build the host-side tables the choice needs.
+    // 根据问题形状、选项与显存预算选择线性求解路径，并构建所需主机表。
     void decidePaths() {
         pickTiers();
         const bool exclusive = exclusiveGroups(P_);
         const uint64_t packed = (uint64_t)P_.n_dim * (P_.n_dim + 1) / 2;
-        const bool denseOk = packed <= 0x7FFFFFFFull;  // 32-bit packed indexing
+        const bool denseOk = packed <= 0x7FFFFFFFull;  // 32 位压缩索引
         const uint64_t pairEntries = pairEntryCount(P_);
         const bool cgOk = P_.num_obs > 0;
         const double budget = opt_.vram_budget_mb > 0 ? opt_.vram_budget_mb
                                                       : 0.9 * ctx_.deviceLocalHeapMB();
-        // The pair-aggregated Schur assembly is the faster of the two dense
-        // assemblies but the only one that costs memory (the entry lists and
-        // the per-observation Y). Treat it as what it is -- an optional
-        // accelerator -- so a dense problem that no longer fits with it
-        // degrades to the atomic kernel instead of jumping to CG.
+        // 按图像对聚合的 Schur 仅为可选加速，会额外存储条目与 Y；显存不足时先退回原子稠密装配，而非直接切到 CG。
         const double denseObsMB = estimateMB(true, false, false, 0);
         const double densePairMB = estimateMB(true, false, true, pairEntries);
         const bool pairOk = exclusive && P_.num_obs > 0 && pairEntries <= kMaxPairEntries &&
@@ -847,9 +779,7 @@ private:
             sfm::slog::diag(sfm::slog::Tag::Map,
                        "[vk] VRAM estimates: dense %.0f MB (%s Schur), cg %.0f MB (budget %.0f MB)",
                        denseMB, pairOk ? "pair" : "per-obs", cgMB, budget);
-        // Say so before the driver does. There is nothing below CG to fall back
-        // to -- its footprint is the problem data plus a few vectors -- so this
-        // is the point at which the answer is a smaller problem or more memory.
+        // 在驱动分配失败前报告预算不足；CG 已无更省内存路径，只能缩小问题或增加内存。
         const double needMB = (useCG_ ? cgMB : denseMB) + (haveFallback_ ? denseMB : 0);
         if (needMB > budget) {
             if (opt_.over_budget_throws) throw BAOverBudget(needMB, budget);
@@ -859,7 +789,7 @@ private:
                        useCG_ ? "cg" : "dense", needMB, budget);
         }
 
-        // host tables for the chosen paths
+        // 所选路径的主机索引表
         P_.use_pair_schur = false;
         if ((!useCG_ || haveFallback_) && pairOk) buildPairTables(P_);
         densePath_ = P_.use_pair_schur ? LinSolve::DensePair : LinSolve::DenseObs;
@@ -870,8 +800,7 @@ private:
         }
         cgMaxit_ = (uint32_t)opt_.cg_max_iters;
         if (tcN_) {
-            // Chunks of at most 128 entries of one cluster pair, their offsets
-            // past the pair-Schur entries they follow on the device.
+            // 每簇对分为至多 128 条目的块，设备偏移位于 pair-Schur 条目之后。
             std::vector<uint32_t> key;
             buildCoarseEntries(P_, tcK_, tcEnt_, key);
             const uint32_t base = (uint32_t)(P_.pair_entries.size() / 2);
@@ -887,9 +816,7 @@ private:
 
     static constexpr uint32_t kTcMaxDim = 4096;
 
-    // One LM iteration of each path in the budget's units. The dense assembly
-    // is quadratic in track length: a 1068-image capture whose tracks average
-    // 70 observations spent 3.7 s an iteration there, against 0.4 s on CG.
+    // 估计单次 LM 迭代代价；稠密装配与轨迹长度平方相关，1068 图、平均 70 观测的轨迹数据每轮 3.7 s，CG 为 0.4 s。
     double denseWork(bool pair, uint64_t pairEntries) const {
         const double n = P_.n_dim;
         const double schur = pair ? kWPairEntry * wide_ * wide_ * (double)pairEntries
@@ -903,16 +830,16 @@ private:
     }
     static constexpr double kCgItersGuess = 40;
 
-    // device-buffer footprint of a path combination, in MB (mirrors init())
+    // 路径组合的设备缓冲占用，单位 MB，与 init 分配一致
     double estimateMB(bool withDense, bool withCG, bool pairTables, uint64_t pairEntries) const {
         const double rs = (double)realSize(opt_.real);
         const double n = P_.n_dim, no = P_.num_obs, np = P_.num_points, ni = P_.num_images;
         const double packed = n * (n + 1) / 2;
         double b = 0;
-        b += no * (2 * rs + 12) + 4 * (double)P_.model_obs.size();  // obs + index tables
+        b += no * (2 * rs + 12) + 4 * (double)P_.model_obs.size();  // 观测与索引表
         b += 16 * ni + 16 * (double)(P_.groups.size() + P_.members.size());
-        b += 2 * (P_.pose_dim + P_.exts.size() + P_.total_intr) * rs;  // params + backups
-        b += 3 * np * rs * 3;                                      // points, backup, Bp0
+        b += 2 * (P_.pose_dim + P_.exts.size() + P_.total_intr) * rs;  // 参数与备份
+        b += 3 * np * rs * 3;                                      // 点参数、备份与 Bp0
         b += 4 * (np + 1);
         b += ((double)P_.jc_total + 8 * no) * rs;                  // Jc, Jp, res
         b += (9 + 3 + 9) * np * rs;                                // App, Bp, W
@@ -920,7 +847,7 @@ private:
         if (withDense) {
             b += packed * rs;
             if (pairTables)
-                b += 8.0 * pairEntries * 1.01 + 6 * no * rs;       // pair entries + Y
+                b += 8.0 * pairEntries * 1.01 + 6 * no * rs;       // 图像对条目与 Y
         }
         if (withCG && tcN_) {
             const double tn = tcN_, tc = tn * (tn + 1) / 2 + 42.0 * P_.num_frames;
@@ -931,31 +858,27 @@ private:
             b += (4 * n + 3 * np + ni * (double)bBlk_ +
                   (ni + (double)P_.members.size() + (double)P_.groups.size()) * kCamBlk) * rs +
                  4 * (ni + 1) + 4 * no + 12 * (no / 1024 + ni) +
-                 16 * (ni + (double)P_.groups.size());  // chunk + prec-block tables
+                 16 * (ni + (double)P_.groups.size());  // 分块与预条件块表
         return b / (1024.0 * 1024.0);
     }
 
-    // ---- submit budget ----
+    // ---------------- 提交预算 ----------------
 
-    // Launch costs in the budget's unit, about a nanosecond of an RTX 5070 at
-    // fp64 with the 24-wide rig camera block (--profile, 6946-image capture);
-    // wide_ scales the camera-block kernels to a narrower tier.
+    // 代价单位约为 RTX 5070 在 fp64、24 维 rig 相机块下的一纳秒，测自 6946 图的 profile；wide_ 调整较窄相机档的代价。
     static constexpr double kWLaunch = 2000, kWPoint = 0.25, kWVec = 1, kWImage = 5;
     static constexpr double kWCost = 1.5, kWJac = 5.5, kWDp = 0.6, kWYPrep = 0.3;
     static constexpr double kWCamDiag = 12.7, kWGather = 0.65, kWScatter = 1.2;
     static constexpr double kWSchurObs = 40, kWPairEntry = 3, kWFlop = 2.6e-3, kWTcSchur = 6;
-    // schur_obs walks the track per observation: kWSchurObs is at the 5.8
-    // observations of that capture's sum t^2 / sum t.
+    // schur_obs 按观测遍历轨迹；kWSchurObs 对应测量数据 sum t^2 / sum t = 5.8 的有效轨迹长度。
     static constexpr double kSchurObsT = 5.8;
-    // Until a submit has been timed, a device is taken to be 64x slower.
+    // 首次提交计时前保守假设设备慢 64 倍。
     static constexpr double kPriorRate = 1e9 / 64;
 
     static std::mutex& budgetMutex() {
         static std::mutex m;
         return m;
     }
-    // One per device and scalar config: the mapper builds a solver per BA,
-    // and each should start from what the last one measured.
+    // 每设备、每标量配置共享预算估计，使新的 BA 求解器继承上次测量。
     spirula::SubmitBudget& budgetLocked() {
         static std::map<std::string, spirula::SubmitBudget> m;
         return m.try_emplace(ctx_.selector() + realCfgName(opt_.real), kPriorRate).first->second;
@@ -964,7 +887,7 @@ private:
         std::lock_guard<std::mutex> g(budgetMutex());
         return budgetLocked().limit();
     }
-    // Measured over modelled cost of one kernel on this device, 0 until probed.
+    // 实际耗时与内核模型代价之比，未探测时为 0。
     double& kernelScaleLocked(const std::string& name) {
         static std::map<std::string, double> m;
         return m[ctx_.selector() + realCfgName(opt_.real) + name];
@@ -977,9 +900,7 @@ private:
         segTop_.clear();
         segTopWork_ = 0;
     }
-    // A CG kernel past convergence returns at once, so a segment holding one
-    // is timed only if the flag it reads back is still clear (a 2-CU iGPU
-    // lost the device on a budget learned from such no-op segments).
+    // CG 收敛后内核立即返回，只有回读标志尚未置位时才计入预算测量；两计算单元集显曾因空任务低估耗时而丢失设备。
     double endSeg(bool record = true) {
         if (segCg_) ctx_.recordDownload(cb_, bCgScal_, 8 * realSize(opt_.real), 0, kDlCgScal);
         const auto t0 = std::chrono::steady_clock::now();
@@ -993,9 +914,7 @@ private:
         std::lock_guard<std::mutex> g(budgetMutex());
         spirula::SubmitBudget& b = budgetLocked();
         if (!record || cgNoop_) return dt;
-        // A segment that is mostly one probed kernel corrects that kernel's
-        // ratio, so the global rate drifting with the others cannot oversize
-        // it (jac in df drifted 3x on an iGPU); 2x a step, as tiny launches plateau.
+        // 主要由单内核构成的提交段更新该内核比例，防止全局速率漂移导致超额；df 的 jac 曾在集显上偏差三倍，每次调整限制为两倍。
         double* scale = segTop_.empty() ? nullptr : &kernelScaleLocked(segTop_);
         if (scale && *scale > 0 && segTopWork_ > 0.8 * open_ && dt > b.target() / 16 &&
             b.rate() > 0) {
@@ -1011,8 +930,7 @@ private:
         endSeg();
         beginSeg();
     }
-    // Called after a barrier, before recording `w` more work: past the budget,
-    // what is recorded goes to the device first. True when it did.
+    // 屏障后、记录更多工作前检查预算；超额则先提交已有命令，返回是否提交。
     bool room(double w) {
         const bool full = open_ > 0 && open_ + w > budgetLimit();
         if (full) split();
@@ -1020,9 +938,7 @@ private:
         return full;
     }
 
-    // `n` items of `name` in budget-sized ranges, placed by `at(push, first, count)`.
-    // The weights are one GPU's, so a big kernel's first range is 1/32 of a
-    // budget, timed alone (schur_obs in df on a 2-CU iGPU took 21x its weight).
+    // 按预算分块执行 n 项，由 at 设置范围；首次大内核仅用 1/32 预算单独计时，避免设备差异，双计算单元集显的 df schur_obs 曾慢于模型 21 倍。
     template <class At>
     void launch(const std::string& name, uint32_t n, uint32_t per_group, double w_item,
                 const Push& p, At at) {
@@ -1039,11 +955,10 @@ private:
         read();
         const bool big = n * w_item > lim / 32;
         if (scale == 0 && big && open_ > 0) {
-            split();  // what is pending may be the measurement a probe needs
+            split();  // 待提交工作可能包含探测所需测量
             read();
         }
-        // At most 256 ranges: a small launch runs at a latency floor that no
-        // per-item cost fits, and 1/256 of any launch here is far under 2 s.
+        // 最多分成 256 段；小启动受固定延迟限制，任一完整启动的 1/256 已远低于 2 s。
         auto rangeOf = [&](double units) {
             const double w = w_item * (scale > 0 ? scale : 1);
             uint64_t c = lim > 0 ? (uint64_t)(units / std::max(w, 1e-9)) : n;
@@ -1080,10 +995,10 @@ private:
             a += c;
         }
     }
-    // Kernels that take the whole count in u0 and a range's first item in u4.
+    // u0 为总量、u4 为当前范围起点的内核。
     static void atBase(Push& q, uint32_t first, uint32_t) { q.u4 = first; }
 
-    // ... and the per-model kernels, whose u0/u1 already are a count and an offset.
+    // 逐模型内核的 u0/u1 已用于数量与偏移。
     template <class Range>
     static auto atModel(const Range& mr) {
         return [&mr](Push& q, uint32_t first, uint32_t count) {
@@ -1098,11 +1013,9 @@ private:
         return v[6] > 0.5;
     }
 
-    // ---- recording ----
+    // ---------------- 命令记录 ----------------
 
-    // chol_update also factors the next diagonal tile, so chol_diag proper
-    // only runs for the first block; the triangular solves are one fused
-    // dispatch per block (see cholesky.slang).
+    // chol_update 同时分解下一对角块，因此 chol_diag 仅处理首块；每块三角求解合并为一次分派。
     void recordCholesky() {
         const uint32_t n = P_.n_dim, bs = 32;
         const uint32_t nb = (n + bs - 1) / bs;
@@ -1125,8 +1038,7 @@ private:
         }
     }
 
-    // Factor the leading n x n packed triangle of u_S in place; `rel` > 0
-    // replaces a pivot under that fraction of the diagonal tc_reg saved with it.
+    // 原地分解 u_S 前 n×n 压缩三角；rel > 0 时，用 tc_reg 对角值替换低于指定比例的主元。
     void recordFactor(uint32_t n, float rel = 0) {
         const uint32_t bs = 32;
         const uint32_t nb = (n + bs - 1) / bs;
@@ -1150,8 +1062,7 @@ private:
         }
     }
 
-    // A_c = P^T S P from this iteration's B and W; its Cholesky factor is then
-    // inverted in place, so an application is two matrix-vector products.
+    // 由本轮 B/W 构造 A_c = P^T S P，再原地求 Cholesky 因子逆，使每次应用仅需两次矩阵向量乘。
     void recordCoarse() {
         const uint32_t packedTc = tcN_ * (tcN_ + 1) / 2;
         Push p;
@@ -1184,7 +1095,7 @@ private:
         room(kWLaunch + nb * tile);
         ctx_.dispatch(cb_, "tc_dinv", nb, d);
         ctx_.barrier(cb_);
-        d.u2 = 2 * tcN_;  // scratch rows follow the two vectors in u_y
+        d.u2 = 2 * tcN_;  // 临时行位于 u_y 中两个向量之后
         for (uint32_t i = 1; i < nb; i++) {
             d.u1 = i;
             room(2 * kWLaunch + i * (i + 1) / 2.0 * tile);
@@ -1195,7 +1106,7 @@ private:
         }
     }
 
-    // z += P A_c^-1 P^T r, after the block-Jacobi part of the preconditioner.
+    // 块 Jacobi 预条件后补充 z += P A_c^-1 P^T r。
     void recordCoarseApply() {
         Push p;
         p.u0 = tcN_;
@@ -1214,9 +1125,7 @@ private:
         ctx_.barrier(cb_);
     }
 
-    // The prior blocks into S (dense) or the preconditioner (CG), and the
-    // prior gradient into g; recorded after a barrier on the kernels that
-    // built those, since these add with plain read-modify-writes.
+    // 将先验块加入稠密 S 或 CG 预条件器，梯度加入 g；普通读改写必须在先前构建内核的屏障之后。
     void recordPriorAdd(const char* blocks_kernel) {
         Push pe;
         pe.u0 = prior_.numEntries();
@@ -1241,11 +1150,7 @@ private:
     void recordAssembly(float damping, bool reuse, LinSolve path) {
         const bool dense = path != LinSolve::CG;
         if (reuse) {
-            // Params were restored after a reject; the per-observation
-            // Jacobians (Jc/Jp/res/App) still match them, so skip the Jacobian
-            // pass. S and g are rebuilt from those by the Schur kernels -- on
-            // every path, which is why none of them is snapshotted. Bp is the
-            // one thing the back-substitution overwrote, so it is.
+            // 拒绝步恢复参数后复用 Jc/Jp/res/App，跳过雅可比重算；S/g 始终由 Schur 内核重建，仅回代会覆盖的 Bp 需要恢复快照。
             ctx_.copy(cb_, bBp0_, bBp_, bBp_.size);
             if (dense) {
                 ctx_.fillZero(cb_, bS_);
@@ -1253,7 +1158,7 @@ private:
             }
             ctx_.barrier(cb_);
         } else {
-            // backup params for possible reject
+            // 备份参数以便拒绝时恢复
             ctx_.copy(cb_, bPoses_, bPosesBak_, bPoses_.size);
             ctx_.copy(cb_, bIntr_, bIntrBak_, bIntr_.size);
             ctx_.copy(cb_, bPoints_, bPointsBak_, bPoints_.size);
@@ -1284,7 +1189,7 @@ private:
             q.f0 = damping;
             room(kWLaunch + P_.num_points * kWPoint);
             ctx_.dispatch(cb_, "point_prep", (P_.num_points + 255) / 256, q);
-            if (path == LinSolve::CG) {  // chunked cg_cam_diag accumulates atomically
+            if (path == LinSolve::CG) {  // 分块 cg_cam_diag 使用原子累加
                 ctx_.fillZero(cb_, bCgB_);
                 ctx_.fillZero(cb_, bCgM_);
                 ctx_.fillZero(cb_, bG_);
@@ -1316,7 +1221,7 @@ private:
             if (!dense) {
                 p.u0 = P_.num_cam_chunks;
                 p.u1 = P_.prec_exclusive ? 1 : 0;
-                p.u2 = P_.num_frames;  // member blocks follow the frame ones, then groups
+                p.u2 = P_.num_frames;  // 成员块位于帧块之后，随后为相机组
                 p.u3 = P_.num_frames + (uint32_t)P_.members.size();
                 launch(std::string("cg_cam_diag") + cgSuffix_, P_.num_cam_chunks, 1,
                        kWCamDiag * wide_ * wide_ * P_.num_obs / std::max(1u, P_.num_cam_chunks),
@@ -1335,17 +1240,13 @@ private:
         ctx_.barrier(cb_);
     }
 
-    // Record the device-side PCG loop (see cg.slang). Every kernel no-ops once
-    // the convergence flag is set; where the budget splits the loop, the flag
-    // is read back and the rest is not recorded.
+    // 记录设备 PCG 循环；收敛标志置位后内核不再执行，预算分段处回读标志并停止记录剩余迭代。
     void recordPCG(uint32_t maxit) {
         const uint32_t n = P_.n_dim;
         const uint32_t ng = (n + 255) / 256;
         const uint32_t npart = ng;
         const uint32_t nib = (P_.num_prec_blocks + 255) / 256;
-        // Shared columns: cg_bmul accumulates into them instead of storing, so
-        // they must start at zero -- the tail past the poses (members and
-        // groups), or the whole vector when rig frames are shared too.
+        // cg_bmul 对共享列累加，须先清零成员与分组尾部；帧也共享时需清零整个向量。
         const bool rigs = P_.hasRigs();
         const VkDeviceSize intrOff = rigs ? 0 : (VkDeviceSize)P_.pose_dim * realSize(opt_.real);
         const VkDeviceSize intrSize =
@@ -1359,7 +1260,7 @@ private:
         ctx_.barrier(cb_);
         Push pc;
         pc.u0 = P_.num_prec_blocks;
-        pc.u1 = 0;  // flag was just cleared
+        pc.u1 = 0;  // 标志刚刚清零
         ctx_.dispatch(cb_, "cg_prec_apply", nib, pc);
         ctx_.barrier(cb_);
         if (tcUse_) recordCoarseApply();
@@ -1436,13 +1337,8 @@ private:
         pollCg_ = false;
     }
 
-    // Put the parameters back where the last accepted step left them. A reject
-    // (and the CG fallback, which is a reject that retries) needs this before
-    // anything else touches them -- but it is three buffer copies, and a submit
-    // of its own costs a fence round trip on a device several solvers are
-    // sharing. So the reject only *marks* it, and the next command buffer to be
-    // recorded carries it. Nothing runs in between: the LM loop either records
-    // another iteration or leaves, and leaving flushes it (see solve()).
+    // 拒绝步或 CG 回退时先标记待恢复，在下一命令缓冲中合并执行三次参数复制，避免独立提交的栅栏往返。
+    // 两者之间不执行其他工作；退出循环前必须刷新恢复。
     void recordRestore() {
         ctx_.copy(cb_, bPosesBak_, bPoses_, bPoses_.size);
         ctx_.copy(cb_, bIntrBak_, bIntr_, bIntr_.size);
@@ -1451,8 +1347,7 @@ private:
         ctx_.barrier(cb_);
     }
 
-    // Emit a marked restore on its own, for the one caller that cannot defer:
-    // the loop is over and the parameters are about to be read back.
+    // 循环结束即将回读参数，不能继续延迟，单独提交待执行的恢复。
     void flushRestore() {
         if (!restore_pending_) return;
         restore_pending_ = false;
@@ -1503,12 +1398,7 @@ private:
         ctx_.barrier(cb_);
 
         recordCost();
-        // Fold the two readbacks the LM loop needs into this command buffer.
-        // A separate download() is its own fenced submit, so taking them here
-        // halves the submits per iteration -- and a submit's latency, not its
-        // arithmetic, is what a forty-image solve costs. The atom phase of a
-        // bottom-up run spends five thousand iterations on problems that size,
-        // with several solvers sharing the device.
+        // 将 LM 所需两次回读合入同一命令缓冲，使每轮提交数减半；小型四十图问题主要受提交延迟限制，bottom-up 原子阶段可能执行约五千轮。
         ctx_.barrier(cb_);
         ctx_.recordDownload(cb_, bCost_, realSize(opt_.real), 0, kDlCost);
         if (path == LinSolve::CG)
@@ -1522,8 +1412,7 @@ private:
         }
     }
 
-    // Offsets into the download staging buffer for the folded readbacks above;
-    // the trial poses (and extrinsics) follow when priors are on.
+    // 合并回读在暂存缓冲中的偏移；启用先验时后接试探位姿与外参。
     static constexpr VkDeviceSize kDlCost = 0, kDlCgScal = 64, kDlPoses = 128;
 
     double readCost() {
@@ -1535,8 +1424,7 @@ private:
     void readCgStatus(bool& converged, double& iters) {
         std::vector<double> v;
         unpackReals(v, (const uint8_t*)ctx_.stagingDownloadPtr() + kDlCgScal, 8, opt_.real);
-        // flag set AND tolerance met (flag alone can also mean breakdown;
-        // flag unset means the recorded iteration cap was hit)
+        // 须同时满足标志置位与容差；仅置位也可能表示数值失效，未置位表示达到记录的迭代上限
         converged = v[6] > 0.5 && v[4] <= v[5];
         iters = v[7];
     }
@@ -1551,60 +1439,54 @@ private:
 
     BAProblem& P_;
     SolverOptions opt_;
-    // Canonical uuid:<hex> this solve resolved to, empty before init() and when
-    // no device at all was usable (the host path). What the capability cache is
-    // keyed by, so two solves on one device share one probe.
+    // 本次求解的规范 UUID，init 前或无可用设备的 CPU 路径为空；能力缓存以此为键，使同设备求解共用探测。
     std::string selector_;
-    std::unique_ptr<bacpu::Solver> cpu_;  // non-null when running on the host
-    const char* schurSuffix_ = "_c";  // dof tier of the Schur kernels (pickTiers)
-    const char* cgSuffix_ = "_w";     // ... and of the CG ones
-    uint32_t bBlk_ = kCamBlk;         // per-image B block stride at that tier
-    double wide_ = 1;                 // widest camera block over the rig tier's 24
-    double meanTrackT_ = kSchurObsT;  // sum t^2 / sum t over the tracks
+    std::unique_ptr<bacpu::Solver> cpu_;  // 主机求解时非空
+    const char* schurSuffix_ = "_c";  // Schur 内核自由度档位，由 pickTiers 选择
+    const char* cgSuffix_ = "_w";     // CG 内核自由度档位
+    uint32_t bBlk_ = kCamBlk;         // 当前档位的逐图像 B 块步长
+    double wide_ = 1;                 // 最宽相机块相对 rig 档 24 维的比例
+    double meanTrackT_ = kSchurObsT;  // 轨迹统计量 sum t^2 / sum t
     SolverStats stats_;
-    std::unique_ptr<VkContext> owned_;      // null when running on a shared context
+    std::unique_ptr<VkContext> owned_;      // 共享上下文时为空
     VkContext& ctx_;
-    std::vector<GpuBuffer*> ownBufs_;   // this instance's buffers (freed in dtor if shared)
+    std::vector<GpuBuffer*> ownBufs_;   // 本实例缓冲，共享上下文时由析构释放
 
     LinSolve densePath_ = LinSolve::DenseObs;
-    bool useCG_ = false;       // CG is the active path (may demote to dense)
-    bool cgAllocated_ = false; // CG buffers/tables exist
+    bool useCG_ = false;       // 当前使用 CG，可能回退稠密路径
+    bool cgAllocated_ = false; // CG 缓冲与索引表已存在
     bool haveFallback_ = false;
     uint32_t cgMaxit_ = 100;
-    // Coarse correction: frames per cluster and the coarse dimension (0: off),
-    // and whether this iteration's solve uses it.
+    // 粗层校正的每簇帧数、粗维度（0 禁用）及本次求解是否启用。
     uint32_t tcK_ = 0, tcN_ = 0;
     uint64_t tcEntries_ = 0;
     uint32_t tcChunks_ = 0;
-    std::vector<uint32_t> tcEnt_, tcChk_;  // follow the pair-Schur tables on the device
+    std::vector<uint32_t> tcEnt_, tcChk_;  // 在设备上位于 pair-Schur 表之后
     bool tcUse_ = false, tcBuild_ = false, tcHave_ = false, tcOff_ = false;
     int tcAge_ = 0;
     double tcLambda_ = 0;
-    double lastCg_ = 0;  // iterations the last CG solve took
+    double lastCg_ = 0;  // 上次 CG 求解的迭代数
     static constexpr double kTcMinIters = 12;
-    // Below ~1e-9 rounding outweighs the damping on a badly scaled camera (Gram
-    // entries of 1e23, from a point at depth 2e-9 in a 22042-image model) and S
-    // goes indefinite; 1e-8 is still Gauss-Newton to eight digits.
+    // 阻尼低于约 1e-9 时，病态尺度下舍入误差会使 S 非正定；22042 图模型中深度 2e-9 的点曾产生 1e23 Gram 项。1e-8 仍保留八位 Gauss-Newton 精度。
     static constexpr double kMinDamping = 1e-8;
 
     GpuBuffer bObs_, bObsImage_, bObsPoint_, bImageInfo_, bGroupInfo_, bMemberInfo_;
     GpuBuffer bPoses_, bExts_, bIntr_, bPoints_, bObsRanges_, bModelObs_, bJcOff_;
     GpuBuffer bJp_, bS_, bG_, bApp_, bBp_, bCost_;
     GpuBuffer bPosesBak_, bExtsBak_, bIntrBak_, bPointsBak_;
-    bool restore_pending_ = false;  // a rejected step's parameters are still live
-    VkCommandBuffer cb_ = VK_NULL_HANDLE;  // being recorded (beginSeg .. endSeg)
-    double open_ = 0;                      // budget work recorded into cb_
-    bool pollCg_ = false;                  // recording the PCG loop
-    bool segCg_ = false;                   // cb_ holds PCG loop kernels
-    bool cgNoop_ = false;                  // ... and the last one submitted found CG converged
-    std::string segTop_;                   // the launch() kernel with the most work in cb_
+    bool restore_pending_ = false;  // 当前缓冲仍保留已拒绝步的参数
+    VkCommandBuffer cb_ = VK_NULL_HANDLE;  // 正在记录 beginSeg 到 endSeg 的命令
+    double open_ = 0;                      // cb_ 已记录的预算工作量
+    bool pollCg_ = false;                  // 正在记录 PCG 循环
+    bool segCg_ = false;                   // cb_ 包含 PCG 循环内核
+    bool cgNoop_ = false;                  // 最近提交的 PCG 已检测到收敛
+    std::string segTop_;                   // cb_ 中工作量最大的 launch 内核
     double segTopWork_ = 0;
     GpuBuffer bBp0_, bJc_, bRes_;
     GpuBuffer bPairEntries_, bPairChunks_, bW_, bYp_, bY_;
     GpuBuffer bCamRanges_, bCamObs_, bCamChunks_, bCgR_, bCgZ_, bCgP_, bCgSp_;
     GpuBuffer bCgV_, bCgB_, bCgM_, bCgScal_, bCgPart_, bPrecBlocks_;
-    // Priors: the assembler, its tables on the device, and the host mirror of
-    // the parameters it is evaluated at (accepted, and the iteration's trial).
+    // 先验装配器、设备表及其求值参数的主机镜像，分别保存已接受值与当前试探值。
     sfm::PriorAssembler prior_;
     bool hasPriors_ = false;
     GpuBuffer bPriorRows_, bPriorCols_, bPriorErow_, bPriorBlk_, bPriorG_;

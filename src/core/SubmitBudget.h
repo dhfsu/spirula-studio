@@ -1,9 +1,7 @@
 #pragma once
 
-// How much work one GPU submission may carry, learned from how long the last
-// ones took. A submit that runs past the driver's watchdog loses the device
-// (VK_ERROR_DEVICE_LOST): 2 s under Windows TDR, and 2 s for amdgpu on Linux
-// 7.0. Header-only: the SfM and inference runtimes link nothing else.
+// 根据历史耗时调整单次 GPU 提交的工作量，避免超过驱动看门狗触发 VK_ERROR_DEVICE_LOST。
+// Windows TDR 与 Linux 7.0 amdgpu 的超时均为 2 s；仅含头文件，供 SfM 与推理运行时共用。
 
 #include <algorithm>
 #include <cmath>
@@ -16,24 +14,20 @@ namespace spirula {
 
 class SubmitBudget {
 public:
-    // 0.25 s leaves 8x headroom under a 2 s watchdog for clocks that drop mid-run.
-    // SS_SUBMIT_BUDGET_MS overrides it, for a device that still times out.
-    // `prior_rate` is assumed until the first measurement replaces it.
+    // 默认 0.25 s，相对 2 s 看门狗保留八倍余量以应对降频；SS_SUBMIT_BUDGET_MS 可覆盖，首次测量前使用 prior_rate。
     explicit SubmitBudget(double prior_rate = 0) : rate_(prior_rate) {
         target_ = 0.25;
         if (const char* v = env("SUBMIT_BUDGET_MS"))
             if (std::atof(v) > 0) target_ = std::atof(v) * 1e-3;
     }
 
-    // Work the next submit may carry, in the caller's units; 0 until a submit
-    // has been timed (and no prior), which means "send the smallest unit".
+    // 下一次提交的工作量，使用调用方单位；无测量且无先验时为 0，表示提交最小工作单元。
     double limit() const { return rate_ > 0 ? rate_ * target_ : 0; }
     double rate() const { return rate_; }
     double target() const { return target_; }
     bool measured() const { return measured_; }
 
-    // limit() as a launch size in whole units: `first` before anything is
-    // measured, never more than `most`, which keeps a fast GPU's launches as-is.
+    // 将 limit() 转成整单位启动大小；测量前采用 first，最大不超过 most，保持快速 GPU 原有批量。
     int64_t chunk(int64_t first, int64_t most) const {
         if (limit() <= 0) return std::max<int64_t>(1, std::min(first, most));
         return std::max<int64_t>(1, std::min<int64_t>((int64_t)limit(), most));
@@ -42,9 +36,7 @@ public:
     void record(double work, double seconds) {
         if (work <= 0 || seconds <= 0) return;
         const double r = work / seconds;
-        // A sample long enough to be mostly GPU work replaces the prior, and
-        // replaces a faster estimate at once; anything else moves halfway in log
-        // space, so a short submit's fixed latency cannot starve the next ones.
+        // 足够长的测量直接替换先验，较慢估计立即生效；其他更新在对数空间折半，避免短提交的固定延迟压低后续批量。
         const bool solid = seconds > target_ / 16;
         if (rate_ <= 0 || (solid && (!measured_ || r < rate_))) rate_ = r;
         else rate_ = std::sqrt(rate_ * r);
@@ -53,8 +45,8 @@ public:
 
 private:
     double target_;
-    double rate_;  // work per second
+    double rate_;  // 每秒工作量
     bool measured_ = false;
 };
 
-}  // namespace spirula
+}  // 命名空间 spirula

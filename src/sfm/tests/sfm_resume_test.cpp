@@ -1,9 +1,4 @@
-// What a re-run may pick up, and what it must not (D76).
-//
-// The two halves that decide correctness: a stage signature moves exactly when
-// a flag that stage reads moves, and the verification journal reads back what
-// it wrote -- including from a tail its writer never flushed, which is how
-// every killed run leaves it.
+// 断点恢复测试（D76）：影响阶段输出的选项才改变签名，验证日志须读回完整记录并容忍未刷新尾部。
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -33,9 +28,7 @@ static fs::path tempDir() {
     return d;
 }
 
-// ---------------------------------------------------------------------------
-// Signatures
-// ---------------------------------------------------------------------------
+// ---------------- 阶段签名 ----------------
 
 static void testSignatures(int& fails) {
     SfmConfig base;
@@ -44,7 +37,7 @@ static void testSignatures(int& fails) {
     const std::string ext0 = stageSignature(base, CMD_EXTRACT);
     const std::string mat0 = stageSignature(base, CMD_MATCH);
 
-    // A flag the stage reads moves its signature.
+    // 阶段使用的输出相关选项应改变签名。
     {
         SfmConfig c = base;
         c.sift.max_num_features = base.sift.max_num_features / 2;
@@ -58,13 +51,13 @@ static void testSignatures(int& fails) {
         check(stageSignature(c, CMD_MATCH) != mat0, "--min-inliers moves matching", fails);
         check(stageSignature(c, CMD_EXTRACT) == ext0, "--min-inliers leaves extraction", fails);
     }
-    // A per-group lens is no table row and still reaches the camera setup.
+    // 组级镜头覆盖虽非配置表行，仍应影响相机签名。
     {
         SfmConfig c = base;
         parseCameraOverride("cam0=opencv-fisheye", OverrideKind::Model, c.camera.overrides);
         check(stageSignature(c, CMD_MATCH) != mat0, "a per-group lens moves matching", fails);
     }
-    // How fast the stage runs is not what it produces.
+    // 运行速度设置不应改变输出签名。
     {
         SfmConfig c = base;
         c.threads = 3;
@@ -75,8 +68,7 @@ static void testSignatures(int& fails) {
         check(stageSignature(c, CMD_EXTRACT) == ext0, "runtime flags leave extraction", fails);
         check(stageSignature(c, CMD_MATCH) == mat0, "runtime flags leave matching", fails);
     }
-    // Mapping-only flags leave both earlier stages alone, which is the whole
-    // point: re-running the mapper must not cost the matching.
+    // 仅建图选项不能使提取和匹配缓存失效。
     {
         SfmConfig c = base;
         c.mapper.min_tri_angle_deg = 2.0;
@@ -87,16 +79,14 @@ static void testSignatures(int& fails) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The journal
-// ---------------------------------------------------------------------------
+// ---------------- 验证日志 ----------------
 
 static void testJournal(const fs::path& dir, int& fails) {
     const fs::path file = dir / "matches.part";
     const std::string sig = "extract=1\nmatch=2\n";
     std::vector<ImageEntry> images = {{"a", 100}, {"b", 100}, {"c", 100}};
 
-    // Three pairs: two kept, one that verification refused.
+    // 三对数据，两对保留、一对拒绝。
     const uint32_t idx1[] = {1, 4, 9}, idx2[] = {2, 5, 7};
     {
         resume::MatchJournal j;
@@ -120,14 +110,14 @@ static void testJournal(const fs::path& dir, int& fails) {
           "a kept pair round-trips", fails);
     check(kept.count(resume::pairKey(0, 2)) == 0, "a refused pair keeps no matches", fails);
 
-    // Other settings: the file is not this run's.
+    // 设置不同的日志不属于本次运行。
     std::unordered_map<uint64_t, TwoViewMatches> other_kept;
     std::vector<uint64_t> other_done;
     uint64_t other_putative = 0;
     check(!resume::readJournal(file, sig + "x", images, other_kept, other_done, other_putative),
           "a signature mismatch refuses the journal", fails);
 
-    // The tail a killed writer never finished: everything before it survives.
+    // 末尾未完成记录不影响此前完整结果。
     {
         const uintmax_t whole = fs::file_size(file);
         std::vector<char> bytes(whole);
@@ -142,7 +132,7 @@ static void testJournal(const fs::path& dir, int& fails) {
           fails);
     check(done.size() == 2 && kept.size() == 1, "a torn record is dropped, not the file", fails);
 
-    // Appending continues the same file rather than starting one.
+    // 恢复追加须继续同一文件。
     {
         resume::MatchJournal j;
         check(j.open(file, sig, /*append=*/true), "journal reopens", fails);
@@ -156,9 +146,7 @@ static void testJournal(const fs::path& dir, int& fails) {
     check(done.size() == 3 && kept.size() == 2, "appending keeps what was there", fails);
 }
 
-// ---------------------------------------------------------------------------
-// The pair list and the feature-file probe
-// ---------------------------------------------------------------------------
+// ---------------- 图像对列表与特征完整性探测 ----------------
 
 static void testPairsAndFeatures(const fs::path& dir, int& fails) {
     const fs::path file = dir / "pairs.bin";
@@ -171,8 +159,7 @@ static void testPairsAndFeatures(const fs::path& dir, int& fails) {
     check(!resume::readPairs(file, "other", back) && back.empty(),
           "a signature mismatch refuses the pair list", fails);
 
-    // peekFeatures is what says a feature file may be reused without reading
-    // the descriptors back, so a truncated one has to fail it.
+    // peekFeatures 无需读描述子即可判断复用资格，必须拒绝截断文件。
     FeatureSet fs_;
     fs_.width = fs_.extract_width = 640;
     fs_.height = fs_.extract_height = 480;

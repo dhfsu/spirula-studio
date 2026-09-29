@@ -1,30 +1,22 @@
-// Implicit-Schur preconditioned conjugate gradient (sfm/ba/README.md): S is
-// never formed; S x = B x - sum_p Acp_p W_p (Acp_p^T x) is applied through the
-// per-observation Jc / Jp and per-point W, with B the per-image damped Gram
-// blocks. Columns several images share (a group, a member extrinsic, a rig
-// frame with several images) are accumulated atomically rather than stored;
-// u1 carries the exclusive/shared choice. Preconditioner: block Jacobi over
-// u_prec_blocks (sfm/ba/Problem.h). The whole loop is recorded into one
-// command buffer: scalar state lives in u_cg_scal and every kernel early-outs
-// once the convergence flag is set. The step accumulates into u_g in place.
-// Included at the end of ba.slang; shares its bindings and g_sh.
+// 隐式 Schur PCG 不生成 S，通过逐观测 Jc/Jp 与逐点 W 计算 Sx=Bx-sum_p Acp_p W_p(Acp_p^T x)。
+// 共享列采用原子累加，u1 区分独占/共享；预条件器为块 Jacobi。标量状态存于 u_cg_scal，收敛后各内核空操作，解累积到 u_g。
 
-[[vk::binding(29)]] StructuredBuffer<uint> u_cam_ranges;  // (num_images+1) obs grouped by image
-[[vk::binding(30)]] StructuredBuffer<uint> u_cam_obs;     // obs indices per image
-[[vk::binding(31)]] RWStructuredBuffer<Real> u_cg_r;      // (n_dim) residual
-[[vk::binding(32)]] RWStructuredBuffer<Real> u_cg_z;      // (n_dim) M^-1 r
-[[vk::binding(33)]] RWStructuredBuffer<Real> u_cg_p;      // (n_dim) search direction
-[[vk::binding(34)]] RWStructuredBuffer<Real> u_cg_sp;     // (n_dim) S p
-[[vk::binding(35)]] RWStructuredBuffer<Real> u_cg_v;      // (3 per point) W (Acp^T p)
-[[vk::binding(36)]] RWStructuredBuffer<Real> u_cg_B;      // per-camera packed damped Jc^T Jc
-[[vk::binding(37)]] RWStructuredBuffer<Real> u_cg_M;      // per-camera packed S_cc -> L factor
-[[vk::binding(38)]] RWStructuredBuffer<Real> u_cg_scal;   // scalar state (kCg* indices)
-[[vk::binding(39)]] RWStructuredBuffer<Real> u_cg_part;   // dot-product partials, 2 slots
-[[vk::binding(40)]] RWStructuredBuffer<AWord> u_cg_sp_a;  // atomic views (chunked accumulation)
+[[vk::binding(29)]] StructuredBuffer<uint> u_cam_ranges;  // num_images+1 个按图像分组的 CSR 偏移
+[[vk::binding(30)]] StructuredBuffer<uint> u_cam_obs;     // 逐图像观测索引
+[[vk::binding(31)]] RWStructuredBuffer<Real> u_cg_r;      // n_dim 维残差
+[[vk::binding(32)]] RWStructuredBuffer<Real> u_cg_z;      // n_dim 维 M^-1 r
+[[vk::binding(33)]] RWStructuredBuffer<Real> u_cg_p;      // n_dim 维搜索方向
+[[vk::binding(34)]] RWStructuredBuffer<Real> u_cg_sp;     // n_dim 维 S p
+[[vk::binding(35)]] RWStructuredBuffer<Real> u_cg_v;      // 每点 3 项 W(Acp^T p)
+[[vk::binding(36)]] RWStructuredBuffer<Real> u_cg_B;      // 逐相机压缩存储的带阻尼 Jc^T Jc
+[[vk::binding(37)]] RWStructuredBuffer<Real> u_cg_M;      // 逐相机压缩 S_cc，原地转为 L 因子
+[[vk::binding(38)]] RWStructuredBuffer<Real> u_cg_scal;   // 由 kCg* 索引的标量状态
+[[vk::binding(39)]] RWStructuredBuffer<Real> u_cg_part;   // 点积局部和，共两个槽
+[[vk::binding(40)]] RWStructuredBuffer<AWord> u_cg_sp_a;  // 分块累加使用的原子视图
 [[vk::binding(41)]] RWStructuredBuffer<AWord> u_cg_B_a;
 [[vk::binding(42)]] RWStructuredBuffer<AWord> u_cg_M_a;
-[[vk::binding(43)]] StructuredBuffer<uint> u_cam_chunks;  // 3 per chunk: image, start, count
-[[vk::binding(44)]] StructuredBuffer<uint4> u_prec_blocks;  // (col0, len0, col1, len1) per block
+[[vk::binding(43)]] StructuredBuffer<uint> u_cam_chunks;  // 每块 3 项：图像、起点、数量
+[[vk::binding(44)]] StructuredBuffer<uint4> u_prec_blocks;  // 每块 (col0,len0,col1,len1)
 
 static const uint kCgRho = 0;    // r^T z
 static const uint kCgPAp = 1;    // p^T S p
@@ -32,19 +24,18 @@ static const uint kCgAlpha = 2;
 static const uint kCgBeta = 3;
 static const uint kCgRR = 4;     // ||r||^2
 static const uint kCgTol2 = 5;   // eta^2 ||r0||^2
-static const uint kCgConv = 6;   // > 0.5: loop kernels become no-ops
-static const uint kCgIters = 7;  // completed CG iterations
-static const uint kCgQ = 8;      // quadratic model 1/2 x^T S x - g^T x at x
-static const uint kCgDQ = 9;     // ... and its change over the last iteration
+static const uint kCgConv = 6;   // 大于 0.5 后循环内核不再执行
+static const uint kCgIters = 7;  // 已完成 CG 迭代数
+static const uint kCgQ = 8;      // x 处二次模型 1/2 x^T S x-g^T x
+static const uint kCgDQ = 9;     // 上次迭代的二次模型变化量
 
-// Packed block strides (lower triangles): preconditioner blocks are at most
-// kPrecDof wide, per-image B blocks as wide as the tier.
+// 下三角块步长，预条件器宽度至多 kPrecDof，逐图像 B 块宽度按档位决定。
 static const uint kCamBlk = kPrecDof * (kPrecDof + 1) / 2;
 uint bblk<let MD : int>() { return uint(MD * (MD + 1) / 2); }
 
 bool cgDone() { return u_cg_scal[kCgConv] > Real(0.5); }
 
-// global columns of preconditioner block `b` (two contiguous ranges)
+// 预条件块 b 的全局列，由两个连续区间表示
 void precCols(uint b, out uint dof, out uint cols[kPrecDof]) {
     uint4 blk = u_prec_blocks[b];
     dof = blk.y + blk.w;
@@ -52,20 +43,17 @@ void precCols(uint b, out uint dof, out uint cols[kPrecDof]) {
     for (uint i = 0; i < blk.w; i++) cols[blk.y + i] = blk.z + i;
 }
 
-// ---------------------------------------------------------------------
-// per-lambda assembly: B_c, M_c = S_cc, and the reduced RHS
-// ---------------------------------------------------------------------
+// ---------------- 每阻尼值装配 B_c、M_c=S_cc 与约化右端 ----------------
 
-// One warp per chunk of a camera's observations accumulates B_c, M_c = S_cc
-// into the partition block(s) covering its rows (cross terms dropped) and g_c.
-// u0 = chunks, u1 = exclusive, u2 = member-block base, u3 = group-block base
+// 每 warp 处理相机观测的一块，累加 B_c、所属预条件块 M_c 与 g_c，忽略跨预条件块项。
+// u0=块数，u1=独占标记，u2/u3=成员/组块起点。
 static const uint kShcJ = 0;                    // Jc    2 x dof
 static const uint kShcZ = 2 * kDofRig;          // Z = Q^T Jc   2 x dof
 static const uint kShcQ = 4 * kDofRig;          // Q = Jp W Jp^T   2 x 2
 static const uint kShcY = 4 * kDofRig + 4;      // Y = (Jp W)^T    2 x 3
-static const uint kShcR = 4 * kDofRig + 10;     // res   2
-static const uint kShcB = 4 * kDofRig + 12;     // Bp    3
-static const uint kShcP = 4 * kDofRig + 15;     // Jp    2 x 3
+static const uint kShcR = 4 * kDofRig + 10;     // 残差，2 项
+static const uint kShcB = 4 * kDofRig + 12;     // Bp，3 项
+static const uint kShcP = 4 * kDofRig + 15;     // Jp，2×3
 
 void cgCamDiagImpl<let MD : int>(uint wgx, uint gi) {
     const uint kEl = (MD * MD + kPairWg - 1) / kPairWg;
@@ -96,13 +84,12 @@ void cgCamDiagImpl<let MD : int>(uint wgx, uint gi) {
         uint o = u_cam_obs[t];
         uint pt = u_obs_point[o];
         uint jb = u_jc_off[o];
-        GroupMemoryBarrierWithGroupSync();  // previous obs done being read
+        GroupMemoryBarrierWithGroupSync();  // 上一观测已读取完毕
         for (uint i = gi; i < 2 * dof; i += kPairWg) g_sh[kShcJ + i] = u_Jc[jb + i];
         if (gi < 6) g_sh[kShcP + gi] = u_Jp[6 * o + gi];
         if (gi < 2) g_sh[kShcR + gi] = u_res[2 * o + gi];
         if (gi < 3) g_sh[kShcB + gi] = u_Bp[3 * pt + gi];
-        // Y = (Jp W)^T, then Q = Jp W Jp^T -- one 2x2 middle matrix instead of
-        // the dof x 3 block T = Acp W the materialized layout carried per obs
+        // 先算 Y=(Jp W)^T，再算 Q=Jp W Jp^T，用 2×2 中间矩阵替代每观测 dof×3 的 Acp W。
         if (gi < 6) {
             uint j = gi >> 1, row = gi & 1;
             g_sh[kShcY + gi] = u_Jp[6 * o + row] * u_W[9 * pt + j]
@@ -128,7 +115,7 @@ void cgCamDiagImpl<let MD : int>(uint wgx, uint gi) {
             uint el = gi + kPairWg * k;
             if (el >= nel) continue;
             uint r = elr[k], c = elc[k];
-            if (r < c) continue;  // symmetric block: lower triangle only
+            if (r < c) continue;  // 对称块仅计算下三角
             accM[k] = accM[k] + g_sh[kShcZ + 2 * r] * g_sh[kShcJ + 2 * c]
                               + g_sh[kShcZ + 2 * r + 1] * g_sh[kShcJ + 2 * c + 1];
             accB[k] = accB[k] + g_sh[kShcJ + 2 * r] * g_sh[kShcJ + 2 * c]
@@ -145,9 +132,7 @@ void cgCamDiagImpl<let MD : int>(uint wgx, uint gi) {
     }
 
     uint bb = bblk<MD>() * img;
-    // Which partition block each row belongs to in the shared layout, and the
-    // block's local row: frame rows [0,6), member rows [6, 6+mfree), the rest
-    // intrinsics.
+    // 共享布局按行确定所属块和局部行：帧 [0,6)，成员 [6,6+mfree)，其余为内参。
     uint fb = kCamBlk * ii.x;
     uint mb = kCamBlk * (u2 + ii.y);
     uint gb = kCamBlk * (u3 + ii.z);
@@ -158,7 +143,7 @@ void cgCamDiagImpl<let MD : int>(uint wgx, uint gi) {
         uint r = elr[k], c = elc[k];
         if (r < c) continue;
         Real jj = accB[k];
-        if (r == c) jj = jj * (Real(1.0) + Real(f0));  // multiplicative damping
+        if (r == c) jj = jj * (Real(1.0) + Real(f0));  // 乘法阻尼
         Real m = jj - accM[k];
         if (isfinite(jj)) atomicAccum(u_cg_B_a, bb + pidx(r, c), jj);
         if (!isfinite(m)) continue;
@@ -176,9 +161,7 @@ void cgCamDiagImpl<let MD : int>(uint wgx, uint gi) {
         atomicAccum(u_g_a, cols[gi], -gacc);
 }
 
-// Factor each block in place (packed lower Cholesky). A block can be all
-// cancellation noise (Gram entries of 2e23 on a 22042-image capture): a pivot
-// under 1e-10 of its largest diagonal is floored and decoupled. u0 = blocks
+// 逐块原地 Cholesky；若主元低于最大对角的 1e-10 则设下限并解除耦合，防止巨大 Gram 项消减噪声破坏分解。u0=块数。
 [shader("compute")] [numthreads(256, 1, 1)]
 void cg_prec_fact(uint3 t : SV_DispatchThreadID) {
     uint b = t.x;
@@ -205,8 +188,7 @@ void cg_prec_fact(uint3 t : SV_DispatchThreadID) {
     for (uint i = 0; i < dof * (dof + 1) / 2; i++) u_cg_M[cb + i] = L[i];
 }
 
-// z = M^-1 r, one thread per block (fwd + bwd solve of the small factor).
-// u0 = num blocks, u1 = 1 to respect the convergence flag
+// z=M^-1 r，每块一线程执行小矩阵前后代；u0=块数，u1=1 时遵守收敛标志。
 [shader("compute")] [numthreads(256, 1, 1)]
 void cg_prec_apply(uint3 t : SV_DispatchThreadID) {
     if (u1 != 0 && cgDone()) return;
@@ -217,8 +199,7 @@ void cg_prec_apply(uint3 t : SV_DispatchThreadID) {
     precCols(b, dof, cols);
     if (dof == 0) return;
     uint cb = kCamBlk * b;
-    // Entries below i are always written before they are read; zeroed so
-    // slangc can see it.
+    // i 以下元素均先写后读，仍显式清零使 slangc 能识别初始化。
     Real y[kPrecDof];
     for (uint i = 0; i < kPrecDof; i++) y[i] = Real(0);
     for (uint i = 0; i < dof; i++) {
@@ -235,12 +216,9 @@ void cg_prec_apply(uint3 t : SV_DispatchThreadID) {
     for (uint i = 0; i < dof; i++) u_cg_z[cols[i]] = y[i];
 }
 
-// ---------------------------------------------------------------------
-// CG loop kernels
-// ---------------------------------------------------------------------
+// ---------------- CG 循环内核 ----------------
 
-// r = g (the reduced RHS assembled by cg_cam_diag), x (in u_g) = 0, scalars
-// reset. u0 = n_dim
+// r=g，u_g 中的 x 清零并重置标量；u0=n_dim。
 [shader("compute")] [numthreads(256, 1, 1)]
 void cg_init(uint3 t : SV_DispatchThreadID) {
     uint i = t.x;
@@ -250,7 +228,7 @@ void cg_init(uint3 t : SV_DispatchThreadID) {
     u_g[i] = Real(0.0);
 }
 
-// p = z. u0 = n_dim
+// p=z，u0=n_dim。
 [shader("compute")] [numthreads(256, 1, 1)]
 void cg_copy(uint3 t : SV_DispatchThreadID) {
     uint i = t.x;
@@ -258,8 +236,7 @@ void cg_copy(uint3 t : SV_DispatchThreadID) {
     u_cg_p[i] = u_cg_z[i];
 }
 
-// v_p = W_p (Acp_p^T p): one thread per point looping its track (linear in
-// track length, like schur_obs). u0 = num_points
+// 每点一线程沿轨迹计算 v_p=W_p(Acp_p^T p)，成本随轨迹线性；u0=点数。
 void cgGatherImpl<let MD : int>(uint p) {
     if (cgDone()) return;
     if (p >= u0) return;
@@ -269,8 +246,7 @@ void cgGatherImpl<let MD : int>(uint p) {
         uint dof, base;
         uint cols[MD];
         obsCamCols<MD>(oi, dof, base, cols);
-        // Acp^T p = Jp^T (Jc p): the contraction runs over the 2-vector
-        // residual, so only two accumulators cross the dof loop
+        // Acp^T p=Jp^T(Jc p)，先收缩二维残差，仅两个累加器跨自由度循环。
         Real d0 = Real(0.0), d1 = Real(0.0);
         for (uint a = 0; a < dof; a++) {
             Real xa = u_cg_p[cols[a]];
@@ -286,9 +262,7 @@ void cgGatherImpl<let MD : int>(uint p) {
                           + u_W[9 * p + 3 * i + 2] * u2v;
 }
 
-// Sp_c = B_c p_c, one warp per camera; cg_scatter then subtracts the cross
-// term. Rows of a frame this image has to itself are stored; every shared row
-// is added into a slice the host pre-zeroed. u0 = num_images, u1 = exclusive
+// 每相机 warp 计算 Sp_c=B_c p_c，后续再减交叉项；独占帧行直接写，共享行累加到预先清零的切片。u0=图像数，u1=独占标记。
 void cgBmulImpl<let MD : int>(uint img, uint gi) {
     if (cgDone()) return;
     if (img >= u0) return;
@@ -307,11 +281,8 @@ void cgBmulImpl<let MD : int>(uint img, uint gi) {
     else if (isfinite(acc)) atomicAccum(u_cg_sp_a, cols[gi], acc);
 }
 
-// Sp_c -= sum_{obs of c} Acp v_{pt(obs)} = sum Jc^T (Jp v): one warp per chunk;
-// lane i owns Jc element i = 2a+row of every observation in turn, so the block
-// loads are fully coalesced, and the per-lane partials reduce as pairs into dof
-// atomic adds per chunk. The 2-vector Jp v is small enough that every lane
-// recomputes it rather than paying a barrier for it. u0 = num chunks
+// 每观测块 warp 计算 Sp_c-=sum Jc^T(Jp v)，各 lane 固定读取雅可比元素，成对归约后每自由度一次原子加。
+// 二维 Jp v 由各 lane 重算，省去屏障；u0=块数。
 void cgScatterImpl<let MD : int>(uint wgx, uint gi) {
     if (cgDone()) return;
     if (wgx >= u0) return;
@@ -322,7 +293,7 @@ void cgScatterImpl<let MD : int>(uint wgx, uint gi) {
     uint cols[MD];
     camCols<MD>(img, dof, cols);
 
-    // 2*dof can reach 48 (> kPairWg), so each lane owns two elements
+    // 2*dof 可达 48，超过 warp 宽度，因此每 lane 最多负责两个元素
     uint gi2 = gi + kPairWg;
     uint row = gi & 1, row2 = gi2 & 1;
     Real pacc = Real(0.0), pacc2 = Real(0.0);
@@ -350,8 +321,7 @@ void cgScatterImpl<let MD : int>(uint wgx, uint gi) {
     }
 }
 
-// Tiered entry points: wide covers every problem without a refined member
-// extrinsic (the pre-rig kernels exactly), rig the rest (sfm/ba/Solver.h).
+// 无自由成员外参时用 wide 档，其余用 rig 档。
 [shader("compute")] [numthreads(kPairWg, 1, 1)]
 void cg_cam_diag_w(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) { cgCamDiagImpl<kDofWide>(wg.x + u4, gi); }
 [shader("compute")] [numthreads(kPairWg, 1, 1)]
@@ -369,9 +339,7 @@ void cg_scatter_w(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) { cgScatterImp
 [shader("compute")] [numthreads(kPairWg, 1, 1)]
 void cg_scatter_x(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) { cgScatterImpl<kDofRig>(wg.x + u4, gi); }
 
-// Dot-product partials over the n_dim vectors, one value per workgroup.
-// u1 selects the products (0: p.Sp -> slot 0; 1: r.z -> slot 0, r.r -> slot 1)
-// u0 = n_dim, u2 = partial stride, u3 = 1 to respect the convergence flag
+// 逐工作组产生点积局部和；u1=0 计算 p·Sp，u1=1 计算 r·z 与 r·r。u0=维度，u2=局部和步长，u3 控制收敛跳过。
 [shader("compute")] [numthreads(256, 1, 1)]
 void cg_red2(uint3 t : SV_DispatchThreadID, uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) {
     if (u3 != 0 && cgDone()) return;
@@ -402,9 +370,7 @@ void cg_red2(uint3 t : SV_DispatchThreadID, uint3 wg : SV_GroupID, uint gi : SV_
     }
 }
 
-// Final partial reduction + scalar updates; one workgroup. u0 = partials,
-// u1 = mode (0: init rho/tol, 1: alpha, 2: beta/converge), u2 = partial stride,
-// f0 = relative residual tolerance (mode 0), f1 = Nash-Sofer tolerance (0: off)
+// 单工作组归约并更新标量；u1 模式 0 初始化、1 更新 alpha、2 更新 beta/收敛，f0 为残差容差，f1 为 Nash-Sofer 容差，0 禁用。
 [shader("compute")] [numthreads(256, 1, 1)]
 void cg_fin(uint gi : SV_GroupIndex) {
     if (u1 != 0 && cgDone()) return;
@@ -426,25 +392,25 @@ void cg_fin(uint gi : SV_GroupIndex) {
     }
     if (gi != 0) return;
     Real A = g_sh[0], B = g_sh[256];
-    if (u1 == 0) {  // A = r.z, B = ||r||^2 of the initial residual
+    if (u1 == 0) {  // 初始残差的 A=r·z，B=||r||²
         u_cg_scal[kCgRho] = A;
         u_cg_scal[kCgRR] = B;
         u_cg_scal[kCgTol2] = Real(f0) * Real(f0) * B;
         u_cg_scal[kCgIters] = Real(0.0);
         u_cg_scal[kCgQ] = Real(0.0);
-        // zero RHS (or a broken preconditioner) => keep the zero step
+        // 右端为零或预条件器失效时保持零步长
         u_cg_scal[kCgConv] = (isfinite(A) && A > Real(0.0)) ? Real(0.0) : Real(1.0);
     } else if (u1 == 1) {  // A = p.Sp
         Real rho = u_cg_scal[kCgRho];
         bool ok = isfinite(A) && A > Real(0.0);
         u_cg_scal[kCgPAp] = A;
         u_cg_scal[kCgAlpha] = ok ? rho / A : Real(0.0);
-        // the step along p lowers the model by alpha rho / 2
+        // 沿 p 的步骤使模型代价下降 alpha*rho/2
         Real dq = ok ? Real(-0.5) * rho * rho / A : Real(0.0);
         u_cg_scal[kCgDQ] = dq;
         u_cg_scal[kCgQ] = u_cg_scal[kCgQ] + dq;
-        if (!ok) u_cg_scal[kCgConv] = Real(1.0);  // lost positive-definiteness
-    } else {  // A = new r.z, B = new ||r||^2
+        if (!ok) u_cg_scal[kCgConv] = Real(1.0);  // 失去正定性
+    } else {  // A 为新 r·z，B 为新 ||r||²
         Real rho = u_cg_scal[kCgRho];
         u_cg_scal[kCgBeta] = A / rho;
         u_cg_scal[kCgRho] = A;
@@ -452,9 +418,7 @@ void cg_fin(uint gi : SV_GroupIndex) {
         u_cg_scal[kCgIters] = u_cg_scal[kCgIters] + Real(1.0);
         if (!(B > u_cg_scal[kCgTol2]) || !isfinite(A) || !(A > Real(0.0)))
             u_cg_scal[kCgConv] = Real(1.0);
-        // Nash-Sofer, as Ceres stops LM's CG: i (Q_i - Q_i-1) / Q_i under f1.
-        // 40% fewer iterations than the residual test alone on a 4102-image
-        // capture, same final cost. Marked as the residual test being met.
+        // Nash-Sofer 判据 i(Q_i-Q_i-1)/Q_i < f1，与 Ceres 一致；4102 图测量同最终代价下少约 40% 迭代，标记为容差满足。
         Real q = u_cg_scal[kCgQ];
         if (f1 > 0.0f && q < Real(0.0) &&
             u_cg_scal[kCgIters] * u_cg_scal[kCgDQ] / q < Real(f1)) {
@@ -464,7 +428,7 @@ void cg_fin(uint gi : SV_GroupIndex) {
     }
 }
 
-// x += alpha p (x accumulates in u_g), r -= alpha S p. u0 = n_dim
+// x+=alpha p，r-=alpha S p，x 累积于 u_g，u0=n_dim。
 [shader("compute")] [numthreads(256, 1, 1)]
 void cg_axpy(uint3 t : SV_DispatchThreadID) {
     if (cgDone()) return;
@@ -475,7 +439,7 @@ void cg_axpy(uint3 t : SV_DispatchThreadID) {
     u_cg_r[i] = u_cg_r[i] - alpha * u_cg_sp[i];
 }
 
-// p = z + beta p. u0 = n_dim
+// p=z+beta p，u0=n_dim。
 [shader("compute")] [numthreads(256, 1, 1)]
 void cg_updp(uint3 t : SV_DispatchThreadID) {
     if (cgDone()) return;
@@ -484,21 +448,15 @@ void cg_updp(uint3 t : SV_DispatchThreadID) {
     u_cg_p[i] = u_cg_z[i] + u_cg_scal[kCgBeta] * u_cg_p[i];
 }
 
-// ---------------------------------------------------------------------
-// coarse correction: M^-1 = block Jacobi + P A_c^-1 P^T
-// ---------------------------------------------------------------------
+// ---------------- 粗层校正：M^-1=块 Jacobi+P A_c^-1 P^T ----------------
 
-// P: a similarity motion (7 dofs) per cluster of u2 frames, as pose deltas
-// (README.md, "Coarse correction"). The CG path leaves u_S and u_y free: A_c
-// goes in u_S with P (6x7 per frame) from u3; tables follow the pair-Schur ones.
+// 每 u2 帧簇提供七自由度相似运动基 P；CG 复用 u_S 存 A_c，u3 后存逐帧 6×7 基，相关表位于 pair-Schur 表之后。
 
 static const uint kTcDof = 7;
 
 uint tcCluster(uint o) { return u_image_info[u_obs_image[o]].x / u2; }
 
-// d(angle-axis) = -Jr^-1 w and dt = s t - R tau for a world similarity
-// (w, tau, s), in fp32: the basis only has to span the slow modes, not be
-// exact. u0 = num_frames
+// 世界相似运动 (w,tau,s) 产生 d(angle-axis)=-Jr^-1 w，dt=s t-R tau；基仅需覆盖慢模态，可用 fp32。u0=帧数。
 [shader("compute")] [numthreads(64, 1, 1)]
 void tc_basis(uint3 t : SV_DispatchThreadID) {
     uint f = t.x;
@@ -529,8 +487,7 @@ void tc_basis(uint3 t : SV_DispatchThreadID) {
         }
 }
 
-// A_c += P_f^T B_img P_f over the pose rows of each image's damped Gram block.
-// u0 = num_images, u2 = frames per cluster, u3 = basis offset
+// 逐图像位姿行累加 A_c+=P_f^T B_img P_f；u0=图像数，u2=每簇帧数，u3=基偏移。
 void tcBpartImpl<let MD : int>(uint img) {
     if (img >= u0) return;
     uint f = u_image_info[img].x, c = f / u2;
@@ -551,7 +508,7 @@ void tcBpartImpl<let MD : int>(uint img) {
         }
 }
 
-// G = sum over the run starting at observation o of P_f^T Jc_pose^T Jp (7x3).
+// 从观测 o 开始的一段内求 G=sum P_f^T Jc_pose^T Jp，尺寸 7×3。
 void tcRunG(uint o, uint t1, out Real G[21]) {
     for (int i = 0; i < 21; i++) G[i] = Real(0.0);
     uint c = tcCluster(o);
@@ -569,9 +526,7 @@ void tcRunG(uint o, uint t1, out Real G[21]) {
     }
 }
 
-// A_c[cu, cv] -= sum G_u W G_v^T, one warp per chunk of one cluster pair's
-// entries: lanes stage their 7x7 products in shared and the warp folds them
-// into 49 sums, written once. u0 = chunks, u1 = first chunk, u2/u3 as above
+// 每簇对块 warp 计算 A_c[cu,cv]-=sum G_u W G_v^T，共享暂存 7×7 乘积并归约 49 项后一次写出。
 [shader("compute")] [numthreads(kPairWg, 1, 1)]
 void tc_schur(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) {
     uint wgx = wg.x + u4;
@@ -617,9 +572,7 @@ void tc_schur(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) {
     }
 }
 
-// A_c diagonal *= 1 + f0, and saved in u_y for the factor's pivot floor: the
-// global similarity is a gauge freedom, so A_c is singular up to the damping.
-// u0 = coarse dim
+// A_c 对角乘 1+f0，并保存到 u_y 供主元下限使用；全局相似规范使无阻尼矩阵奇异。u0=粗维度。
 [shader("compute")] [numthreads(256, 1, 1)]
 void tc_reg(uint3 t : SV_DispatchThreadID) {
     uint i = t.x;
@@ -629,17 +582,16 @@ void tc_reg(uint3 t : SV_DispatchThreadID) {
     u_S[pidx(i, i)] = d * (Real(1.0) + Real(f0));
 }
 
-// ---- L -> L^-1 in place, so that each application is two matrix-vector
-// products rather than 2 n / 32 dependent triangular-solve dispatches ----
+// ---------------- 原地 L -> L^-1，以两次矩阵向量乘替代依赖的三角分派 ----------------
 
-// Invert every 32x32 diagonal block, one thread per column. u0 = n
+// 逐 32×32 对角块求逆，每列一线程，u0=n。
 [shader("compute")] [numthreads(kBs, 1, 1)]
 void tc_dinv(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) {
     uint base = wg.x * kBs, m = min(kBs, u0 - base), c = gi;
     for (uint r = c; r < m; r++)
         g_chol[r * kBs + c] = u_S[pidx(base + r, base + c)];
     GroupMemoryBarrierWithGroupSync();
-    // column c of the inverse, into the upper half of the pool
+    // 逆矩阵第 c 列写入共享池上半部分
     if (c < m) {
         g_chol[kSh2 + c * kPitch + c] = Real(1.0) / g_chol[c * kBs + c];
         for (uint r = c + 1; r < m; r++) {
@@ -653,9 +605,7 @@ void tc_dinv(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) {
         u_S[pidx(base + r, base + c)] = g_chol[kSh2 + r * kPitch + c];
 }
 
-// Block row u1 of the inverse, X_ij = -X_ii sum_{j<=k<i} L_ik X_kj, into
-// scratch rows u_y[u2 + r * n + col] while the row's L blocks are still read.
-// One 32x32 workgroup per block j < i. u0 = n
+// 逆矩阵块行 X_ij=-X_ii sum_{j<=k<i} L_ik X_kj 先写临时行，保证原 L 尚可读取；每块一个 32×32 工作组。
 [shader("compute")] [numthreads(kBs, kBs, 1)]
 void tc_inv_row(uint3 wg : SV_GroupID, uint3 lt : SV_GroupThreadID) {
     uint n = u0, i = u1, j = wg.x;
@@ -680,7 +630,7 @@ void tc_inv_row(uint3 wg : SV_GroupID, uint3 lt : SV_GroupThreadID) {
     if (bi + r < n) u_y[u2 + r * n + bj + c] = -x;
 }
 
-// Scratch row -> block row u1. u0 = n, one thread per element.
+// 将临时行复制回第 u1 块行，每元素一线程，u0=n。
 [shader("compute")] [numthreads(256, 1, 1)]
 void tc_inv_copy(uint3 t : SV_DispatchThreadID) {
     uint n = u0, bi = u1 * kBs;
@@ -689,9 +639,9 @@ void tc_inv_copy(uint3 t : SV_DispatchThreadID) {
     u_S[pidx(bi + r, col)] = u_y[u2 + r * n + col];
 }
 
-// ---- application ----
+// ---------------- 应用粗层校正 ----------------
 
-// v = P^T r into u_y[0, u0), one thread per coarse dof. u1 = num_frames
+// v=P^T r 写入 u_y[0,u0)，每粗自由度一线程，u1=帧数。
 [shader("compute")] [numthreads(256, 1, 1)]
 void tc_restrict(uint3 t : SV_DispatchThreadID) {
     if (cgDone()) return;
@@ -705,7 +655,7 @@ void tc_restrict(uint3 t : SV_DispatchThreadID) {
     u_y[q] = s;
 }
 
-// w = X v into u_y[u0, 2 u0), one warp per row. u0 = coarse dim
+// w=Xv 写入 u_y[u0,2u0)，每行一 warp，u0=粗维度。
 [shader("compute")] [numthreads(256, 1, 1)]
 void tc_lmul(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (cgDone()) return;
@@ -722,8 +672,7 @@ void tc_lmul(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (lane == 0 && row < u0) u_y[u0 + row] = g_sh[32 * w];
 }
 
-// z = X^T w into u_y[0, u0): 32 columns per workgroup, so each packed row
-// segment is one coalesced read, and 8 row lanes summed in shared.
+// z=X^T w 写入 u_y[0,u0)，每工作组 32 列合并读取压缩行段，8 条行 lane 在共享内存归约。
 [shader("compute")] [numthreads(256, 1, 1)]
 void tc_ltmul(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) {
     if (cgDone()) return;
@@ -742,7 +691,7 @@ void tc_ltmul(uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) {
     }
 }
 
-// z += P y over the pose columns. u0 = pose_dim
+// 在位姿列上 z+=P y，u0=pose_dim。
 [shader("compute")] [numthreads(256, 1, 1)]
 void tc_prolong(uint3 t : SV_DispatchThreadID) {
     if (cgDone()) return;

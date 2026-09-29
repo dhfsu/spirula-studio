@@ -1,17 +1,6 @@
-// The one entry point -- see app/Tools.h for why there is only one.
-//
-//   spirula                    the window
-//   spirula <file-or-folder>   the window, opening what was named
-//   spirula sfm auto ...       structure from motion
-//   spirula train ...          the trainer
-//   spirula sam segment ...    segmentation
-//   spirula geometry ...       depth and normals for a dataset
-//   spirula mesh ...           mesh extraction
-//
-// A first argument that is not a subcommand goes to the GUI untouched, so
-// "Open with" from a file manager and a shell alias both land on the right
-// screen. On a build with no GUI it is an error naming the subcommands, which
-// is the only thing such a build can do.
+// 统一程序入口，工具定义见 app/Tools.h。
+// spirula 或 spirula <file-or-folder> 打开窗口；sfm、train、sam、geometry、mesh 分别执行重建、训练、分割、几何估计和网格提取。
+// 首参数若不是子命令则交给 GUI；无 GUI 构建会报告可用子命令。
 
 #include "app/AppPaths.h"
 #include "app/CrashLog.h"
@@ -25,7 +14,7 @@
 #ifdef _WIN32
 #include <io.h>
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>   // NOMINMAX comes from CMakeLists.txt
+#include <windows.h>   // NOMINMAX 由 CMakeLists.txt 定义
 #define isatty _isatty
 #define fileno _fileno
 #else
@@ -42,9 +31,7 @@ namespace cmsg = spirula::i18n::msg::cli;
 #ifdef _WIN32
 UINT g_console_cp = 0;
 
-// A console keeps a code page of its own, which src/app/utf8.manifest does not
-// touch: every CJK path this prints into a cp437 window would be mojibake.
-// Restored at exit, because cmd.exe keeps whatever code page it is left with.
+// Windows 控制台代码页独立于程序清单；临时切换为 UTF-8 以正确输出中文路径，退出时恢复，避免影响 cmd.exe。
 void use_utf8_console() {
     const UINT prev = GetConsoleOutputCP();
     if (prev == 0 || prev == CP_UTF8 || !SetConsoleOutputCP(CP_UTF8)) return;
@@ -53,11 +40,7 @@ void use_utf8_console() {
 }
 #endif
 
-// The subcommand NAME is an identifier and prints as it is written; the
-// summary is a message, so `spirula --help` follows --lang like everything
-// else. It is a pointer rather than a copy because a Msg is immortal .rodata
-// and the language may change under it (it cannot here, but the habit is what
-// keeps a cached `const char*` from ever appearing).
+// 子命令名称是固定标识符，简介则通过 Msg 随 --lang 翻译；保存 Msg 指针而非缓存字符串，避免语言切换后引用失效。
 struct Tool {
     const char* name;
     const spirula::i18n::Msg* summary;
@@ -101,10 +84,7 @@ const Tool* find_tool(const char* name) {
     return nullptr;
 }
 
-// argv[0] as a tool name: a copy or symlink called spirula-sfm runs the SfM
-// tool, which is how the separately-named executables of earlier releases keep
-// working. Only the basename matters, and only the part after the prefix.
-// "ssplat-" is the pre-rename spelling and still resolves.
+// 按 argv[0] 的文件名识别工具，spirula-sfm 的副本或符号链接均可启动 SfM；仅检查前缀后的名称，并兼容 ssplat- 前缀。
 const Tool* tool_from_argv0(const char* argv0) {
     if (!argv0) return nullptr;
     std::string s = argv0;
@@ -136,27 +116,11 @@ void print_usage() {
                 spirula::i18n::language_list().c_str());
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 int main(int argc, char** argv) {
-    // Stop FULL buffering of stdout whenever it is NOT a terminal. Every tool
-    // here is routinely run as a CHILD PROCESS with its output piped to a live
-    // log -- the GUI does it for reconstruction, masking and meshing -- and the
-    // C runtime's default for a pipe is full buffering, which holds 4 KB of
-    // progress back until the buffer fills or the process exits. A run that
-    // prints one line a minute then appears to print nothing at all for the
-    // first hour, which is exactly the failure it looks like.
-    //
-    // The two runtimes need different modes for the same result, and the
-    // Windows one is unforgiving about both halves:
-    //   * its CRT has no line buffering at all -- `_IOLBF` is documented to be
-    //     treated as `_IOFBF` -- so asking for it would leave the stall in
-    //     place;
-    //   * and it rejects a zero size for the buffered modes, through an
-    //     invalid-parameter handler that is `__fastfail`. The process then dies
-    //     at this line with status 0xC0000409 and NOTHING on either stream --
-    //     which reads, from the parent, as a tool that failed instantly for no
-    //     reason. Only `_IONBF` is allowed a zero size there.
+    // 输出到管道时禁用全缓冲，避免 4 KB 缓冲积压进度，让子进程看似卡住。
+    // Windows CRT 将 _IOLBF 当作 _IOFBF，必须使用 _IONBF；其缓冲模式不接受大小 0，否则触发 __fastfail，以 0xC0000409 退出且无任何输出。
     if (!isatty(fileno(stdout))) {
 #ifdef _WIN32
         std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -168,26 +132,17 @@ int main(int argc, char** argv) {
     use_utf8_console();
 #endif
 
-    // --lang is handled here and removed from argv, so no tool's own parser
-    // has to know about it. The chain that decides the language is in
-    // src/i18n/Locale.h; the GUI re-runs it once it has read its settings
-    // file, which is a step below --lang and the environment.
+    // 在统一入口处理 --lang 并从 argv 删除；语言选择优先级见 src/i18n/Locale.h，GUI 设置的优先级低于命令行和环境变量。
     const char* lang = spirula::i18n::take_lang_arg(&argc, argv);
     spirula::i18n::init(lang, nullptr);
 
-    // Every tool, not only the window: the GUI runs reconstruction, masking
-    // and meshing as child processes, and a child that dies of a fault leaves
-    // its parent an exit status and nothing else.
+    // 所有工具都安装崩溃报告，便于诊断仅向 GUI 父进程返回退出码的重建、分割和网格子进程。
     app::install_crash_log(app::config_dir());
 
-    // An explicit subcommand wins over the argv[0] hint, so a binary that was
-    // renamed or symlinked still answers to every tool it holds. No subcommand
-    // name collides with an argument any of them takes, so `spirula-sfm auto`
-    // falls through to the name check below and reaches the SfM tool.
+    // 显式子命令优先于 argv[0] 的工具提示；spirula-sfm auto 中 auto 不是顶层子命令，因此继续按程序名称分派到 SfM。
     if (argc > 1) {
         if (const Tool* t = find_tool(argv[1])) {
-            // The tool sees "spirula sfm" as its program name, so its own usage
-            // text prints a command line that can be pasted back.
+            // 将 spirula sfm 作为工具程序名，使帮助示例可直接复制执行。
             std::string prog = std::string(argv[0] ? argv[0] : "spirula") + " " + t->name;
             app::set_crash_note(prog);
             std::vector<char*> sub;
@@ -198,8 +153,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Named as a tool: hand it everything, --help and --version included, so a
-    // spirula-sfm symlink behaves exactly as the separate executable did.
+    // 按工具名启动时完整传递参数，包括 --help 和 --version，使符号链接与独立程序行为一致。
     if (const Tool* t = tool_from_argv0(argc > 0 ? argv[0] : nullptr)) {
         app::set_crash_note(t->name);
         return t->run(argc, argv);

@@ -1,14 +1,7 @@
 #pragma once
 
-// The stages of a run, and `auto`'s ordering of them.
-//
-// One implementation, two front ends: `spirula sfm` parses a command line and
-// calls these, and an in-process front end calls the same functions with its
-// own sinks installed (docs/notes/sfm-in-process-plan.md). Nothing here parses
-// arguments or prints outside slog.
-//
-// Stages still read and write the files they always did, so `spirula sfm
-// extract | match | map` remains the way to bisect a failure.
+// SfM 各阶段的公共接口及 auto 调度，CLI 与进程内前端共用实现并安装各自日志、事件接收端。
+// 阶段保留独立磁盘输入输出，便于通过 extract、match、map 分步定位故障。
 
 #include "sfm/SfmConfig.h"
 #include "sfm/core/CameraSetup.h"
@@ -35,23 +28,21 @@
 
 namespace sfm {
 
-// ---------------------------------------------------------------------------
-// What a stage reports about itself
-// ---------------------------------------------------------------------------
+// ---------------- 阶段统计 ----------------
 
 struct ExtractStats {
     size_t images = 0, failed = 0, unreadable = 0;
-    size_t reused = 0;            // features an earlier run had already written
+    size_t reused = 0;            // 先前运行已写出的特征数量
     uint64_t features = 0;
-    uint64_t features_new = 0;    // ... of which this run extracted
-    // Masking (D39), all zero when no mask directory was given.
-    size_t masked_images = 0;     // images that found a mask file
-    size_t unmasked_images = 0;   // images that did not
-    size_t mask_unreadable = 0;   // found a mask file but could not decode it
-    uint64_t masked_out = 0;      // keypoints dropped by masks
-    std::string first_unmasked;   // an example, for the warning
-    bool warned_empty = false;    // "this mask masked out everything", warned once
-    bool warned_exif_mirror = false;   // "the tag also asked for a mirror", ditto
+    uint64_t features_new = 0;    // 本次实际提取的特征数
+    // 未指定掩码目录时，下列掩码统计均为零。
+    size_t masked_images = 0;     // 找到掩码文件的图像数
+    size_t unmasked_images = 0;   // 未找到掩码文件的图像数
+    size_t mask_unreadable = 0;   // 找到掩码但无法解码的图像数
+    uint64_t masked_out = 0;      // 被掩码排除的关键点数
+    std::string first_unmasked;   // 供警告使用的示例名称
+    bool warned_empty = false;    // 掩码清除全部特征的警告仅输出一次
+    bool warned_exif_mirror = false;   // 方向标签要求镜像的警告仅输出一次
 };
 
 struct MatchStats {
@@ -60,8 +51,7 @@ struct MatchStats {
     double select_seconds = 0;
 };
 
-// A telemetry file read once per run, with the queries the sensor priors and
-// the gauge fit make of it.
+// 每次运行只读取一次的遥测文件，供传感器先验与规范拟合查询。
 struct LoadedCapture {
     SensorCapture cap;
     SensorTimeline timeline;
@@ -77,18 +67,16 @@ struct SensorCaptures {
     }
 };
 
-// Every telemetry file the config names, or none when `--sensor-gauge none`.
+// 配置指定的全部遥测文件；sensor-gauge 为 none 时为空。
 SensorCaptures loadSensorCaptures(const SfmConfig& cfg, bool verbose);
 
-// The sensors as a prior source over `db`'s images (sfm/map/SensorPriors.h),
-// uncalibrated; null without telemetry or with every use of it switched off.
+// 为数据库图像创建尚未标定的传感器先验源；无遥测或全部用途被禁用时返回空。
 std::unique_ptr<TelemetryPriors> makeSensorPriors(const SfmConfig& cfg,
                                                   const SensorCaptures& sensors,
                                                   const MatchesDatabase& db,
                                                   const std::vector<uint32_t>& cam_ids);
 
-// Calibrate `priors` against the gyro from pairs and their matches (a
-// sample's putative ones, or the database's verified ones), reporting per group.
+// 利用候选样本或数据库已验证匹配的旋转标定传感器先验，并按相机组报告。
 void calibrateSensorPriors(TelemetryPriors& priors, const std::vector<FeatureSet>& feats,
                            const std::vector<std::pair<uint32_t, uint32_t>>& pairs,
                            const std::vector<std::vector<FeatureMatch>>& matches,
@@ -99,48 +87,39 @@ void calibrateSensorPriorsFromDatabase(TelemetryPriors& priors, const MatchesDat
                                        const std::vector<Camera>& cams,
                                        const TwoViewOptions& tvopt, int threads, bool verbose);
 
-// One camera per image, from a setup.
+// 从相机配置生成逐图像相机参数。
 std::vector<Camera> perImageCameras(const CameraSetup& cs, size_t num_images);
 
-// Calibrated verification (D45): a fisheye pair is verified on unit bearings,
-// which needs a focal, so one is searched on a sample of pairs first unless
-// given (sfm/feature/Verification.h, `bootstrapFocal`).
+// 鱼眼匹配在单位视线上验证，需要焦距；未给定时先在图像对样本上搜索，见 Verification.h 的 bootstrapFocal（D45）。
 struct VerifyCalibration {
     CameraSetupOptions setup;
-    size_t sample_pairs = 150;  // pairs per group used by the focal search
-    // The run's telemetry, for the sensor priors; null skips them.
+    size_t sample_pairs = 150;  // 每组用于焦距搜索的图像对数
+    // 运行遥测为空时跳过传感器先验。
     const SensorCaptures* sensors = nullptr;
-    // outputs
-    CameraSetup cameras;        // what the grouping decided, for the caller to reuse
+    // 输出结果
+    CameraSetup cameras;        // 相机分组结果，供调用方复用
     bool used_bearings = false;
-    // The sensors over this database, calibrated where the pairs allowed.
+    // 数据库上的传感器先验，在图像对允许时完成标定。
     std::unique_ptr<TelemetryPriors> priors;
 };
 
-// ---------------------------------------------------------------------------
-// Stages
-// ---------------------------------------------------------------------------
+// ---------------- 流水线阶段 ----------------
 
-// Features for every image under `imagedir`, written to `outdir` mirroring the
-// image tree. `reuse` keeps what an earlier run left there when it is whole and
-// newer than what it describes; a file no image maps to is removed either way.
+// 按图像目录树写出特征；reuse 保留完整且未过期的缓存，无图像对应的旧特征始终删除。
 int extractDirectory(const std::string& imagedir, const std::filesystem::path& outdir,
                      const SfmConfig& cfg, ExtractStats& stats, bool reuse = false);
 
-// Where an interrupted run's matching left its work, and what those files must
-// carry to be this run's (sfm/core/Resume.h). Null is a run that starts over.
+// 匹配中断缓存的位置与签名要求，见 Resume.h；空指针表示从头开始。
 struct MatchResume {
     std::filesystem::path dir;
     std::string signature;
 };
 
-// Every features.bin under `featdir`, in the sorted order that fixes the image
-// indices everything downstream uses. Fills `db.images` alongside. Non-zero on
-// a failure that stops the stage.
+// 按排序读取特征目录并固定下游图像索引，同时填充 db.images；失败返回非零。
 int loadFeatureDir(const std::string& featdir, const SfmConfig& cfg, bool with_descriptors,
                    std::vector<FeatureSet>& feats, MatchesDatabase& db);
 
-// Pairing, matching and two-view verification over a feature directory.
+// 对特征目录执行配对、匹配和双视图验证。
 int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode mode,
                     bool verify, std::vector<FeatureSet>& feats, MatchesDatabase& db,
                     MatchStats& stats, VerifyCalibration* calib = nullptr,
@@ -150,31 +129,28 @@ std::vector<Reconstruction> runMapper(Mapper& mapper, const MatchesDatabase& db,
                                       const std::vector<FeatureSet>& feats, SfmConfig& cfg,
                                       AssembleStats& ast);
 
-// The run's rigs over `db`'s image names (sfm/core/Rig.h), reported when
-// verbose. Throws std::runtime_error on a definition that does not resolve.
+// 按数据库图像名解析 rig，详细模式下报告；定义无法匹配时抛出 std::runtime_error。
 RigTable buildRigs(const MatchesDatabase& db, const SfmConfig& cfg, bool verbose);
 
-// The run's sequences the same way (sfm/core/Sequence.h).
+// 同样按图像名解析序列，见 Sequence.h。
 SequenceTable buildSequences(const MatchesDatabase& db, const SfmConfig& cfg, bool verbose);
 
-// The passes that run after the mapper: merge, audit, grow, prune, reseed.
+// 建图后的合并、审查、扩展、裁剪与重新播种。
 std::vector<Reconstruction> finishModels(Mapper& mapper,
                                          std::vector<Reconstruction> models,
                                          const SfmConfig& cfg, bool verbose,
                                          double& seconds);
 
-// What a model's frame means, written beside it as `gauge.txt`. `up` and
-// `scale` are tokens rather than prose ("sensors", "gps", "cameras", "none"):
-// the file is read by programs, and the log is where the sentences are.
+// 模型坐标规范写入 gauge.txt；up 与 scale 使用 sensors、gps、cameras、none 等机器标识符，描述性句子仅出现在日志中。
 struct ModelGauge {
-    bool oriented = false;   // +Z is up because something measured it
-    bool metric = false;     // one unit is one metre
+    bool oriented = false;   // 测量确定 +Z 为上方
+    bool metric = false;     // 一个单位等于一米
     std::string up = "none";
     std::string scale = "none";
-    double scale_sigma = 0;  // relative; 0 when nothing estimated one
+    double scale_sigma = 0;  // 相对不确定度，未估计时为 0
 };
 
-// Levelling, centring and the metric gauge. False when no metric frame fitted.
+// 调平、居中与公制规范；未拟合公制坐标时返回 false。
 bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
               const std::string& imagedir, bool verbose,
               std::vector<ModelGauge>& gauge, const SensorCaptures* sensors = nullptr);
@@ -187,13 +163,10 @@ void writeModels(const std::vector<Reconstruction>& models,
                  const std::filesystem::path& dir, bool verbose,
                  const std::vector<ModelGauge>& gauge = {}, const RigTable* rigs = nullptr);
 void writeRigs(const std::filesystem::path& dir, const Reconstruction& m, const RigTable* rigs);
-// The rigs.txt writeRigs left beside a model, as a table over its image names
-// with each member's calibration in `m.rigs`. Empty when there is no file.
+// 读取模型旁的 rigs.txt，按图像名构建表并将标定存入 m.rigs；无文件时返回空。
 RigTable readRigs(const std::filesystem::path& dir, Reconstruction& m);
 
-// ---------------------------------------------------------------------------
-// Reporting helpers the summary is built from
-// ---------------------------------------------------------------------------
+// ---------------- 摘要报告辅助函数 ----------------
 
 void reprojStats(const Reconstruction& rec, const std::vector<FeatureSet>& feats,
                  double& mean, double& median, size_t& nobs);
@@ -209,28 +182,23 @@ void printCameraSetup(slog::Tag tag, const CameraSetup& cs,
 void reportFeatureCompaction(const FeatureCompactionStats& stats);
 void warnIfMasksLookInverted(const ExtractStats& st);
 
-// Per-keypoint colours while the image is hot, then back to source pixels.
+// 图像仍在内存中时采样关键点颜色，再恢复原图坐标。
 void sampleFeatureColors(FeatureSet& fs, const GrayImage& img);
 void finishFeatures(FeatureSet& fs, const GrayImage& img);
 
-// An EXR capture states its own colour space; adopt it for any of
-// `image-gamut` / `image-linear` that `seen` does not already name.
+// 从 EXR 补齐 seen 中未显式指定的 image-gamut 与 image-linear。
 void adoptExrColorSpace(SfmConfig& cfg, const std::string& imagedir,
                         const std::set<std::string>& seen);
 
 bool holdsImagesOutside(const std::filesystem::path& root,
                         const std::filesystem::path& nested);
 
-// Seconds on a steady clock; the one place a stage times itself.
+// 使用稳定时钟的秒数，统一用于阶段计时。
 double now();
 
-// ---------------------------------------------------------------------------
-// `auto`
-// ---------------------------------------------------------------------------
+// ---------------- 自动流水线 ----------------
 
-// The sinks a run reports through, installed for as long as this object
-// lives. Nothing set means the CLI's own behaviour: print, no events, no
-// cancelling. One run per process, which is what makes the sinks global.
+// 在对象生命周期内安装运行接收端；未设置时沿用 CLI 的打印、无事件和无取消行为。进程内每次运行一个任务，因此接收端为全局状态。
 class RunContext {
 public:
     RunContext() = default;
@@ -247,18 +215,16 @@ public:
 struct AutoInputs {
     std::string image_dir;
     std::string workspace;
-    // The front end said where the masks are; do not look for a sibling.
+    // 前端显式指定了掩码位置，不再查找相邻目录。
     bool mask_dir_explicit = false;
-    // Flags the front end set by hand, so preset fan-out and the EXR colour
-    // space adoption know what they may not overwrite.
+    // 前端显式设置的字段，预设展开与 EXR 色彩空间推断不得覆盖。
     std::set<std::string> explicit_flags;
-    // What the presets moved, reported in the run header.
+    // 预设修改项，在运行开头报告。
     std::vector<PresetChange> preset_changes;
 };
 
 struct AutoResult {
-    // 0 ok, 2 failed, 3 partial, 4 no metric frame -- the CLI's exit codes,
-    // as data, so a front end need not read one number for two facts.
+    // 退出状态：0 成功、2 失败、3 部分成功、4 未确定公制坐标；结构化字段使前端能分别读取各项结果。
     int exit_code = 0;
     int64_t registered = 0, images = 0, points = 0, models = 0;
     double mean_reproj = 0.0, median_reproj = 0.0;
@@ -267,26 +233,20 @@ struct AutoResult {
     std::filesystem::path sparse_dir;
 };
 
-// Every stage, in order, from a finalized config. Throws `Cancelled` when the
-// run was stopped; other failures come back in `exit_code`.
+// 按已定配置顺序运行全部阶段；取消抛出 Cancelled，其他失败写入 exit_code。
 AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in);
 
-// What a run was asked for: a finalized config and the inputs beside it.
+// 完整运行请求：已定配置及输入。
 struct AutoRequest {
     SfmConfig cfg;
     AutoInputs in;
-    // Where snapshots go; the caller installs it, since a front end running
-    // the pipeline in its own process routes them differently.
+    // 快照输出位置由调用方安装，进程内前端可采用不同路由。
     std::string progress_dir;
     bool wants_help = false;
 };
 
-// Read a settings list -- `spirula sfm auto`'s own arguments, and what a front
-// end with no command line hands over rather than keeping a second mapping of
-// its own. "" on success, otherwise the sentence to show the user.
-//
-// Presets fill in first, then the manifest, then finalize(): an explicit
-// setting beats the file and the file beats a preset's guess.
+// CLI 与前端共用设置列表解析，避免维护第二份参数映射；成功返回空字符串，失败返回用户可读说明。
+// 显式设置优先于清单，清单优先于预设，最后由 finalize 统一展开。
 std::string parse_auto_args(const std::vector<std::string>& args, AutoRequest& out);
 
-}  // namespace sfm
+}  // 命名空间 sfm

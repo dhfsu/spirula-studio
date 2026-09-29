@@ -1,33 +1,6 @@
-// Reconstructing the atoms of a bottom-up run, concurrently.
-//
-// An atom is a few dozen images (sfm/map/Partition.h), and the incremental
-// mapper over one is almost entirely host work: a two-view RANSAC per candidate
-// seed, then P3P and triangulation per image, with bundle adjustments too small
-// to occupy the device between them. Measured on a 5402-image capture, the atom
-// phase was 721 s of a 1137 s mapping stage, on one core, one atom at a time.
-//
-// Atoms are independent by construction, so this runs them in parallel. What
-// makes that possible without threading the mapper's state machine is to give
-// each atom its *own* mapper over its own **sub-database**: the atom's images
-// renumbered from zero, the verified pairs among them, and their features. Two
-// consequences, both of which matter more than the parallelism:
-//
-//   * A Mapper over 48 images allocates 48 image records, not 5402. The shared
-//     mapper's `rec_` carries a points2D / point3D_ids pair for every image in
-//     the database whatever the restriction, so building a fresh mapper per
-//     atom is *cheaper* than restricting one -- and resetModel(), which the
-//     seed retries call, walks the whole database rather than the atom.
-//   * A private object needs no locking anywhere. The only shared thing is the
-//     Vulkan context each bundle adjustment runs on, and that is per worker:
-//     a context is not thread-safe, and creating one costs far more than
-//     reconstructing an atom, so it is created once per worker and handed to
-//     every mapper that worker builds (Mapper::useBaContext).
-//
-// Camera ids stay global throughout. The intrinsics an atom must not fit for
-// itself are bootstrapped once over the whole database and handed to every
-// worker (Mapper::startingCameras), and the joint refinement that follows the
-// atom phase shares intrinsics per group -- which is only meaningful if the
-// group ids agree across atoms.
+// 并行重建互相独立的小原子分组，每原子独享局部编号子数据库与 Mapper，减少记录分配和重置范围。
+// 每工作线程复用自己的 Vulkan 上下文，不跨线程共享；相机 ID 和全局初始化内参保持一致，供后续联合优化。
+// 5402 图测量中串行原子阶段占建图 1137 s 中的 721 s，主要为主机工作，小 BA 不能充分利用 GPU。
 #pragma once
 
 #include <algorithm>
@@ -52,68 +25,44 @@
 namespace sfm {
 
 struct AtomOptions {
-    // Workers, each with its own Vulkan context. 0 = hardware_concurrency,
-    // clamped by `max_threads`: the contexts are the reason for a ceiling
-    // (each maps two 64 MB staging buffers), and past a handful of them the
-    // atoms' small solves are contending for one device anyway.
+    // 每工作线程独享上下文，默认核心数受 max_threads 限制；每上下文两个 64 MB 暂存缓冲，过多线程还会争用设备。
     int threads = 0;
     int max_threads = 8;
-    // Bundle-adjustment cadence inside an atom. Far looser than the mapper's
-    // global default because a forty-image solve does not fill the hardware,
-    // and what it protects against is a bad registration in a model small
-    // enough for the joint refinement afterwards to absorb.
+    // 原子内部放宽 BA 调用频率，小问题无法填满设备，后续联合优化可吸收小模型误差。
     double ba_growth = 2.0;
-    // Whether the atom's closing refinement is a tight one. See
-    // MapperOptions::ba_final_tight: everything an atom converges is re-solved
-    // jointly above it, three times over.
-    //
-    // Loosening the *growth* tolerance was tried alongside and is not the same
-    // trade: rtol 1e-3 with patience 2 took a 379-image capture's median
-    // relative rotation from 0.286 to 0.672 deg and its AUC@10 from 96.1 to
-    // 92.5, to save two seconds. Iteration count is not where an atom's time is.
+    // 控制原子末次精化是否严格；增长容差不能随意放宽，379 图上 rtol=1e-3、patience=2 仅省 2 s，却使旋转误差 0.286->0.672 度、AUC@10 96.1->92.5。
     bool tight_final_ba = false;
-    // Seed attempts an atom may spend looking for further components inside
-    // itself. An atom that fragments is usually dust, and what it leaves
-    // behind is picked up by the tree's growth passes.
+    // 原子内部寻找附加分量的种子预算；零散残余通常由上层增长处理。
     int model_trials = 4;
-    // Seed attempts for the atom's *primary* model, and how much of the atom
-    // that model must cover to be kept. The mapper's own defaults (8 and 0.5)
-    // are written for a whole capture, where failing to cover half of it is a
-    // failure worth retrying from another seed. An atom is not a capture: a
-    // partial one is merged and grown by the levels above, so trial
-    // reconstructions spent covering it are work the schedule redoes anyway.
-    // 0 keeps the mapper's own value.
+    // 原子主模型的种子预算与覆盖比例，0 沿用 Mapper 默认；原子部分结果还会合并增长，无需为覆盖半个原子反复试探。
     int init_trials = 8;
     double min_model_fraction = 0;
     bool verbose = true;
 };
 
 struct AtomStats {
-    size_t atoms = 0;      // clusters handed in
-    size_t models = 0;     // reconstructions they produced
-    size_t registered = 0; // summed over models, so overlap counts twice
-    size_t empty = 0;      // atoms that produced nothing
+    size_t atoms = 0;      // 输入簇数量
+    size_t models = 0;     // 产生的重建模型数
+    size_t registered = 0; // 按模型累加，重叠图像重复计数
+    size_t empty = 0;      // 未产生模型的原子数
     int threads = 1;
     double secs = 0;
 };
 
 namespace detail {
 
-// The atom's images renumbered 0..n-1, with the pairs among them.
+// 原子图像局部编号 0..n-1，以及组内匹配。
 struct SubDatabase {
     MatchesDatabase db;
     std::vector<FeatureSet> feats;
-    std::vector<uint32_t> cam_ids;   // per local image, the *global* camera id
-    std::vector<uint32_t> to_global; // local id -> database id
-    RigTable rigs;                   // the run's rigs over the local ids
-    SequenceTable seqs;              // ... and its sequences
-    std::unique_ptr<RemappedPriorSource> priors;   // ... and its sensor priors
+    std::vector<uint32_t> cam_ids;   // 逐局部图像的全局相机 ID
+    std::vector<uint32_t> to_global; // 局部 ID 到数据库 ID 的映射
+    RigTable rigs;                   // 局部 ID 上的 rig 表
+    SequenceTable seqs;              // 局部序列表
+    std::unique_ptr<RemappedPriorSource> priors;   // 局部传感器先验
 };
 
-// `adj[i]` = indices into db.pairs of every pair image i takes part in. Built
-// once for the whole database; a per-atom scan of db.pairs would be O(atoms x
-// pairs), which on a capture with 300 atoms and 700k pairs is the dominant
-// cost of the phase it is meant to make cheap.
+// 预先构建逐图像匹配邻接表，避免每原子扫描全部图像对；300 原子、70 万匹配时 O(原子数×匹配数) 会成为主开销。
 inline std::vector<std::vector<uint32_t>> pairAdjacency(const MatchesDatabase& db) {
     std::vector<std::vector<uint32_t>> adj(db.images.size());
     std::vector<uint32_t> deg(db.images.size(), 0);
@@ -130,9 +79,7 @@ inline std::vector<std::vector<uint32_t>> pairAdjacency(const MatchesDatabase& d
     return adj;
 }
 
-// Carve out one atom. `local` is scratch sized to the database, holding
-// UINT32_MAX for images outside the atom; the caller reuses it across atoms so
-// this stays O(atom), and it is left clean on return.
+// local 作为可复用全数据库临时映射，原子外为 UINT32_MAX，返回前恢复为空，使提取子数据库保持 O(原子大小)。
 inline SubDatabase carveAtom(const MatchesDatabase& db, const std::vector<FeatureSet>& feats,
                              const std::vector<uint32_t>& cam_ids,
                              const std::vector<std::vector<uint32_t>>& adj,
@@ -151,11 +98,7 @@ inline SubDatabase carveAtom(const MatchesDatabase& db, const std::vector<Featur
     for (uint32_t i = 0; i < s.to_global.size(); i++) {
         const uint32_t g = s.to_global[i];
         s.db.images[i] = db.images[g];
-        // Everything the mapper reads and nothing else. Descriptors are half a
-        // megabyte an image and no mapping code touches them -- the `map`
-        // subcommand does not even load them -- but `auto` still holds the ones
-        // matching used, and copying those per atom would cost more memory than
-        // the whole reconstruction.
+        // 仅复制建图所需关键点与颜色，不复制每图约半 MB、建图完全不使用的描述子。
         const FeatureSet& f = feats[g];
         FeatureSet& sf = s.feats[i];
         sf.width = f.width;
@@ -168,7 +111,7 @@ inline SubDatabase carveAtom(const MatchesDatabase& db, const std::vector<Featur
         sf.colors = f.colors;
         s.cam_ids[i] = cam_ids.empty() ? 1 : cam_ids[g];
     }
-    // Take each pair from its lower endpoint so it is collected exactly once.
+    // 仅从较小端点收集图像对，保证每对一次。
     for (uint32_t i = 0; i < s.to_global.size(); i++) {
         const uint32_t g = s.to_global[i];
         for (uint32_t k : adj[g]) {
@@ -187,8 +130,7 @@ inline SubDatabase carveAtom(const MatchesDatabase& db, const std::vector<Featur
     return s;
 }
 
-// Renumber a reconstruction built on a sub-database back to database ids.
-// Camera ids are global already and are left alone.
+// 将局部重建图像 ID 映回数据库 ID，相机 ID 已全局统一。
 inline void toGlobalIds(Reconstruction& m, const std::vector<uint32_t>& to_global) {
     std::map<uint32_t, Image> images;
     for (auto& kv : m.images) {
@@ -203,11 +145,9 @@ inline void toGlobalIds(Reconstruction& m, const std::vector<uint32_t>& to_globa
             if (e.image_id < to_global.size()) e.image_id = to_global[e.image_id];
 }
 
-}  // namespace detail
+}  // 命名空间 detail
 
-// Reconstruct every atom and return the models, in atom order. `base` is the
-// mapper options for the whole run; `seed_mapper` supplies the bootstrapped
-// intrinsics and is not otherwise used.
+// 按原子顺序返回模型；base 提供运行配置，seed_mapper 仅提供全局初始化内参。
 inline std::vector<Reconstruction> reconstructAtoms(
     const MatchesDatabase& db, const std::vector<FeatureSet>& feats,
     const MapperOptions& base, const std::vector<uint32_t>& cam_ids,
@@ -220,22 +160,15 @@ inline std::vector<Reconstruction> reconstructAtoms(
 
     MapperOptions mo = base;
     mo.verbose = false;
-    mo.threads = 1;  // the parallelism is over atoms; nesting only oversubscribes
-    // An atom is not the capture: it numbers its images within itself and its
-    // model is one of hundreds. The loop below reports it in database ids once
-    // it is done, and a snapshot from here would show one atom as "the model".
+    mo.threads = 1;  // 原子层已并行，禁用嵌套并行
+    // 局部原子快照不能冒充全局模型，完成后统一映回数据库 ID 报告。
     mo.report_progress = false;
     mo.ba_growth_ratio = std::max(1.0 + 1e-9, opt.ba_growth);
     mo.ba_final_tight = opt.tight_final_ba;
-    // Every solve an atom runs is a coarse one (nothing here is the final
-    // answer), so one scalar configuration covers the worker, and one context
-    // with it -- which is what makes the per-worker context in the first place.
+    // 原子求解均为中间结果，每工作线程共用一个粗阶段标量配置与上下文。
     if (!opt.tight_final_ba) mo.ba_real = mo.ba_real_coarse;
     mo.max_model_trials = opt.model_trials;
-    // The focal was settled over the whole database before this ran. An atom
-    // that searched again would be answering from a few dozen images the
-    // question D48 exists to keep it away from, and would pay a trial
-    // reconstruction per atom to do it.
+    // 焦距已在全数据库确定，禁止原子用少量图像重搜并重复试探重建（D48）。
     mo.focal_trials = 0;
     if (opt.init_trials > 0) mo.max_init_trials = opt.init_trials;
     if (opt.min_model_fraction > 0) mo.min_model_fraction = opt.min_model_fraction;
@@ -244,9 +177,7 @@ inline std::vector<Reconstruction> reconstructAtoms(
 
     const std::vector<std::vector<uint32_t>> adj = detail::pairAdjacency(db);
 
-    // An explicit count is taken literally; the default is capped, because the
-    // ceiling exists for the contexts (two 64 MB staging buffers each) and for
-    // a device that a handful of concurrent small solves already saturates.
+    // 显式线程数照用，默认线程数设上限以控制上下文暂存内存和设备争用。
     unsigned hc = std::thread::hardware_concurrency();
     int nt = opt.threads > 0 ? opt.threads
                              : std::min(hc > 0 ? (int)hc : 1, std::max(1, opt.max_threads));
@@ -257,17 +188,13 @@ inline std::vector<Reconstruction> reconstructAtoms(
     std::atomic<size_t> next{0};
     std::mutex log_mu;
     std::atomic<size_t> done{0};
-    // A worker whose device fails has to report itself: an exception crossing
-    // a thread boundary is std::terminate, and a terminate handler is a worse
-    // way to learn about a lost device than the message the failure carries.
+    // 工作线程必须捕获并报告设备失败，不能让异常跨线程触发 terminate。
     std::mutex err_mu;
     std::exception_ptr first_error;
 
     auto worker = [&] {
         try {
-            // One context for every atom this worker builds. Creating a Vulkan
-            // device takes longer than reconstructing an atom, and it cannot be
-            // shared with another thread.
+            // 每线程创建一次 Vulkan 上下文并复用于所有原子，设备初始化比单原子重建更贵，且不能跨线程共享。
             VkContext ctx;
             std::vector<uint32_t> local(db.images.size(), UINT32_MAX);
             for (size_t i = next++; i < atoms.size(); i = next++) {
@@ -296,7 +223,7 @@ inline std::vector<Reconstruction> reconstructAtoms(
         } catch (...) {
             std::lock_guard<std::mutex> lk(err_mu);
             if (!first_error) first_error = std::current_exception();
-            next = atoms.size();  // nothing left for the others to claim
+            next = atoms.size();  // 阻止其他线程继续领取任务
         }
     };
     if (nt == 1) {
@@ -322,4 +249,4 @@ inline std::vector<Reconstruction> reconstructAtoms(
     return models;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

@@ -1,5 +1,4 @@
-// Solver-facing configuration shared by the GPU driver (sfm/ba/Solver.h) and
-// the host fallback (sfm/ba/SolverCpu.h).
+// GPU 与 CPU 回退共用的 BA 求解配置。
 #pragma once
 
 #include <cstring>
@@ -7,8 +6,7 @@
 #include <string>
 #include <vector>
 
-// The arithmetic the solver runs in. `CPU` is double precision on the host, for
-// devices that can run none of the kernels (see realSupportedByDevice).
+// 求解器算术类型；CPU 表示主机双精度，用于无法执行设备内核的情况。
 enum class RealCfg { F32, F64, DF64, CPU };
 
 inline RealCfg realCfgFromName(const std::string& s) {
@@ -61,12 +59,7 @@ inline void unpackReals(std::vector<double>& out, const uint8_t* v, size_t n, Re
 enum class SolverSel { Auto, Dense, CG };
 enum class CgFallback { Auto, On, Off };
 
-// Raised, before anything is allocated, when the chosen path does not fit the
-// memory budget and the caller asked to be told rather than to find out from
-// the driver. There is nothing below CG to fall back to -- its footprint is the
-// problem data plus a few vectors -- so the only answer is a smaller problem,
-// and only the caller knows how to make one (Mapper::jointRefine splits its
-// models into batches).
+// 可拆分问题的调用方可要求在分配前因超出预算抛出 BAOverBudget；CG 已接近问题数据加少量向量的最低开销，只能缩小问题或增加内存。
 struct BAOverBudget : std::runtime_error {
     BAOverBudget(double need, double budget)
         : std::runtime_error("bundle adjustment needs more device memory than the budget allows"),
@@ -74,9 +67,7 @@ struct BAOverBudget : std::runtime_error {
     double need_mb, budget_mb;
 };
 
-// Where a device solve had got to: its parameters are in the problem's host
-// vectors as of `iterations` LM iterations, so a restart after a device failure
-// resumes from here instead of from the start.
+// 设备求解进度检查点：主机参数向量对应已完成的 LM 迭代，设备失败后从此恢复。
 struct SolverCheckpoint {
     int iterations = 0;
     double damping = 0, cost = 0;
@@ -84,41 +75,32 @@ struct SolverCheckpoint {
 
 struct SolverOptions {
     RealCfg real = RealCfg::F64;
-    float loss_param = 1.0f;      // Huber delta / Cauchy c (unused by trivial loss)
+    float loss_param = 1.0f;      // Huber 的 delta 或 Cauchy 的 c，普通平方损失不使用
     int max_iters = 50;
     double init_damping = 1e-2;
     double rtol = 1e-6;
     int patience = 10;
     SolverSel solver = SolverSel::Auto;
-    double vram_budget_mb = 0;    // 0 = 90% of the device-local heap (host: half the RAM)
-    // Throw BAOverBudget instead of warning and trying anyway. For a caller
-    // that can split the problem; the default keeps the old behaviour, since a
-    // caller that cannot split is better served by an attempt than by a refusal.
+    double vram_budget_mb = 0;    // 0 表示设备本地堆的 90%，CPU 为主机内存的一半
+    // 可请求超预算时抛出 BAOverBudget，默认仍警告并尝试。
     bool over_budget_throws = false;
-    int cg_max_iters = 100;       // CG iteration cap per LM step
-    double cg_tol = 0.1;          // relative residual tolerance eta
-    // ... and CG also stops once a step improves the quadratic model by under
-    // this fraction of the total so far (Nash-Sofer; 0 = off). It settles for a
-    // residual near sqrt of it, so a caller that wants the exact step turns it off.
+    int cg_max_iters = 100;       // 每个 LM 步的 CG 迭代上限
+    double cg_tol = 0.1;          // 相对残差容差 eta
+    // Nash-Sofer 条件可在二次模型收益低于累计收益指定比例时停止，0 禁用；此时残差约为该比例平方根，精确步应禁用提前停止。
     double cg_model_tol = 0.1;
     CgFallback cg_fallback = CgFallback::Auto;
-    // The kernels are compiled per (real, loss); `loss` selects the embedded
-    // blob "ba_<real>_<loss>". spv_path overrides it with a module from disk
-    // (a hand-compiled shader, for iteration without relinking).
+    // 内核按 real/loss 编译，选择 ba_<real>_<loss>；spv_path 可用磁盘模块覆盖，便于修改着色器后无需重新链接。
     std::string loss = "trivial";
     std::string spv_path;
-    // Canonical uuid:<hex> of the device to run on, "" for the shared
-    // precedence (explicit --device, then VK_DEVICE, then Auto).
+    // 规范 uuid:<hex>；空值沿用显式设备、环境选择、Auto 的共享优先级。
     std::string device_selector;
     int device = -1;
-    // Host worker threads for the CPU path; 0 = every core. Caps the tasks one
-    // solve splits into, not the shared pool's width (bacpu::Pool).
+    // CPU 工作线程上限，0 使用全部核心；限制单次求解的任务数，不改变共享池宽度。
     int threads = 0;
     bool validate = false;
     bool verbose = true;
     bool profile = false;
-    // Written by a device solve every few seconds of accepted progress, along
-    // with the problem's parameters. Null = no checkpoints.
+    // 设备求解每隔数秒保存已接受参数与进度；空指针禁用检查点。
     SolverCheckpoint* checkpoint = nullptr;
 };
 
@@ -126,9 +108,9 @@ struct SolverStats {
     double initial_cost = 0, final_cost = 0;
     int iterations = 0, accepted = 0;
     double solve_seconds = 0;
-    double vram_mb = 0;           // host RAM on the CPU path
+    double vram_mb = 0;           // CPU 路径使用主机内存
     const char* solver = "dense";
-    double cg_iters_total = 0;    // CG iterations summed over LM solves
+    double cg_iters_total = 0;    // 所有 LM 步累计的 CG 迭代数
     int cg_solves = 0;
-    int cg_fallbacks = 0;         // LM iterations re-solved densely
+    int cg_fallbacks = 0;         // 改用稠密求解器重算的 LM 迭代数
 };

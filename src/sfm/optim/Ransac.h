@@ -1,18 +1,5 @@
-// Generic LO-RANSAC with MSAC scoring (src/sfm/README.md).
-//
-// Estimator-agnostic: the caller supplies a minimal solver (`fit`, exactly
-// `min_samples` points, may return several candidates), a non-minimal solver
-// (`refit`, all current inliers, for the local-optimization step), and a
-// squared-residual function. Scoring is MSAC (truncated quadratic), inliers are
-// residual^2 < max_error^2, and the trial count adapts to the best inlier ratio
-// (COLMAP's defaults: confidence 0.999, 100..10000 trials).
-//
-// SPRT was measured and rejected (D26): residual evaluation is a few percent of
-// RANSAC's cost, so a statistical test that stops scoring early buys almost
-// nothing. What does buy something, and is exact rather than statistical, is
-// the bail in `scoreModel` -- a model that cannot reach the incumbent's inlier
-// count stops being scored -- and running the local optimization *inside* the
-// trial loop, which raises the inlier ratio the stopping rule reads.
+// 通用 LO-RANSAC，调用方提供最小解、内点重拟合和平方残差；使用截断二次 MSAC 评分，并按最佳内点率调整试验数。
+// SPRT 收益很小，因残差求值仅占少量开销；采用精确的内点数量上界提前退出，并在试验循环内局部优化以提升停止条件（D26）。
 #pragma once
 
 #include <algorithm>
@@ -25,21 +12,21 @@
 namespace sfm {
 
 struct RansacOptions {
-    double max_error = 4.0;          // inlier threshold in the residual's units (px)
+    double max_error = 4.0;          // 内点阈值，单位与残差一致，通常为像素
     double confidence = 0.999;
     int min_num_trials = 100;
     int max_num_trials = 10000;
-    double min_inlier_ratio = 0.0;   // give up early if clearly below this
+    double min_inlier_ratio = 0.0;   // 明显达不到此内点数时提前停止
     unsigned seed = 0;
-    int lo_iters = 10;               // local-optimization refit rounds
+    int lo_iters = 10;               // 局部优化重拟合轮数
 };
 
 template <class Model>
 struct RansacReport {
     Model model{};
-    std::vector<char> inlier_mask;   // per point
+    std::vector<char> inlier_mask;   // 逐点标记
     int num_inliers = 0;
-    double score = 0;                // MSAC (lower is better)
+    double score = 0;                // MSAC 代价，越小越好
     bool success = false;
     int trials = 0;
 };
@@ -49,18 +36,8 @@ using FitFn = std::function<std::vector<Model>(const std::vector<int>&)>;
 template <class Model>
 using ResidualFn = std::function<double(const Model&, int)>;
 
-// Score a model over all points; fills inliers, returns MSAC score (lower
-// better) and inlier count. `res` is a template parameter, not a
-// std::function: this runs `trials * n` times per estimate and an indirect
-// call per residual was pure overhead against a few flops of work.
-//
-// `need` is the inlier count a model must be able to reach to be worth
-// finishing: once the points left cannot lift `count` to it, the model can
-// neither beat nor tie the incumbent, so scoring stops and `count` is returned
-// as -1. Most trials of a RANSAC are such models, and each of them was
-// previously scored against every correspondence. The saving is exact -- a
-// model that would have won is never cut, because the bail needs
-// count + remaining < need, not <=.
+// 评分输出内点、数量与 MSAC 代价；res 为模板调用，避免高频残差的间接调用。
+// 仅当 count+remaining<need 时精确提前退出并返回 count=-1，不能用 <=，以保留可能平局或胜出的候选。
 template <class Model, class Res>
 static double scoreModel(const Model& m, int n, double thr2, const Res& res,
                          std::vector<char>& inliers, int& count, int need = 0) {
@@ -81,9 +58,7 @@ static double scoreModel(const Model& m, int n, double thr2, const Res& res,
     return score;
 }
 
-// The non-minimal solver, handed the incumbent model when it takes one: a
-// local optimization that refines rather than refits needs somewhere to start,
-// and the inlier set alone does not say where.
+// 非最小求解器可接收当前模型作为精化初值，只有内点集合不足以描述其状态。
 template <class Refit, class Model>
 static auto refitModels(const Refit& refit, const std::vector<int>& idx, const Model& m) {
     if constexpr (std::is_invocable_v<Refit, const std::vector<int>&, const Model&>)
@@ -92,9 +67,7 @@ static auto refitModels(const Refit& refit, const std::vector<int>& idx, const M
         return refit(idx);
 }
 
-// `fit` / `refit` / `res` are deduced, so callers pass lambdas and everything
-// inlines; the FitFn / ResidualFn aliases above still work for a caller that
-// wants a type-erased one. Model stays explicit at the call sites.
+// fit/refit/res 由类型推导以支持内联 lambda，也兼容类型擦除包装；Model 在调用处显式指定。
 template <class Model, class Fit, class Refit, class Res>
 RansacReport<Model> loransac(int n, int min_samples, const Fit& fit, const Refit& refit,
                              const Res& res, const RansacOptions& opt) {
@@ -106,14 +79,12 @@ RansacReport<Model> loransac(int n, int min_samples, const Fit& fit, const Refit
     std::mt19937 rng(opt.seed);
     std::uniform_int_distribution<int> uni(0, n - 1);
 
-    // Scratch reused across trials. `consider` ran thousands of times per
-    // estimate and allocated a fresh mask each time; now the winning mask is
-    // swapped into `best` and the loser's storage comes back as scratch.
+    // 跨试验复用掩码缓冲，胜出者与 best 交换，落败者存储重新作为临时区，避免反复分配。
     std::vector<char> inl;
     auto consider = [&](const Model& m) {
         int cnt = 0;
         double sc = scoreModel(m, n, thr2, res, inl, cnt, best.num_inliers);
-        if (cnt < 0) return;  // bailed: cannot reach the incumbent's inlier count
+        if (cnt < 0) return;  // 无法达到当前最佳内点数，提前退出
         if (cnt > best.num_inliers || (cnt == best.num_inliers && sc < best.score)) {
             best.model = m;
             best.inlier_mask.swap(inl);
@@ -123,10 +94,7 @@ RansacReport<Model> loransac(int n, int min_samples, const Fit& fit, const Refit
         }
     };
 
-    // Local optimization on the current inliers, `rounds` times or until it
-    // stops helping. Used both inside the trial loop (where a better model
-    // raises the inlier ratio and so lowers the trial count the stopping rule
-    // demands) and once more at the end.
+    // 局部优化最多 rounds 次或到无改善，既用于试验循环内提升内点率，也用于最终精化。
     std::vector<int> lo_idx;
     auto localOptimize = [&](int rounds) {
         for (int it = 0; it < rounds; it++) {
@@ -136,7 +104,7 @@ RansacReport<Model> loransac(int n, int min_samples, const Fit& fit, const Refit
             if ((int)lo_idx.size() < min_samples) break;
             const int before = best.num_inliers;
             for (const Model& m : refitModels(refit, lo_idx, best.model)) consider(m);
-            if (best.num_inliers <= before) break;  // converged
+            if (best.num_inliers <= before) break;  // 已收敛
         }
     };
 
@@ -145,7 +113,7 @@ RansacReport<Model> loransac(int n, int min_samples, const Fit& fit, const Refit
     std::vector<int> sample;
     sample.reserve(min_samples);
     for (; trial < max_trials; trial++) {
-        // random distinct minimal sample
+        // 随机抽取互不重复的最小样本
         sample.clear();
         while ((int)sample.size() < min_samples) {
             int idx = uni(rng);
@@ -153,15 +121,10 @@ RansacReport<Model> loransac(int n, int min_samples, const Fit& fit, const Refit
         }
         const int before = best.num_inliers;
         for (const Model& m : fit(sample)) consider(m);
-        // Textbook LO-RANSAC: optimize as soon as the incumbent improves, not
-        // only at the end. The refit model explains more of the data, which
-        // both raises the inlier ratio the stopping rule reads (fewer trials
-        // for the same confidence) and tightens the early-bail threshold
-        // (cheaper trials). One round is enough here -- the full ladder runs
-        // after the loop.
+        // 最佳模型一改善就做一轮局部优化，提高内点率以减少试验数并强化提前退出界限；完整优化留到循环结束。
         if (opt.lo_iters > 0 && best.num_inliers > before && best.success) localOptimize(1);
 
-        // adaptive stopping from the best inlier ratio so far
+        // 按目前最佳内点率自适应停止
         if (best.num_inliers > 0) {
             double w = (double)best.num_inliers / n;
             double denom = std::log(1.0 - std::pow(w, min_samples));
@@ -174,10 +137,7 @@ RansacReport<Model> loransac(int n, int min_samples, const Fit& fit, const Refit
         }
     }
 
-    // Final local optimization. (`refit` is a deduced callable rather than a
-    // std::function, so there is no "empty" state to test for -- every caller
-    // passes a real one, and an estimator with no non-minimal solver passes its
-    // minimal one twice.)
+    // 最终局部优化，refit 必须为有效可调用对象；没有非最小求解器时重复传入最小求解器。
     if (best.success) localOptimize(opt.lo_iters);
     best.trials = trial;
     if (opt.min_inlier_ratio > 0 && (double)best.num_inliers / n < opt.min_inlier_ratio)
@@ -185,4 +145,4 @@ RansacReport<Model> loransac(int n, int min_samples, const Fit& fit, const Refit
     return best;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

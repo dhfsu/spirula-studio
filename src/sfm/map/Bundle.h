@@ -1,16 +1,5 @@
-// Bundle adjustment for the mapper: build a BAProblem from a Reconstruction and
-// run the existing GPU solver (src/sfm/README.md "BA integration").
-//
-// The reconstruction's camera convention (+z forward, angle-axis pose) maps 1:1
-// to the solver's per-group camera models (pinhole_radial for RADIAL, opencv for
-// OPENCV; D29), so no coordinate juggling is needed. Gauge is left free -- the solver's LM damping
-// regularizes it, exactly as it does for the (also gauge-free) BAL problems.
-//
-// Known MVP limitation: each call constructs a fresh BundleSolver (hence a fresh
-// VkContext) and pays the device init every time. The context tears down fully at
-// scope exit (VRAM is returned -- before that, a 1363-image run OOMed on the
-// accumulated leaks), but a persistent, reusable solver belongs with the
-// phase-0 shared GPU primitives.
+// 将 Reconstruction 装配为 BAProblem 并调用统一求解器；相机约定与求解器一致，无需额外坐标转换。
+// 坐标规范保持自由，由 LM 阻尼正则化；设备上下文可由调用方持久复用。
 #pragma once
 
 #include <algorithm>
@@ -32,104 +21,57 @@ struct BundleOptions {
     RealCfg real = RealCfg::F64;
     int max_iters = 25;
     bool verbose = false;
-    // Canonical uuid:<hex> of the device this solve runs on; "" = the shared
-    // precedence. The int below is the CLI/API input boundary only.
+    // 规范 uuid:<hex> 指定求解设备，空值沿用共享优先级；整数仅保留 CLI/API 输入形式。
     std::string device_selector;
     int device = -1;
-    // Robust loss for mapping-time BA (D36). COLMAP's global BA is trivial
-    // because local BA cleans each registration first; without local BA, a
-    // single bad registration's residuals bend a small model before the
-    // filters can catch it. Huber keeps the quadratic basin for well-fit
-    // observations and grows linearly past `loss_param` pixels.
+    // 建图 BA 默认使用 Huber：缺少局部 BA 时，错误配准可能在过滤前扭曲小模型；阈值内二次、阈值外线性（D36）。
     std::string loss = "huber";
     float loss_param = 2.0f;
-    // Convergence overrides (D38): growth-phase BAs pass a looser tolerance so
-    // iteration count adapts to actual convergence instead of a fixed cap.
-    // 0 keeps the solver defaults (the final refinement passes do).
+    // 增长阶段可覆盖为较松收敛容差，0 沿用求解器默认，最终精化使用默认严格设置（D38）。
     double rtol = 0;
     int patience = 0;
-    // Refine each camera's principal point, or hold it where the setup put it
-    // (the image centre, unless something measured otherwise). COLMAP's
-    // refine_principal_point, false there and here.
-    //
-    // Shifting the principal point by d is almost exactly a rotation of the
-    // camera by d/f -- for an equidistant fisheye it is exactly that to first
-    // order across the whole field, since a rotation moves every angle by the
-    // same amount. So the parameter buys nothing and costs plenty: with a
-    // single camera group its drift is a pure gauge (every camera turns the
-    // same way, which the alignment absorbs), but with two or more groups each
-    // drifts its own way and the difference is a real error in their relative
-    // orientation. On the dual-fisheye 360 rigs that error was 1.0-1.8 deg
-    // of inter-lens rotation, matching the drift difference to within 25% (D50).
-    //
-    // A *finished* model is a different situation, which is why this is an
-    // option and not a constant: COLMAP's own documentation says to hold the
-    // principal point during reconstruction and then "try to refine [it] in
-    // global bundle adjustment" once every image is in, "especially when
-    // sharing intrinsic parameters between multiple images". Hence the
-    // qualifier below -- sharing is what makes it observable (D51).
+    // 建图期间默认固定主点；主点偏移 d 近似等效旋转 d/f，多相机组独立漂移会改变相对朝向，双鱼眼实测误差 1.0–1.8 度（D50）。
+    // 完成后可在有足够共享图像时单独优化主点，以改善可观性（D51）。
     bool refine_principal_point = false;
-    // Refine the distortion coefficients, or hold them at the setup's value.
-    // COLMAP's refine_extra_params, true there and here; holding them pins the
-    // principal point too, since the free set is a prefix (D72).
+    // 畸变默认可优化；固定畸变也会固定其后主点，以保持自由参数为前缀（D72）。
     bool refine_extra_params = true;
-    // Refuse a solve that does not fit the device rather than attempting it --
-    // for a caller that can split the problem and retry (Mapper::jointRefine).
+    // 可拆分问题的调用方可要求超设备预算时立即拒绝，随后分批重试。
     bool over_budget_throws = false;
-    // ... and only for camera groups with at least this many images behind
-    // them. A group of one image has no sharing at all: moving its principal
-    // point is exactly a rotation of that one camera, with nothing to
-    // contradict it. 0 refines every group.
+    // 仅为图像数量达到阈值的相机组优化主点；单图组无法区分主点变化与相机旋转，0 表示全部组。
     size_t pp_min_images = 20;
-    // Which linear solver the reduced camera system gets: "auto" is the
-    // solver's own n_dim threshold, "dense" its Cholesky, "cg" the
-    // implicit-Schur conjugate gradient. The threshold was measured on one GPU
-    // and the crossover moves with the hardware, so it is worth being able to
-    // name (`--ba-solver`).
+    // auto 按系统维度选路径，dense 使用 Cholesky，cg 使用隐式 Schur；硬件改变交叉点，因此提供 ba-solver 显式选择。
     std::string solver = "auto";
-    // Persistent context (D38): device, pipelines and descriptor machinery
-    // outlive one solve. The caller owns it and must keep (real, loss) fixed
-    // across calls on the same context. Null = scoped context per call.
+    // 调用方持久上下文复用设备、流水线和描述符，同一上下文的 real/loss 必须固定；空值则每次创建局部上下文。
     VkContext* shared_ctx = nullptr;
-    // Host worker threads, for the `cpu` scalar; 0 = hardware_concurrency.
+    // CPU 主机线程数，0 使用 hardware_concurrency
     int threads = 0;
-    // Rigs (sfm/core/Rig.h): with a table, every frame whose members have an
-    // established calibration is one pose block and the member extrinsics are
-    // refined; `use_rigs` off treats every image as its own frame.
+    // 已标定成员同帧共享一个位姿块，成员外参可精化；use_rigs 关闭时每图独占一帧。
     const RigTable* rigs = nullptr;
     bool use_rigs = true;
     bool refine_rigs = true;
-    // Frames holding a member together with another member of its rig before
-    // its extrinsic is refined rather than held; below that, the two would
-    // trade off against each other.
+    // 优化成员外参前，需足够共同观测其他成员的帧数，避免位姿与外参相互补偿。
     int rig_min_frames = 3;
-    // ... and observations of the member's images in the problem.
+    // 还需足够成员图像观测数
     int rig_min_obs = 100;
-    // Pose priors on the reconstruction's image ids (sfm/ba/Priors.h);
-    // factors naming an image the problem lacks are dropped.
+    // 先验使用重建图像 ID，问题中缺失图像的因子将被丢弃。
     const PosePriors* priors = nullptr;
 };
 
-// The problem built from a reconstruction, plus what writing the solution back
-// needs: which reconstruction entity each BA index belongs to. Kept apart from
-// `runGlobalBA` so a caller that wants to drive the solver itself (the `ba`
-// subcommand, on a model directory) does not have to rebuild any of this.
+// BA 问题及索引到原重建对象的映射，与 runGlobalBA 分离，便于独立 ba 命令复用装配。
 struct BundleLayout {
     BAProblem P;
-    std::vector<Image*> imgOf;      // by BA image index
-    std::vector<Point3D*> ptOf;     // by BA point index
-    std::vector<uint32_t> camIds;   // by group
-    std::vector<std::pair<uint32_t, uint32_t>> memberOf;  // by BA member: (rig, member)
-    // The priors on BA indices. P.priors points here once the layout has its
-    // final address (attachPriors), never before: the struct is returned by value.
+    std::vector<Image*> imgOf;      // 按 BA 图像索引
+    std::vector<Point3D*> ptOf;     // 按 BA 三维点索引
+    std::vector<uint32_t> camIds;   // 按相机组
+    std::vector<std::pair<uint32_t, uint32_t>> memberOf;  // 每 BA 成员对应（rig，成员）
+    // P.priors 须在返回值地址稳定后由 attachPriors 指向本对象内先验。
     PosePriors priors;
     void attachPriors() { P.priors = priors.empty() ? nullptr : &priors; }
 };
 
 namespace bundle_detail {
 
-// The frame a registered image's pose block belongs to: (rig, frame) for a rig
-// image whose member is calibrated, (kNoRig, image id) otherwise.
+// 已标定 rig 图像使用（rig，frame）位姿块，其余使用（kNoRig，图像 ID）。
 struct FrameKey {
     uint32_t rig, frame;
     bool operator<(const FrameKey& o) const {
@@ -158,25 +100,18 @@ inline Pose unpackPose(const double* v) {
     return {angleAxisToRotation({v[0], v[1], v[2]}), {v[3], v[4], v[5]}};
 }
 
-}  // namespace bundle_detail
+}  // 命名空间 bundle_detail
 
-// Pack `rec` into a BAProblem. Empty layout (num_images < 2) if there is
-// nothing to optimize.
+// 将重建装配为 BAProblem，不足两图像时返回空布局。
 inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) {
-    // Index registered images and 3D points.
-    //
-    // Everything downstream addresses them by their dense BA index, so the
-    // id -> index maps are flat arrays rather than std::map: assembly walks a
-    // few million observations and a tree lookup per observation was the whole
-    // reason "BA build" showed up next to "BA solve" in the profile.
+    // 使用平铺 ID 到稠密 BA 索引映射，避免数百万观测逐项树查找使问题构建成为主要开销。
     BundleLayout L;
     std::vector<uint32_t> imgIds;
-    std::vector<Image*>& imgOf = L.imgOf;  // by BA index
+    std::vector<Image*>& imgOf = L.imgOf;  // 按 BA 索引
     uint32_t max_img_id = 0;
     for (auto& kv : rec.images) max_img_id = std::max(max_img_id, kv.first);
     std::vector<uint32_t> imgBA(max_img_id + 1, UINT32_MAX);
-    // Images ordered by frame, so a rig frame's images are one contiguous pose
-    // block (the host solver relies on it; sfm/ba/Problem.h).
+    // 图像按帧排序，使 rig 帧连续，CPU 求解器依赖此约束。
     using bundle_detail::FrameKey;
     const RigTable* rigs = bopt.use_rigs ? bopt.rigs : nullptr;
     std::vector<std::pair<FrameKey, uint32_t>> order;
@@ -192,7 +127,7 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
         imgOf.push_back(&rec.images.at(o.second));
     }
     std::vector<uint64_t> ptIds;
-    std::vector<Point3D*>& ptOf = L.ptOf;  // by BA index
+    std::vector<Point3D*>& ptOf = L.ptOf;  // 按 BA 索引
     for (auto& kv : rec.points3D) {
         if (kv.second.track.size() < 2) continue;
         ptIds.push_back(kv.first);
@@ -200,7 +135,7 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
     }
     if (imgIds.size() < 2 || ptIds.empty()) return BundleLayout{};
 
-    // Camera groups: one per distinct camera used (usually a single shared one).
+    // 每个实际使用的相机 ID 对应一个内参组。
     std::vector<uint32_t>& camIds = L.camIds;
     std::map<uint32_t, uint32_t> camGroup;
     for (Image* im : imgOf) {
@@ -215,9 +150,7 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
     P.num_images = (uint32_t)imgIds.size();
     P.num_points = (uint32_t)ptIds.size();
 
-    // Observations, emitted point-major (which is the order the solver's tables
-    // want) so the only sorting left is by image *within* one point's track --
-    // a handful of elements each, instead of one global sort of millions.
+    // 按点顺序输出观测，仅需在各短轨迹内按图像排序，避免对全部观测做全局排序。
     struct Obs { uint32_t img, pt; double x, y; };
     std::vector<Obs> obs;
     obs.reserve((size_t)P.num_points * 3);
@@ -246,14 +179,12 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
         P.obs_xy[2 * i + 1] = obs[i].y;
     }
 
-    // Frames and members. A rig frame's pose is taken from the image with the
-    // most observations (its rig-mates are snapped to the calibration; the
-    // solve reconciles them); a plain image is its own frame.
+    // rig 帧初始位姿取观测最多的成员图像，其余按标定对齐并由 BA 协调；普通图像独占帧。
     P.image_frame.assign(P.num_images, 0);
     P.image_member.assign(P.num_images, kNoMember);
-    std::map<std::pair<uint32_t, uint32_t>, uint32_t> memberBA;  // (rig, member) -> index
-    std::vector<uint32_t> memberCo;  // per BA member, frames shared with another member
-    std::vector<std::vector<uint32_t>> frameImgs;  // per BA frame, its BA images
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> memberBA;  // （rig，成员）到索引的映射
+    std::vector<uint32_t> memberCo;  // 每 BA 成员与其他成员共同出现的帧数
+    std::vector<std::vector<uint32_t>> frameImgs;  // 每 BA 帧包含的图像
     for (uint32_t i = 0; i < P.num_images; i++) {
         const FrameKey key = order[i].first;
         if (i == 0 || !(order[i - 1].first == key)) frameImgs.emplace_back();
@@ -287,9 +218,7 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
         }
         bundle_detail::packPose(fp, &P.poses[6 * f]);
     }
-    // Members: cam_from_rig from the calibration, refined when asked, when
-    // enough frames tie the member to its rig, and when it sees enough: a known
-    // member is established before it has observed anything (a lens on the sky).
+    // 只有显式要求、共同帧数及观测数足够时才优化成员外参；已知外参的镜头可能尚无观测，如朝天镜头。
     std::vector<uint32_t> memberObs(L.memberOf.size(), 0);
     for (uint32_t o = 0; o < P.num_obs; o++) {
         const uint32_t m = P.image_member[P.obs_image[o]];
@@ -312,18 +241,8 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
         P.ext_dim += nf;
     }
 
-    // Intrinsics groups. Model + parameter count are per group (each camera may
-    // pick its own distortion model), so the flat `intr` array is packed with
-    // per-group offsets rather than a single stride (D29 ended the old uniform
-    // pinhole_radial-only assumption). The model index, count and parameter
-    // layout all come from sfm/core/Camera.h -- one source of truth (D30).
-    //
-    // Every group stores all of its model's parameters; how many of them BA may
-    // *change* is the group's n_intr, and only those own columns of the reduced
-    // system (D50). Storage and columns are therefore two different packings --
-    // a group holding its principal point fixed stores 8 and owns 6 -- and the
-    // solver's intr_update walks the group table rather than assuming they
-    // coincide.
+    // 相机模型、参数数量与布局统一来自 Camera.h，按组偏移打包，兼容混合镜头。
+    // 存储全部参数，但仅 n_intr 个自由参数占约化列；例如存八参、固定主点时仅占六列，更新必须按组表映射。
     std::vector<size_t> group_images(camIds.size(), 0);
     std::vector<uint32_t> img_group(P.num_images);
     for (uint32_t i = 0; i < P.num_images; i++) {
@@ -347,7 +266,7 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
     }
     P.image_group = std::move(img_group);
 
-    // Points.
+    // 三维点。
     P.points.resize(3 * P.num_points);
     for (uint32_t i = 0; i < P.num_points; i++) {
         const Vec3& X = ptOf[i]->xyz;
@@ -361,8 +280,7 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
     for (auto& g : P.groups) g.intr_col += P.pose_dim + P.ext_dim;
     finalizeTables(P);
 
-    // Priors onto BA indices. One rotation factor per frame pair: a rig's
-    // lenses each carry the chain, and both name the same two pose blocks.
+    // 将先验映射到 BA 索引，同一帧对只保留一个旋转因子，避免 rig 多镜头重复约束同一位姿块。
     if (bopt.priors && !bopt.priors->empty()) {
         const PosePriors& in = *bopt.priors;
         PosePriors& out = L.priors;
@@ -391,7 +309,7 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
     return L;
 }
 
-// Solver options for a mapper-driven bundle adjustment.
+// 建图器使用的求解选项。
 inline SolverOptions bundleSolverOptions(const BundleOptions& bopt) {
     SolverOptions sopt;
     sopt.real = bopt.real;
@@ -410,9 +328,7 @@ inline SolverOptions bundleSolverOptions(const BundleOptions& bopt) {
     return sopt;
 }
 
-// Copy a solved problem's parameters back into the reconstruction it came from.
-// `P` is the layout's own problem unless the caller moved it out to hand to a
-// solver, which `spirula-sfm ba` does.
+// 将求解参数写回原重建；P 通常为布局内部问题，也允许调用方移出后传给求解器。
 inline void writeBundle(Reconstruction& rec, const BundleLayout& L, const BAProblem& P) {
     for (uint32_t m = 0; m < P.members.size(); m++) {
         const auto& rm = L.memberOf[m];
@@ -433,11 +349,9 @@ inline void writeBundle(Reconstruction& rec, const BundleLayout& L, const BAProb
         L.ptOf[i]->xyz = {P.points[3 * i], P.points[3 * i + 1], P.points[3 * i + 2]};
 }
 
-// ---- host fallback after a device failure ---------------------------------
+// ---------------- 设备失败后的主机回退 ----------------
 
-// A solve the device could not finish -- a lost device (what a Windows TDR
-// reset looks like from here), or a refused allocation -- re-runs on the host,
-// and every later solve that big goes straight there: the problems only grow.
+// 设备丢失或分配失败后改用 CPU 重算，后续达到同等规模的问题直接走主机，避免重复失败。
 inline std::atomic<uint64_t>& baHostObsThreshold() {
     static std::atomic<uint64_t> n{UINT64_MAX};
     return n;
@@ -454,13 +368,11 @@ inline void noteBaDeviceFailure(const VkError& e, uint64_t num_obs) {
 
 struct BundleRun {
     SolverStats stats;
-    RealCfg real = RealCfg::F64;  // what the solve that finished ran in
+    RealCfg real = RealCfg::F64;  // 最终成功求解使用的算术配置
     double t_init = 0, t_solve = 0;
 };
 
-// Solve `P` in place, moving to the host if the device fails. The device solve
-// checkpoints `P` every few seconds (SolverOptions::checkpoint), so the host
-// picks up where it stopped instead of from the start.
+// 原地求解 P；设备每数秒保存已接受参数，失败后主机从检查点继续而非从头开始。
 inline BundleRun solveBundle(BAProblem& P, SolverOptions sopt, VkContext* shared) {
     BundleRun r;
     if (P.num_obs >= baHostObsThreshold().load()) sopt.real = RealCfg::CPU;
@@ -498,9 +410,7 @@ inline BundleRun solveBundle(BAProblem& P, SolverOptions sopt, VkContext* shared
     return r;
 }
 
-// Global BA over all registered images and all 3D points. Overwrites poses,
-// point positions, and intrinsics in `rec`. Returns the final RMS reprojection
-// cost reported by the solver (0 if nothing to optimize).
+// 全局 BA 更新全部已配准位姿、三维点与内参，返回求解器最终 RMS 代价，无工作时为 0。
 inline double runGlobalBA(Reconstruction& rec, const BundleOptions& bopt) {
     auto prof_t0 = std::chrono::steady_clock::now();
     auto prof_lap = [&prof_t0] {
@@ -541,11 +451,9 @@ inline double runGlobalBA(Reconstruction& rec, const BundleOptions& bopt) {
     return stats.final_cost;
 }
 
-// ---- joint refinement of several components (D45) -------------------------
+// ---------------- 多分量联合精化（D45）----------------
 
-// One lens took every component, so its intrinsics are one set of unknowns:
-// every model goes into one BAProblem under its own id range, the camera ids
-// shared. `priors[k]`, when given, are model k's factors on its own image ids.
+// 各模型使用独立图像 ID 区间，但共享同相机 ID 的内参；可选 priors[k] 使用模型自身图像 ID。
 inline double runJointBA(std::vector<Reconstruction*> models, const BundleOptions& bopt,
                          const std::vector<const PosePriors*>* priors = nullptr) {
     if (models.empty()) return 0;
@@ -559,7 +467,7 @@ inline double runJointBA(std::vector<Reconstruction*> models, const BundleOption
         return runGlobalBA(*models[0], one);
     }
 
-    // Id strides, so a merged view can be split apart again unambiguously.
+    // 使用独立 ID 步长，使联合视图可无歧义拆回。
     uint32_t img_stride = 0;
     uint64_t pt_stride = 0;
     for (const Reconstruction* m : models) {
@@ -567,24 +475,19 @@ inline double runJointBA(std::vector<Reconstruction*> models, const BundleOption
         for (const auto& kv : m->points3D) pt_stride = std::max(pt_stride, kv.first + 1);
     }
     if (img_stride == 0 || pt_stride == 0) return 0;
-    // A rig frame names images a component may not hold; the stride has to
-    // clear every id the table can produce, not only the ones present.
+    // rig 表可引用当前分量未包含的图像，步长须覆盖表能产生的所有 ID。
     if (bopt.rigs && bopt.use_rigs)
         img_stride = std::max(img_stride, (uint32_t)bopt.rigs->of_image.size());
 
     Reconstruction all;
-    // Each model's priors travel with its shifted image ids; the up axis is
-    // per model too, so the stacked problem takes it from the first model
-    // that has up factors and drops the others' (their gauges differ).
+    // 先验随图像 ID 平移；各模型向上轴不同，联合问题只采用首个含向上因子模型的轴，其余向上因子忽略。
     PosePriors joint_priors;
     bool joint_up = false;
-    // Rigs: each component keeps its own calibration (its own scale), so the
-    // stacked problem gets one copy of the table per component, image ids
-    // shifted with the component, and one calibration set per copy.
+    // 各模型尺度不同，保留独立 rig 标定与表副本，并按模型平移图像 ID。
     RigTable joint_rigs;
     const bool rigs = bopt.rigs && bopt.use_rigs && !bopt.rigs->empty();
     std::vector<uint32_t> rig_base(models.size(), 0);
-    // Cameras: shared by id, taken from the component with the most images.
+    // 相机按 ID 共享，初值取图像最多的模型。
     std::map<uint32_t, double> cam_weight;
     for (const Reconstruction* m : models) {
         std::map<uint32_t, double> w;
@@ -665,7 +568,7 @@ inline double runJointBA(std::vector<Reconstruction*> models, const BundleOption
     }
     double cost = runGlobalBA(all, jopt);
 
-    // Scatter back. Intrinsics land in every component, which is the point.
+    // 拆回模型时将共享内参写入所有分量。
     for (size_t mi = 0; mi < models.size(); mi++) {
         Reconstruction& m = *models[mi];
         if (m.numRegistered() < 2) {
@@ -705,4 +608,4 @@ inline double runJointBA(std::vector<Reconstruction>& models, const BundleOption
     return runJointBA(std::move(p), bopt, priors);
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

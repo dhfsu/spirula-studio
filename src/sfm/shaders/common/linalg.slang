@@ -1,7 +1,5 @@
 #pragma once
-// Small differentiable vector/matrix helpers over `Real`.
-// Custom RVec2/RVec3 are used instead of vector<Real,N> so the emulated DF
-// scalar works with the exact same code paths as float/double.
+// Real 上的小型可微向量与矩阵操作，采用自定义 RVec2/RVec3，使 DF 与 float/double 共用同一路径。
 
 #include "real.slang"
 
@@ -26,9 +24,7 @@ struct RVec3 : IDifferentiable {
 [Differentiable] RVec3 operator *(RVec3 a, Real s) { return rvec3(a.x * s, a.y * s, a.z * s); }
 [Differentiable] RVec2 operator -(RVec2 a, RVec2 b) { return rvec2(a.x - b.x, a.y - b.y); }
 
-// Fused differentiable sincos: one range reduction + polynomial pair per
-// call (rsin/rcos each compute both and discard one), with a backward that
-// also evaluates it only once. Returns (sin, cos) as an RVec2.
+// 合并的可微 sincos 每次仅做一次参数约简与多项式对，反向同样复用，返回 RVec2(sin,cos)。
 [BackwardDerivative(rsincos_bwd)]
 RVec2 rsincos(Real x) {
     Real s, c;
@@ -47,7 +43,7 @@ void rsincos_bwd(inout DifferentialPair<Real> x, RVec2 g) {
 }
 [Differentiable] Real length3(RVec3 a) { return sqrt(dot3(a, a)); }
 
-// Inverse of a symmetric 3x3 given as row-major Real[9] (adjugate formula).
+// 行主序 Real[9] 对称 3×3 矩阵的伴随公式逆。
 void inverse3(Real m[9], out Real r[9]) {
     Real c00 = m[4] * m[8] - m[5] * m[7];
     Real c01 = m[5] * m[6] - m[3] * m[8];

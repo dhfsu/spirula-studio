@@ -1,11 +1,5 @@
-// Pose priors in the bundle adjustment (sfm/ba/Priors.h): the analytic
-// Jacobians against central differences, the device assembly and solve against
-// the host, and a gauge the reprojections cannot see recovered from centre,
-// up and rotation priors alone.
-//
-//   sfm_prior_test [--device N] [--real double|df|float] [--no-gpu]
-//
-// Prints PASS/FAIL per case and returns 0/1. See docs/testing.md.
+// BA 位姿先验测试：解析雅可比对照差分，GPU 装配求解对照主机，并仅靠中心、向上和旋转先验恢复不可由重投影确定的规范。
+// 支持 --no-gpu。
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -65,7 +59,7 @@ Pose camPose(const BAProblem& P, uint32_t img) {
     return composePose(Pose{angleAxisToRotation({e[0], e[1], e[2]}), {e[3], e[4], e[5]}}, f);
 }
 
-// Priors stated about the problem's current poses, perturbed by `bias`.
+// 相对问题当前位姿构造先验，并加入 bias 扰动。
 PosePriors priorsFrom(const BAProblem& P, std::mt19937& rng, double bias, bool centres) {
     std::normal_distribution<double> gauss;
     PosePriors pr;
@@ -100,7 +94,7 @@ PosePriors priorsFrom(const BAProblem& P, std::mt19937& rng, double bias, bool c
             c.sigma = {0.01, 0.01, 0.01};
             pr.centres.push_back(c);
             if (i + 2 < P.num_images) {
-                // A three-term factor with distinct matrices, as the inertial triple.
+                // 三个不同系数矩阵的中心因子，模拟惯性三帧约束。
                 PriorCentre t;
                 t.n = 3;
                 t.img[0] = i;
@@ -122,7 +116,7 @@ PosePriors priorsFrom(const BAProblem& P, std::mt19937& rng, double bias, bool c
     return pr;
 }
 
-// ---- Jacobians against central differences ---------------------------------
+// ---------------- 雅可比与中心差分 ----------------
 
 void testJacobians(uint32_t rig) {
     std::mt19937 rng(11 + rig);
@@ -159,7 +153,7 @@ void testJacobians(uint32_t rig) {
     report(name, worst, 1e-6);
 }
 
-// ---- device against host ---------------------------------------------------
+// ---------------- 设备与主机对照 ----------------
 
 void testParity(uint32_t rig, bool cg, RealCfg real, int device, double tol) {
     std::mt19937 rng(21 + rig);
@@ -180,8 +174,7 @@ void testParity(uint32_t rig, bool cg, RealCfg real, int device, double tol) {
         sc.debugAssemble(1e-2f);
         snprintf(name, sizeof name, "S with priors rig=%u", rig);
         report(name, relMax(sg.debugPackedS(), sc.debugPackedS()), tol);
-        // The device's g differs from the host's by ~4e-6 on this problem
-        // with the priors off too; the tolerance is for that, not for them.
+        // 即使关闭先验，设备 g 与主机也约差 4e-6，容差用于基础算术差异。
         snprintf(name, sizeof name, "g with priors rig=%u", rig);
         report(name, relMax(sg.debugG(), sc.debugG()), 10 * tol);
     }
@@ -206,10 +199,9 @@ void testParity(uint32_t rig, bool cg, RealCfg real, int device, double tol) {
     report(name, relMax(Pg.poses, Pc.poses), tol);
 }
 
-// ---- the gauge, recovered from the priors alone ------------------------------
+// ---------------- 仅靠先验恢复坐标规范 ----------------
 
-// A reconstruction moved by a similarity reprojects identically; only the
-// priors know where it stood. With them the solve puts it back.
+// 相似变换不改重投影，只有先验知道原位置，求解应将模型恢复。
 void testGauge(uint32_t rig, bool cg, RealCfg real, int device) {
     BAProblem P0 = synth::makeProblem(3, 12, 150, 1, 0.1, 77 + rig, -1, rig, true);
     {
@@ -221,7 +213,7 @@ void testGauge(uint32_t rig, bool cg, RealCfg real, int device) {
     }
     std::mt19937 rng(5);
     PosePriors pr = priorsFrom(P0, rng, 0.0, true);
-    // Move the whole model: every camera centre and point through one Sim(3).
+    // 对全部相机中心和三维点应用同一 Sim3。
     Sim3 T;
     T.scale = 1.7;
     T.R = angleAxisToRotation({0.3, -0.2, 0.4});
@@ -291,6 +283,6 @@ int run(int argc, char** argv) {
     return g_fail ? 1 : 0;
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 int main(int argc, char** argv) { return sfmTestMain(argc, argv, run); }

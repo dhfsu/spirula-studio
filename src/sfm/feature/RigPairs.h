@@ -1,8 +1,4 @@
-// Pairs a rig implies. When a/i and b/j verified, frames i and j face the same
-// way through those two lenses, and the members' known rotations then say
-// which other lens of i faces which lens of j: those pairs are matched too, so
-// a frame link never rests on whichever lens the pair source happened to rank
-// (docs/notes/sfm-rig-constraints.md, "Known lens geometry").
+// 对已验证的 a/i 与 b/j，利用成员已知旋转推导其他朝向重叠的镜头对并补充匹配，避免帧间连接只依赖筛选恰好选中的镜头。
 #pragma once
 
 #include <algorithm>
@@ -16,37 +12,33 @@
 
 namespace sfm {
 
-// (a'/i, b'/j), a' facing away from a, for each seed (a/i, b/j) whose frame
-// pair has at most a quarter of the members in seeds -- the weak links -- where
-// a'/i and b'/j face within `max_angle_deg` had a/i and b/j faced alike.
+// 对种子成员不足四分之一的弱帧间连接，选择背离 a 的 a'，并使 a'/i 与 b'/j 在假定种子朝向一致时夹角不超过 max_angle_deg。
 inline std::vector<std::pair<uint32_t, uint32_t>> rigMatePairs(
     const RigTable& rigs, const std::vector<std::pair<uint32_t, uint32_t>>& seeds,
     double max_angle_deg) {
     const double cos_max = std::cos(max_angle_deg * M_PI / 180.0);
-    // implied[r][a * n + b]: the member pairs a chosen (a, b) brings.
+    // implied[r][a*n+b] 保存成员对 (a,b) 推导出的伙伴成员对。
     std::vector<std::vector<std::vector<std::pair<uint32_t, uint32_t>>>> implied(rigs.rigs.size());
     for (size_t r = 0; r < rigs.rigs.size(); r++) {
         const std::vector<RigMemberDef>& mem = rigs.rigs[r].members;
         const size_t n = mem.size();
         implied[r].resize(n * n);
-        // "Faced alike" holds for a seed of two ~190-degree fisheyes; two 90-degree
-        // views overlap at 60 degrees apart, and on a .360 6% of mates verified.
+        // 约 190 度双鱼眼的种子可近似视为同向；90 度视图可在相差 60 度时重叠，.360 的伙伴仅 6% 验证成功。
         if (rigs.rigs[r].kind != "dual-fisheye") continue;
         for (size_t a = 0; a < n; a++)
             for (size_t b = 0; b < n; b++) {
                 if (!mem[a].has_ext || !mem[b].has_ext) continue;
-                // Frame j's rig frame, in frame i's, when a/i and b/j agree.
+                // 假定 a/i 与 b/j 同向时，帧 j 的 rig 坐标在帧 i 中的旋转。
                 const Mat3 H = mul(transpose(mem[a].ext.R), mem[b].ext.R);
                 for (size_t a2 = 0; a2 < n; a2++)
                     for (size_t b2 = 0; b2 < n; b2++) {
                         if ((a2 == a && b2 == b) || !mem[a2].has_ext || !mem[b2].has_ext) continue;
                         const Mat3& Ra = mem[a2].ext.R;
-                        // Only the lenses facing away from the seed's: those
-                        // beside it share its content, which found them already.
+                        // 仅补充背离种子镜头的方向；相邻镜头共享内容，通常已被原筛选找到。
                         const Mat3& Rs = mem[a].ext.R;
                         if (Ra[6] * Rs[6] + Ra[7] * Rs[7] + Ra[8] * Rs[8] > 0) continue;
                         const Mat3 Rb = mul(H, transpose(mem[b2].ext.R));
-                        // Optical axes: a row of cam_from_rig, a column of rig_from_cam.
+                        // 光轴为 cam_from_rig 的一行，或 rig_from_cam 的一列。
                         const double c = Ra[6] * Rb[2] + Ra[7] * Rb[5] + Ra[8] * Rb[8];
                         if (c >= cos_max) implied[r][a * n + b].push_back({(uint32_t)a2, (uint32_t)b2});
                     }
@@ -88,4 +80,4 @@ inline std::vector<std::pair<uint32_t, uint32_t>> rigMatePairs(
     return out;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

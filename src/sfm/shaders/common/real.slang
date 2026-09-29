@@ -1,15 +1,6 @@
 #pragma once
-// Scalar type configuration. Exactly one of REAL_FLOAT / REAL_DOUBLE / REAL_DF
-// is defined on the slangc command line; everything downstream is written
-// against `Real` and the small accumulation API below.
-//
-//   Real        - the arithmetic scalar type
-//   AWord       - element type of buffers that receive atomic accumulation
-//                 (bound as a second view of the same VkBuffer)
-//   atomicAccum - lock-free `buf[i] += v`
-//   loadAccum / storeAccum - non-atomic access through the AWord view
-//   rexp/rlog/rsin/rcos - differentiable transcendentals (SPIR-V only has
-//   them natively for 32-bit floats; sqrt works for every config)
+// 编译时恰好选择 REAL_FLOAT/REAL_DOUBLE/REAL_DF，下游统一使用 Real。
+// AWord 为同缓冲的原子视图元素类型，atomicAccum 执行无锁累加，load/store 为普通访问；rexp/rlog/rsin/rcos 提供可微超越函数。
 
 #include "df.slang"
 #include "dmath.slang"
@@ -55,8 +46,7 @@ float rToFloat(Real x) { return float(x); }
 typealias Real = DF;
 typealias AWord = uint64_t;
 
-// Memory layout of DF is {hi, lo} = 8 bytes; the packed uint64 view puts hi in
-// the low word so both views of a buffer see identical bytes (little-endian).
+// DF 布局为 {hi,lo} 共八字节，小端 uint64 视图的低字存 hi，使两个视图字节完全一致。
 uint64_t packReal(Real v) { return uint64_t(asuint(v.hi)) | (uint64_t(asuint(v.lo)) << 32); }
 Real unpackReal(uint64_t w) { return DF(asfloat(uint(w)), asfloat(uint(w >> 32))); }
 
@@ -79,7 +69,7 @@ void storeAccum(RWStructuredBuffer<AWord> buf, uint i, Real v) { buf[i] = packRe
 void rsincos_raw(Real x, out Real s, out Real c) { df_sincos_impl(x, s, c); }
 [BackwardDerivative(df_rlog_bwd)]
 Real rlog(Real x) {
-    // float log as seed + one Newton step through df_exp
+    // 以 float log 为初值，经 df_exp 做一次 Newton 精化
     DF y = DF(log(x.hi));
     DF u = df_mul(x, df_exp(df_neg(y))) - DF(1.0f);
     return y + u - DF(0.5f) * (u * u);
@@ -93,14 +83,8 @@ float rToFloat(Real x) { return x.hi; }
 #error "define one of REAL_FLOAT / REAL_DOUBLE / REAL_DF"
 #endif
 
-// atan2(r, z) for r >= 0, returning the angle from the +z axis in [0, pi].
-// Generic across all Real configs (SPIR-V has no fp64 inverse-trig): a fp32
-// atan2 gives a ~1e-7 seed, then Newton on g(t) = z*sin t - r*cos t = 0 (whose
-// root is atan2(r,z), with g' = |(r,z)| != 0 for r>0) reaches full Real
-// precision in a few steps, reusing the config's own rsincos. Used by the
-// fisheye camera model. A custom backward derivative supplies the exact
-// dtheta/dr = z/(r^2+z^2), dtheta/dz = -r/(r^2+z^2), so autodiff never
-// differentiates through the Newton loop.
+// r>=0 的 atan2(r,z) 返回 [0,pi]；fp32 初值后对 g(t)=z sin(t)-r cos(t)=0 做 Newton，达到当前 Real 精度。
+// 自定义反向直接使用 dtheta/dr=z/(r²+z²)、dtheta/dz=-r/(r²+z²)，不对迭代过程求导。
 [BackwardDerivative(rAtan2_bwd)]
 Real rAtan2(Real r, Real z) {
     Real theta = Real(atan2(rToFloat(r), rToFloat(z)));

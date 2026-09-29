@@ -1,33 +1,6 @@
-// Keypoint masking: the parts of an image SfM is allowed to use.
-//
-// A mask is a single-channel image; a pixel is *keep* where it is nonzero and
-// *ignore* where it is zero -- COLMAP's ImageReader.mask_path convention and
-// the trainer's. Masking happens once, at extraction: keypoints under a zero
-// pixel are dropped before `features.bin` is written, so every stage downstream
-// (matching, verification, mapping, BA) is masked for free and no stage has to
-// carry mask state.
-//
-// Two things here are deliberately *not* COLMAP's behavior (D39):
-//
-// 1. **Masks are sampled in uv, not in pixels.** COLMAP indexes the mask with
-//    the integer keypoint coordinate (`mask.GetPixel((int)kp.x, (int)kp.y)`,
-//    controllers/feature_extraction.cc MaskFeatures) after rescaling keypoints
-//    back to the *original* image size, so the mask has to match the source
-//    resolution exactly. It routinely does not: masks come out of a
-//    segmentation model at whatever size the model works at (one capture here
-//    ships 1600x1600 masks over 1920x1920 images). COLMAP's out-of-range GetPixel
-//    returns nullopt, which MaskFeatures treats as "masked out", so a mask
-//    smaller than the image silently deletes every keypoint past its extent --
-//    69% of the frame survives in that example and nothing says so. Sampling
-//    normalized coordinates makes the resolutions independent, which is also
-//    what our own --max-image-size downscale needs (our keypoints live in the
-//    decoded frame, not the source frame).
-//
-// 2. **Mask files are found by convention, not by one fixed name.** COLMAP
-//    accepts `<image_name>.png` and `<stem>.png` only. Masks in the wild are
-//    named by whatever produced them; MaskIndex below probes the common
-//    conventions and, failing that, falls back to an index of the mask
-//    directory keyed on progressively-stripped names.
+// 关键点掩码非零保留、零忽略；提取时压缩关键点、描述子和颜色，后续阶段无需携带掩码状态。
+// 按归一化 UV 采样使掩码分辨率独立于图像，例如 1600² 掩码可覆盖 1920² 图像，避免像素索引越界误删特征。
+// 文件查找兼容多种扩展名及 mask 后缀，并以唯一的剥离名称索引回退。
 #pragma once
 
 #include <algorithm>
@@ -44,20 +17,15 @@
 
 namespace sfm {
 
-// Binary mask, row-major, 1 = keep / 0 = ignore.
+// 行主序二值掩码，1 保留，0 忽略。
 struct Mask {
     int width = 0, height = 0;
-    std::vector<uint8_t> bits;  // width*height, strictly 0 or 1
+    std::vector<uint8_t> bits;  // width*height 项，严格为 0 或 1
 
     bool empty() const { return bits.empty(); }
     size_t pixels() const { return (size_t)width * height; }
 
-    // Sample at normalized image coordinates: u,v in [0,1) over the full image
-    // extent, (0,0) at the top-left *corner*. Nearest neighbour -- a mask is
-    // categorical, interpolating it would invent boundary values. Out-of-range
-    // coordinates clamp to the border rather than counting as masked-out: a
-    // keypoint at x = width - 0.2 is inside the image, and COLMAP's habit of
-    // deleting anything its indexing cannot reach is the bug being avoided.
+    // 按整图范围的 u,v∈[0,1) 最近邻采样，左上角为 (0,0)；掩码为分类值不能插值，越界钳位以保留边缘内部关键点。
     bool atUV(float u, float v) const {
         if (empty()) return true;
         int mx = (int)std::floor(u * width);
@@ -67,13 +35,12 @@ struct Mask {
         return bits[(size_t)my * width + mx] != 0;
     }
 
-    // Swap keep and ignore, for the exporters that paint the region to REMOVE.
+    // 交换保留与忽略区域，兼容标记删除区的掩码。
     void invert() {
         for (uint8_t& b : bits) b = (uint8_t)!b;
     }
 
-    // Fraction of the mask that is "keep". Reported so a run that masks away
-    // almost everything (an inverted mask, the classic mistake) is visible.
+    // 返回保留面积比例，便于发现反向掩码等几乎删除全图的问题。
     double keepFraction() const {
         if (empty()) return 1.0;
         size_t n = 0;
@@ -82,23 +49,15 @@ struct Mask {
     }
 };
 
-// Decode a mask image (any format stb_image reads) to strict 0/1. Returns an
-// empty Mask if the file cannot be decoded. Defined in image.cpp, the single
-// translation unit that instantiates stb_image (D5).
+// 将支持的图像格式解码为严格 0/1 掩码，失败返回空；实现位于 Image.cpp。
 Mask loadMask(const std::string& path);
 
-// Drop every keypoint of `fs` that falls on a zero mask pixel, compacting
-// keypoints, descriptors and colors in place. Returns the number removed.
-//
-// Keypoints are in `fs`'s own (post-downscale) pixel frame, so the pixel-center
-// convention -- pixel i covers [i, i+1), center i + 0.5 -- makes uv = (x + 0.5)
-// / width. That is the same convention resizeGray() samples with, so a mask at
-// the image's own resolution masks exactly the pixels a human would expect.
+// 原地删除落在零掩码处的关键点及对应描述子、颜色，返回删除数。
+// 关键点仍在工作图坐标，按像素中心约定 uv=(x+0.5)/width 采样，与 resizeGray 一致。
 inline uint32_t applyMask(FeatureSet& fs, const Mask& m) {
     if (m.empty() || fs.width <= 0 || fs.height <= 0 || fs.keypoints.empty()) return 0;
     const uint32_t n = fs.count();
-    // 0 when the set carries keypoints but no descriptors (synthetic sets built
-    // by the self-tests do this); compacting then has nothing to move.
+    // 合成测试可只有关键点而无描述子，此时每行字节数为 0，无需搬移描述子。
     const size_t dbytes = fs.descriptors.size() >= (size_t)n * fs.dim * dtypeSize(fs.dtype)
                               ? (size_t)fs.dim * dtypeSize(fs.dtype)
                               : 0;
@@ -123,7 +82,7 @@ inline uint32_t applyMask(FeatureSet& fs, const Mask& m) {
     return n - out;
 }
 
-// ---- finding the mask that belongs to an image --------------------------
+// ---------------- 查找图像对应的掩码 ----------------
 
 namespace detail {
 
@@ -132,7 +91,7 @@ inline std::string lowerStr(std::string s) {
     return s;
 }
 
-// Drop one trailing extension, if any ("a/b.jpg.png" -> "a/b.jpg").
+// 移除最后一个扩展名，如 a/b.jpg.png -> a/b.jpg。
 inline std::string stripExt(const std::string& s) {
     size_t dot = s.rfind('.');
     size_t slash = s.find_last_of("/\\");
@@ -140,8 +99,7 @@ inline std::string stripExt(const std::string& s) {
     return s.substr(0, dot);
 }
 
-// Drop a conventional mask marker from the end of a stem
-// ("img_mask" -> "img"). Returns s unchanged when there is none.
+// 移除文件主干末尾常见掩码标记，如 img_mask -> img；不存在时保留原文。
 inline std::string stripMaskTag(const std::string& s) {
     static const char* kTags[] = {"_mask", "-mask", ".mask", "_masks", "_alpha", "_seg"};
     for (const char* t : kTags) {
@@ -156,31 +114,11 @@ inline std::string baseName(const std::string& s) {
     return slash == std::string::npos ? s : s.substr(slash + 1);
 }
 
-}  // namespace detail
+}  // 命名空间 detail
 
-// Maps an image's name (its path relative to the image directory, the same
-// string that ends up in COLMAP's images.bin) to a mask file under `mask_dir`.
-//
-// Resolution is two-tier. First the explicit conventions are probed by
-// filename, cheapest and least surprising first:
-//
-//   masks/<name>.png        "00023.jpg.png"   COLMAP, Spirula Studio, SAM tools
-//   masks/<stem>.png        "00023.png"       COLMAP's alternate, nerfstudio
-//   masks/<stem>_mask.png   "00023_mask.png"  Spirula Studio's suffix form
-//
-// each over {.png,.jpg,.jpeg} in either case, which also covers a mask sharing
-// the image's exact filename. If none exists, a lazily-built index of the mask
-// directory is consulted, keyed on the name with extensions and mask markers
-// progressively stripped -- this is what catches a mask directory that is flat
-// while the images are in sub-folders, or one whose files are `.jpeg` against
-// `.jpg` images. Index hits require the key to be *unique* in the mask
-// directory, so two `00023.png` under different sub-folders never silently pick
-// one for the other.
-//
-// The index is built lazily on the first miss, so `find` is const but not
-// thread-safe. Callers resolve every image's mask up front on one thread (the
-// decode pool then only ever opens the resolved paths), which is also where a
-// mask directory that matches nothing gets reported.
+// 优先按完整图像名加扩展名、主干名、主干加 _mask 查找，支持 png/jpg/jpeg 及大小写形式。
+// 未命中时延迟构建剥离扩展名和掩码后缀的索引，兼容平铺掩码目录；仅接受唯一键，避免同名文件错误配对。
+// find 虽为 const 但延迟建表不具线程安全性，调用方须在单线程中预先解析全部掩码路径。
 class MaskIndex {
 public:
     MaskIndex() = default;
@@ -192,8 +130,7 @@ public:
     bool valid() const { return valid_; }
     const std::filesystem::path& dir() const { return dir_; }
 
-    // Absolute-or-relative path of the mask for `rel_name`, or "" if there is
-    // none. `rel_name` uses '/' separators (generic_string()).
+    // 返回 rel_name 的掩码路径，无匹配时为空；rel_name 使用 / 分隔符。
     std::string find(const std::string& rel_name) const {
         if (!valid_) return "";
         namespace fs = std::filesystem;
@@ -210,7 +147,7 @@ public:
             fs::path p = dir_ / (stem + "_mask" + e);
             if (fs::exists(p, ec)) return p.string();
         }
-        // Fall back to the stripped-name index.
+        // 回退到剥离名称索引。
         if (!indexed_) buildIndex();
         for (const std::string& key : probeKeys(rel_name)) {
             auto it = index_.find(key);
@@ -221,16 +158,14 @@ public:
     }
 
 private:
-    // A key claimed by exactly one mask file (or flagged ambiguous). `level`
-    // records how specific the claim was, so a file that matches by its full
-    // name beats one that only matches after stripping.
+    // 键仅能对应一个文件，否则标为歧义；level 表示匹配具体程度，完整名称优先于剥离后的名称。
     struct Entry {
         std::string rel;
         int level = 0;
         bool ambiguous = false;
     };
 
-    // Keys an image name can be looked up by, most specific first.
+    // 按具体程度降序生成图像名查询键。
     static std::vector<std::string> probeKeys(const std::string& rel_name) {
         using namespace detail;
         const std::string low = lowerStr(rel_name);
@@ -248,7 +183,7 @@ private:
             index_.emplace(key, Entry{rel, level, false});
             return;
         }
-        if (it->second.rel == rel) return;             // same file, another alias
+        if (it->second.rel == rel) return;             // 同一文件的另一别名
         if (level < it->second.level) it->second = Entry{rel, level, false};
         else if (level == it->second.level) it->second.ambiguous = true;
     }
@@ -264,10 +199,8 @@ private:
             const std::string rel = it->path().lexically_relative(dir_).generic_string();
             const std::string low = lowerStr(rel);
             const std::string s1 = stripExt(low);       // "00023.jpg.png" -> "00023.jpg"
-            const std::string s2 = stripExt(s1);        //                 -> "00023"
-            // Levels: 0 = full name, 1 = one extension off, 2 = two off or a
-            // mask marker off, +4 for the basename-only forms (which only ever
-            // resolve a flat mask directory against nested images).
+            const std::string s2 = stripExt(s1);        // 继续剥离得到 00023
+            // 级别 0 为完整名，1 去一层扩展名，2 去两层或掩码标记；仅基本文件名形式加 4。
             claim(low, rel, 0);
             claim(s1, rel, 1);
             claim(s2, rel, 2);
@@ -287,4 +220,4 @@ private:
     mutable std::map<std::string, Entry> index_;
 };
 
-}  // namespace sfm
+}  // 命名空间 sfm

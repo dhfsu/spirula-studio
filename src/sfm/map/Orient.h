@@ -1,12 +1,5 @@
-// The gauge a finished model is written in when nothing measured one.
-//
-// A monocular reconstruction has no absolute orientation, position or scale,
-// so the model is turned so the cameras' mean up axis is +Z, centred on the
-// cameras and sized so the furthest camera coordinate is 1 -- the similarity
-// the trainer computes from the poses it loads -- and then levelled on the
-// ground its points stand on (groundTransform). "Up" from the cameras is a
-// statistical claim about how the capture was held; src/sfm/README.md,
-// "--orient", has the reasoning and `--level cameras` / `--no-orient`.
+// 无外部测量时，将相机平均向上轴对齐 +Z，以相机中心居中并归一化最大坐标，再按点云地面调平。
+// 相机向上轴是持机方式的统计猜测，可用 level=cameras 或 no-orient 调整。
 #pragma once
 
 #include <algorithm>
@@ -21,9 +14,7 @@
 
 namespace sfm {
 
-// The cameras' mean up axis in world coordinates, unnormalized: up is minus the
-// second ROW of R (world -> camera, x right, y DOWN, z forward). `use_exif`
-// takes each image's up from its Orientation tag -- a portrait file's is 90 off.
+// 世界向上方向为世界到相机 R 的第二行取负，平均后未归一化；use_exif 使用各图方向标签，处理竖拍 90 度差。
 inline Vec3 meanCameraUp(const Reconstruction& rec, bool use_exif = false) {
     Vec3 up{0, 0, 0};
     for (const auto& kv : rec.images) {
@@ -31,7 +22,7 @@ inline Vec3 meanCameraUp(const Reconstruction& rec, bool use_exif = false) {
         if (!im.registered) continue;
         double u[3] = {0, -1, 0};
         if (use_exif) exifUpInCamera(im.exif_orientation, u);
-        // R^T u: the camera-frame up written in world coordinates.
+        // R^T u，将相机向上向量写到世界坐标。
         for (int c = 0; c < 3; c++)
             up = up + Vec3{im.pose.R[3 * c] * u[c], im.pose.R[3 * c + 1] * u[c],
                            im.pose.R[3 * c + 2] * u[c]};
@@ -39,7 +30,7 @@ inline Vec3 meanCameraUp(const Reconstruction& rec, bool use_exif = false) {
     return up;
 }
 
-// Rodrigues rotation taking the unit vector `up` onto +Z, about up x z.
+// 用 Rodrigues 绕 up×z 将单位 up 旋至 +Z。
 inline Mat3 rotationUpToZ(const Vec3& up) {
     Vec3 axis{up.y, -up.x, 0.0};
     const double s = std::sqrt(axis.x * axis.x + axis.y * axis.y);
@@ -52,13 +43,12 @@ inline Mat3 rotationUpToZ(const Vec3& up) {
                  axis.x * axis.y * C + axis.z * s, c + axis.y * axis.y * C,      -axis.x * s,
                  -axis.y * s,                   axis.x * s,                       c};
     } else if (c < 0.0) {
-        R = Mat3{1, 0, 0, 0, -1, 0, 0, 0, -1};   // up == -z: flip
+        R = Mat3{1, 0, 0, 0, -1, 0, 0, 0, -1};   // up==-z 时翻转
     }
     return R;
 }
 
-// The similarity turning `rec` by `R`, centred on the cameras and unit-sized.
-// Identity with under two registered images.
+// 按 R 旋转并围绕相机中心归一化，不足两张已配准图时返回恒等。
 inline Sim3 normalizingTransform(const Reconstruction& rec, const Mat3& R) {
     Sim3 T;
     std::vector<Vec3> centers;
@@ -73,9 +63,7 @@ inline Sim3 normalizingTransform(const Reconstruction& rec, const Mat3& R) {
     if (centers.size() < 2) return T;
     mid = mid * (1.0 / (double)centers.size());
 
-    // Scale so the furthest camera coordinate lands on 1. Per component, not
-    // by norm: that is what the trainer does, and the point of doing this here
-    // is that the two agree.
+    // 按最大坐标分量而非欧氏范数缩放到 1，与训练器规范保持一致。
     double max_abs = 0.0;
     for (const Vec3& p : centers) {
         const Vec3 d = mul(R, p - mid);
@@ -89,16 +77,14 @@ inline Sim3 normalizingTransform(const Reconstruction& rec, const Mat3& R) {
     return T;
 }
 
-// The same, turned so that `up` is +Z. Identity when `up` is zero.
+// 将 up 对齐 +Z 的相同变换，up 为零时返回恒等。
 inline Sim3 normalizingTransform(const Reconstruction& rec, const Vec3& up) {
     const double un = up.norm();
     if (!(un > 1e-12)) return Sim3{};
     return normalizingTransform(rec, rotationUpToZ(up * (1.0 / un)));
 }
 
-// Orientation tags for models that did not come from this run's features --
-// `merge` and a resumed `map` read theirs off disk, which records no tag. One
-// image already carrying a turn stops it: the features are the authority.
+// 为磁盘读取模型补 EXIF 方向，若已有图像携带变换标签则以特征为权威，不覆盖。
 inline int fillExifOrientations(std::vector<Reconstruction>& models,
                                 const std::string& imagedir) {
     if (imagedir.empty()) return 0;
@@ -116,15 +102,12 @@ inline int fillExifOrientations(std::vector<Reconstruction>& models,
     return read;
 }
 
-// The same, with up taken from the cameras themselves.
+// 从相机自身获取向上方向。
 inline Sim3 uprightTransform(const Reconstruction& rec, bool use_exif = false) {
     return normalizingTransform(rec, meanCameraUp(rec, use_exif));
 }
 
-// Apply it. Poses and 3D points are the only things in a Reconstruction with
-// world units in them: intrinsics are per-camera, 2D observations are pixels,
-// and a reprojection error is a pixel count -- all unchanged by a change of
-// world gauge, which is the whole reason this is safe to do at the end.
+// 世界规范变换只改位姿、三维点及相应 rig 平移尺度，内参、二维像素和重投影误差不随世界单位改变。
 inline void applySim3(Reconstruction& rec, const Sim3& T) {
     for (auto& kv : rec.images)
         if (kv.second.registered) kv.second.pose = transformPose(T, kv.second.pose);
@@ -132,18 +115,14 @@ inline void applySim3(Reconstruction& rec, const Sim3& T) {
     transformRigs(rec.rigs, T.scale);
 }
 
-// Levelled on the ground the points stand on rather than on how the cameras
-// were held: the editor's Auto align (core/SceneAlign.h). `rec`'s +Z is the
-// prior, and a ground more than 60 degrees from it is not taken.
+// 使用 SceneAlign 的地面几何调平，以当前 +Z 为先验，拒绝偏离超过 60 度的地面。
 struct GroundFit {
-    Sim3 T;               // identity when no ground was found
+    Sim3 T;               // 未找到地面时为恒等变换
     bool found = false;
-    double share = 0.0;   // of the points, on the ground
+    double share = 0.0;   // 落在地面上的点占比
 };
 
-// `full`: ground at z = 0 and level, walls onto the axes, footprint on the
-// origin, scale kept; otherwise only a move along Z putting the ground at 0.
-// `pre` is where the model is about to go, applied to the points sampled.
+// full 模式将地面调平到 z=0、墙面对轴、水平投影居中并保持尺度；否则仅沿 Z 平移。pre 先作用于采样点。
 inline GroundFit groundTransform(const Reconstruction& rec, bool full,
                                  const Sim3& pre = Sim3{}) {
     GroundFit out;
@@ -171,7 +150,7 @@ inline GroundFit groundTransform(const Reconstruction& rec, bool full,
         out.T.t = Vec3{r.T.t[0], r.T.t[1], r.T.t[2]};
         return out;
     }
-    // The plane's height under the middle of the footprint.
+    // 水平投影中心处的平面高度。
     std::vector<double> xs, ys;
     for (int64_t i = 0; i < n; i++) {
         xs.push_back(pts[(size_t)i * 3]);
@@ -185,4 +164,4 @@ inline GroundFit groundTransform(const Reconstruction& rec, bool full,
     return out;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

@@ -1,17 +1,11 @@
 #pragma once
-// Double-precision transcendentals for the SPIR-V target.
-//
-// GLSL.std.450 only defines Exp/Log/Sin/Cos for 16/32-bit floats (Sqrt and
-// Fma are fine on doubles), and slangc would otherwise emit invalid SPIR-V.
-// These use standard argument reduction + near-minimax (Chebyshev) fits on
-// the reduced range (fewer terms than Taylor at the same interval accuracy;
-// a couple of ulps, plenty for BA). All carry custom derivatives so they can
-// be used inside [Differentiable] code.
+// SPIR-V 的双精度超越函数：标准扩展只提供 16/32 位 Exp/Log/Sin/Cos，因此采用参数约简与 Chebyshev 近似，误差约数 ULP。
+// 所有函数带自定义导数，可用于可微代码；double 的 Sqrt/Fma 可直接使用。
 
 static const double kDInvLn2 = 1.442695040888963387;
-static const double kDLn2Hi = 0.69314718048553913832;   // 32 high bits
+static const double kDLn2Hi = 0.69314718048553913832;   // 高 32 位
 static const double kDLn2Lo = 7.4406171100123968474e-11;
-// exp(r), |r| <= ln2/2: degree 11, max rel err 4.2e-18
+// exp(r)，|r|<=ln2/2，十一次多项式，最大相对误差 4.2e-18
 static const double kDExpCoef[12] = {
     0.99999999999999999693, 0.99999999999999999976, 0.50000000000000183855,
     0.16666666666666680806, 0.041666666666488095495, 0.0083333333333196006109,
@@ -20,7 +14,7 @@ static const double kDExpCoef[12] = {
 };
 
 double dbl_ldexp(double x, int k) {
-    // x * 2^k via exponent bits (k clamped well inside range by callers)
+    // 通过指数位实现 x*2^k，调用方将 k 限制在安全范围内
     uint hi = uint((1023 + k) << 20);
     return x * asdouble(0u, hi);
 }
@@ -44,7 +38,7 @@ void dbl_exp_bwd(inout DifferentialPair<double> x, double g) {
 
 [BackwardDerivative(dbl_log_bwd)]
 double dbl_log(double x) {
-    // float log as seed, one refinement step: log(x) = y + (x e^-y - 1) - (..)^2/2
+    // 以 float log 为初值，精化 log(x)=y+(x e^-y-1)-(... )²/2。
     double y = double(log(float(x)));
     double u = x * dbl_exp(-y) - 1.0;
     return y + u - 0.5 * u * u;
@@ -57,8 +51,7 @@ static const double kDTwoOverPi = 0.63661977236758138243;
 static const double kDPiO2_1 = 1.5707963267341256142;
 static const double kDPiO2_2 = 6.0771005035934605454e-11;
 static const double kDPiO2_3 = 2.9127320560933560353e-20;
-// sin(r)/r and cos(r) as polynomials in s = r^2 <= (pi/4)^2: degree 6 / 7,
-// max rel err 3.5e-18 / 4.3e-20
+// sin(r)/r 与 cos(r) 对 s=r²<=(pi/4)² 分别用六次/七次多项式，最大相对误差 3.5e-18/4.3e-20。
 static const double kDSinCoef[7] = {
     0.99999999999999999685, -0.16666666666666616666, 0.0083333333333203624567,
     -0.00019841269828650300013, 2.7557313376400129128e-6, -2.5050716974102745028e-8,

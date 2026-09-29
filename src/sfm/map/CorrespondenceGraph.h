@@ -1,15 +1,5 @@
-// Correspondence graph: for every (image, feature), the set of features in
-// other images it is matched to (COLMAP's scene/correspondence_graph).
-// Built from the verified two-view matches; the incremental mapper
-// queries it to find 2D-3D correspondences (register-next) and to grow tracks
-// (triangulation).
-//
-// Stored per image as CSR -- one offsets array over the image's features plus
-// one flat correspondence array -- rather than a vector per feature. A large
-// capture has millions of features and tens of millions of correspondences, so
-// the vector-per-feature layout spent a heap allocation and 24 bytes of header
-// on each of them, and made the mapper's innermost loops chase a pointer per
-// feature. `at()` returns a view over the flat array; every caller iterates.
+// 由已验证匹配构建逐（图像，特征）的对应图，供增量配准查找二维、三维对应及三角化扩展轨迹。
+// 每图使用 CSR 偏移加连续对应数组，避免数百万特征各自分配向量及 24 字节头部，at 返回连续视图。
 #pragma once
 
 #include <cstdint>
@@ -24,7 +14,7 @@ struct Correspondence {
     uint32_t feature_idx;
 };
 
-// Contiguous run of correspondences for one (image, feature).
+// 单个（图像，特征）的连续对应区间。
 struct CorrespondenceView {
     const Correspondence* first = nullptr;
     const Correspondence* last = nullptr;
@@ -36,15 +26,14 @@ struct CorrespondenceView {
 
 class CorrespondenceGraph {
 public:
-    // `num_features[i]` = feature count of image i (matching db.images order).
+    // num_features 与 db.images 同序，保存逐图像特征数。
     void build(const MatchesDatabase& db, const std::vector<uint32_t>& num_features) {
         const size_t n = num_features.size();
         starts_.assign(n, {});
         data_.assign(n, {});
         for (size_t i = 0; i < n; i++) starts_[i].assign((size_t)num_features[i] + 1, 0);
 
-        // Count, prefix-sum, scatter. The +1 offset in the counting pass makes
-        // the prefix sum land directly in the final offsets array.
+        // 计数、前缀和、散射；计数写到下一槽，使前缀和直接成为最终偏移表。
         for (const TwoViewMatches& p : db.pairs)
             for (const FeatureMatch& m : p.matches) {
                 if (m.idx1 + 1 >= starts_[p.image1].size() ||
@@ -82,10 +71,9 @@ public:
     }
 
 private:
-    // Per image: offsets over the image's features (num_features+1 entries) and
-    // the correspondences they index into.
+    // 每图像保存 num_features+1 个偏移及其索引的对应数组。
     std::vector<std::vector<uint32_t>> starts_;
     std::vector<std::vector<Correspondence>> data_;
 };
 
-}  // namespace sfm
+}  // 命名空间 sfm

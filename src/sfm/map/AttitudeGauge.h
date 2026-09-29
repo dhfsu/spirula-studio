@@ -1,8 +1,5 @@
-// The gauge from the attitude each image records (core/Attitude.h): up from
-// its pitch and roll, north from its yaw. Every registered image carrying one
-// votes, and a set the reconstruction contradicts is refused rather than
-// averaged. Orient.h guesses up from how the cameras were held; this measures
-// it, which a capture looking down, or one a gimbal turned upside down, needs.
+// 根据图像记录的俯仰、滚转确定向上方向，偏航确定北向；与重建矛盾的姿态集合拒绝使用。
+// 这是姿态测量而非按持机方向猜测，适用于俯拍或云台倒置。
 #pragma once
 
 #include <cmath>
@@ -20,15 +17,14 @@
 
 namespace sfm {
 
-// Camera -> east-north-up, for each registered image that records an attitude.
+// 每张含姿态的已配准图像，相机到东、北、上坐标的旋转。
 struct AttitudeRef {
     std::vector<uint32_t> image_ids;
     std::vector<Mat3> world_from_cam;
     int registered = 0;
 };
 
-// `pixels_turned` is `--exif-orientation apply`, under which a model camera is
-// the turned frame rather than the one the attitude describes.
+// pixels_turned 表示已应用 EXIF 像素旋转，模型相机系与原姿态记录坐标系不同。
 inline AttitudeRef attitudeRefFromImages(const Reconstruction& rec, const std::string& image_dir,
                                          bool pixels_turned) {
     AttitudeRef ref;
@@ -48,17 +44,16 @@ inline AttitudeRef attitudeRefFromImages(const Reconstruction& rec, const std::s
 enum class AttitudeFail { None, Few, Disagree };
 
 struct AttitudeFit {
-    bool ok = false;        // T levels the model
-    bool north = false;     // ... and turns north onto +Y
+    bool ok = false;        // T 将模型调平
+    bool north = false;     // 并将北向旋至 +Y
     AttitudeFail reason = AttitudeFail::Few;
     AttitudeFail north_reason = AttitudeFail::None;
     Sim3 T;
-    UpConsensus up;         // in the model's frame
-    UpConsensus heading;    // (cos, sin, 0) of the turn about the levelled +Z
+    UpConsensus up;         // 位于模型坐标系
+    UpConsensus heading;    // 绕调平后 +Z 旋转的 (cos,sin,0)
 };
 
-// A vote more than 10 degrees off is an outlier (consensusUp); a set with more
-// outliers than inliers is one the model contradicts, not one to average.
+// 偏离超过 10 度视为离群；离群多于内点时拒绝整组，而非强行平均。
 inline bool attitudeMajority(const UpConsensus& u) {
     return u.ok && 2 * u.outliers <= u.votes;
 }
@@ -74,7 +69,7 @@ inline AttitudeFit fitAttitudeGauge(const Reconstruction& rec, const AttitudeRef
         const Mat3& w = ref.world_from_cam[k];
         W.push_back(w);
         R.push_back(it->second.pose.R);
-        // World +Z in the camera is the third row of camera -> world.
+        // 世界 +Z 在相机中的方向为相机到世界矩阵的第三行。
         votes.push_back(mul(transpose(R.back()), Vec3{w[6], w[7], w[8]}));
     }
     if (votes.size() < 3) return fit;
@@ -88,7 +83,7 @@ inline AttitudeFit fitAttitudeGauge(const Reconstruction& rec, const AttitudeRef
     if (north) {
         std::vector<Vec3> hv;
         for (size_t k = 0; k < W.size(); k++) {
-            // East-north-up from the levelled model: a turn about +Z, up to noise.
+            // 调平模型到东、北、上的变换，在噪声范围内仅绕 +Z 旋转。
             const Mat3 E = mul(W[k], mul(R[k], transpose(level)));
             const double a = std::atan2(E[3] - E[1], E[0] + E[4]);
             hv.push_back({std::cos(a), std::sin(a), 0});
@@ -108,4 +103,4 @@ inline AttitudeFit fitAttitudeGauge(const Reconstruction& rec, const AttitudeRef
     return fit;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

@@ -1,10 +1,4 @@
-// Small dense linear algebra for the geometry estimators (host only, no Eigen).
-//
-// Just enough for two-view geometry: fixed 2/3-vectors and 3x3 matrices, a
-// cyclic Jacobi eigensolver for symmetric n x n (n <= 9, used for DLT null
-// spaces via A^T A), and a 3x3 SVD built on it (rank-2 enforcement, essential/
-// homography decomposition). Accuracy over speed -- these run on RANSAC-sized
-// samples, not in a hot loop.
+// 主机小型稠密线性代数，不依赖 Eigen，提供二维/三维向量、3×3 矩阵、对称 Jacobi 特征分解和 3×3 SVD，供几何估计使用。
 #pragma once
 
 #include <algorithm>
@@ -34,12 +28,12 @@ struct Vec3 {
     }
 };
 
-// 3x3, row-major.
+// 3×3，行主序。
 using Mat3 = std::array<double, 9>;
 
 inline Mat3 mat3Identity() { return {1, 0, 0, 0, 1, 0, 0, 0, 1}; }
 
-// [v]_x, the matrix with [v]_x u == v x u.
+// 叉乘矩阵 [v]_x，满足 [v]_x u=v×u。
 inline Mat3 crossMatrix(const Vec3& v) {
     return {0, -v.z, v.y, v.z, 0, -v.x, -v.y, v.x, 0};
 }
@@ -87,20 +81,16 @@ inline Mat3 inverse3(const Mat3& A, bool* ok = nullptr) {
     return C;
 }
 
-// Cyclic Jacobi eigen-decomposition of a symmetric n x n matrix (row-major in
-// `A`, destroyed). Eigenvalues -> w[n], eigenvectors -> columns of V[n*n].
-// Not sorted. This form allocates nothing, for callers in a hot loop.
+// 原地循环 Jacobi 分解对称 n×n 行主序 A；特征值写 w，特征向量为 V 的列，不排序且不分配内存。
 inline void jacobiEigenSymmetric(double* A, int n, double* w, double* V) {
     for (int i = 0; i < n; i++) w[i] = 0;
     for (size_t i = 0; i < (size_t)n * n; i++) V[i] = 0;
     for (int i = 0; i < n; i++) V[(size_t)i * n + i] = 1.0;
 
-    // Convergence is measured against the matrix's own scale. The old test was
-    // the absolute `off < 1e-30`, which a badly scaled A never reaches, so it
-    // burned all 100 sweeps every call (D24).
+    // 按矩阵自身尺度判断收敛；绝对阈值可能使病态尺度矩阵每次耗尽 100 轮（D24）。
     double frob2 = 0;
     for (size_t i = 0; i < (size_t)n * n; i++) frob2 += A[i] * A[i];
-    if (!(frob2 > 0)) return;  // zero matrix: eigenvalues 0, V = I
+    if (!(frob2 > 0)) return;  // 零矩阵的特征值为 0，V=I
     const double tol = 1e-30 * frob2;
 
     for (int sweep = 0; sweep < 50; sweep++) {
@@ -108,21 +98,16 @@ inline void jacobiEigenSymmetric(double* A, int n, double* w, double* V) {
         for (int p = 0; p < n; p++)
             for (int q = p + 1; q < n; q++) off += A[(size_t)p * n + q] * A[(size_t)p * n + q];
         if (off <= tol) break;
-        // Classic threshold strategy: while still far from converged, only
-        // rotate the off-diagonals that carry real weight.
+        // 远离收敛时仅旋转足够大的非对角项。
         const double tresh = sweep < 3 ? 0.2 * off / ((double)n * n) : 0.0;
 
         for (int p = 0; p < n; p++)
             for (int q = p + 1; q < n; q++) {
                 double apq = A[(size_t)p * n + q];
-                if (apq * apq <= tresh * tresh) continue;  // also skips apq == 0
+                if (apq * apq <= tresh * tresh) continue;  // 同时跳过 apq==0
                 double app = A[(size_t)p * n + p], aqq = A[(size_t)q * n + q];
-                // Rotation from the standard tangent form instead of
-                // atan2/cos/sin: with theta = cot(2 phi),
-                //   t = tan(phi) = sign(theta) / (|theta| + sqrt(theta^2 + 1))
-                // is the same rotation on the |phi| <= pi/4 branch, for one
-                // sqrt instead of three transcendental calls. This is the inner
-                // loop of every RANSAC trial, so it dominates verification.
+                // 用 t=sign(theta)/(|theta|+sqrt(theta^2+1))，theta=cot(2 phi)，得到 |phi|<=pi/4 分支的相同旋转。
+                // 一次 sqrt 替代 atan2/cos/sin，降低 RANSAC 高频内循环开销。
                 double theta = 0.5 * (aqq - app) / apq;
                 double t = (theta >= 0 ? 1.0 : -1.0) /
                            (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
@@ -155,22 +140,11 @@ inline void jacobiEigenSymmetric(std::vector<double>& A, int n, std::vector<doub
     jacobiEigenSymmetric(A.data(), n, w.data(), V.data());
 }
 
-// Exact null space of an m x 9 matrix with m < 9, by Householder QR of A^T.
-//
-// A minimal RANSAC sample gives a constraint matrix that is rank deficient *by
-// construction*, so its null space is exact and needs no iteration at all. That
-// matters because this is the overwhelming majority of calls and the iterative
-// A^T A + Jacobi path below was, measured, essentially the entire cost of
-// geometric verification (D27).
-//
-// A^T = Q^T R with Q = H_{m-1} ... H_0, so the first m rows of Q span the row
-// space of A and rows m..8 span its null space. Q is a product of Householder
-// reflections, hence orthogonal whatever the input: a degenerate sample yields
-// vectors that are still orthonormal but no longer span the null space, and
-// RANSAC scores and discards the resulting model exactly as it would any other.
+// m<9 时对 A^T 做 Householder QR 直接求精确零空间，避免最小 RANSAC 样本反复迭代特征分解。
+// A^T=Q^T R，Q 前 m 行张成行空间，后续行张成零空间；退化样本仍产生正交向量，由 RANSAC 评分淘汰。
 inline std::vector<std::array<double, 9>> nullSpaceQR9(const std::vector<double>& A, int m,
                                                        int count) {
-    double M[9][9] = {};  // A^T, 9 x m
+    double M[9][9] = {};  // A^T，尺寸 9×m
     for (int r = 0; r < m; r++)
         for (int c = 0; c < 9; c++) M[c][r] = A[(size_t)r * 9 + c];
     double Q[9][9] = {};
@@ -180,8 +154,8 @@ inline std::vector<std::array<double, 9>> nullSpaceQR9(const std::vector<double>
         double nrm = 0;
         for (int i = k; i < 9; i++) nrm += M[i][k] * M[i][k];
         nrm = std::sqrt(nrm);
-        if (!(nrm > 1e-300)) continue;  // column already eliminated
-        // Reflect away from the larger component to avoid cancellation.
+        if (!(nrm > 1e-300)) continue;  // 该列已消去
+        // 沿较大分量方向反射，避免消减误差。
         const double alpha = M[k][k] > 0 ? -nrm : nrm;
         double v[9] = {};
         for (int i = k; i < 9; i++) v[i] = M[i][k];
@@ -189,13 +163,13 @@ inline std::vector<std::array<double, 9>> nullSpaceQR9(const std::vector<double>
         double vn = 0;
         for (int i = k; i < 9; i++) vn += v[i] * v[i];
         if (!(vn > 1e-300)) continue;
-        for (int c = k; c < m; c++) {  // apply H to the remaining columns of M
+        for (int c = k; c < m; c++) {  // 将 H 应用到 M 剩余列
             double d = 0;
             for (int i = k; i < 9; i++) d += v[i] * M[i][c];
             d = 2 * d / vn;
             for (int i = k; i < 9; i++) M[i][c] -= d * v[i];
         }
-        for (int c = 0; c < 9; c++) {  // accumulate H into Q
+        for (int c = 0; c < 9; c++) {  // 将 H 累积到 Q
             double d = 0;
             for (int i = k; i < 9; i++) d += v[i] * Q[i][c];
             d = 2 * d / vn;
@@ -212,15 +186,10 @@ inline std::vector<std::array<double, 9>> nullSpaceQR9(const std::vector<double>
     return out;
 }
 
-// Right null vector(s) of an m x 9 matrix A: the eigenvectors of A^T A with the
-// `count` smallest eigenvalues, smallest first. Returns count vectors of len 9.
+// 求 A^T A 的 count 个最小特征值对应向量，按升序返回长度 9 的右零空间候选。
 inline std::vector<std::array<double, 9>> nullVectors9(const std::vector<double>& A, int m,
                                                        int count) {
-    // Under-determined: take the exact null space directly rather than iterate
-    // an eigensolver for it (D27). Over-determined systems fall through -- there
-    // the answer is the *smallest singular vector*, not a null space, and only
-    // the eigendecomposition gives it. That is the local-optimization refit,
-    // which runs ~10 times per pair against the minimal solver's ~10000.
+    // 欠定最小样本直接用精确零空间；超定重拟合需最小奇异向量，仍用特征分解。后者每对约十次，最小解约上万次（D27）。
     if (m < 9 && count <= 9 - m) return nullSpaceQR9(A, m, count);
 
     std::vector<double> ata((size_t)9 * 9, 0.0);
@@ -232,7 +201,7 @@ inline std::vector<std::array<double, 9>> nullVectors9(const std::vector<double>
         }
     std::vector<double> w, V;
     jacobiEigenSymmetric(ata, 9, w, V);
-    // indices of ascending eigenvalue
+    // 按特征值升序的索引
     std::array<int, 9> idx{0, 1, 2, 3, 4, 5, 6, 7, 8};
     std::sort(idx.begin(), idx.end(), [&](int a, int b) { return w[a] < w[b]; });
     std::vector<std::array<double, 9>> out;
@@ -244,8 +213,7 @@ inline std::vector<std::array<double, 9>> nullVectors9(const std::vector<double>
     return out;
 }
 
-// Smallest right singular vector of a rows x cols matrix (row-major `A`), via
-// the smallest eigenvector of A^T A. `cols` up to ~16.
+// 通过 A^T A 最小特征向量求 rows×cols 矩阵的最小右奇异向量，cols 约不超过 16。
 inline std::vector<double> nullspaceVector(const std::vector<double>& A, int rows, int cols) {
     std::vector<double> ata((size_t)cols * cols, 0.0);
     for (int i = 0; i < cols; i++)
@@ -264,15 +232,14 @@ inline std::vector<double> nullspaceVector(const std::vector<double>& A, int row
     return v;
 }
 
-// SVD of a 3x3 matrix: A = U * diag(s) * V^T, singular values descending,
-// U and V orthonormal. Built from the symmetric eigen-decomposition of A^T A.
+// 3×3 SVD：A=U diag(s)V^T，奇异值降序，U/V 正交，由 A^T A 对称特征分解构造。
 struct Svd3 {
     Mat3 U, V;
     Vec3 s;
 };
 
 inline Svd3 svd3(const Mat3& A) {
-    // V and s^2 from eigen(A^T A)
+    // 由 eigen(A^T A) 得到 V 与 s^2
     Mat3 AtA = mul(transpose(A), A);
     std::vector<double> M(AtA.begin(), AtA.end()), w, Vv;
     jacobiEigenSymmetric(M, 3, w, Vv);
@@ -286,38 +253,24 @@ inline Svd3 svd3(const Mat3& A) {
         (&r.s.x)[c] = std::sqrt(std::max(0.0, w[idx[c]]));
         vcol[c] = {Vv[0 * 3 + idx[c]], Vv[1 * 3 + idx[c]], Vv[2 * 3 + idx[c]]};
     }
-    // V columns
+    // V 的列
     for (int c = 0; c < 3; c++) {
         r.V[0 * 3 + c] = vcol[c].x;
         r.V[1 * 3 + c] = vcol[c].y;
         r.V[2 * 3 + c] = vcol[c].z;
     }
-    // U columns = A v_c / s_c, completing any direction whose singular value is
-    // numerically zero.
-    //
-    // The cutoff has to be RELATIVE, and generous. s_c comes from the square
-    // root of an eigenvalue of A^T A, so an eigenvalue carrying the usual ~eps
-    // relative error surfaces as a singular value of about sqrt(eps)*s_max,
-    // i.e. ~1e-8*s_max, not ~1e-16*s_max. The old absolute `1e-12` therefore
-    // classified an exactly rank-deficient A as full rank and divided
-    // A*v_c (~1e-17) by ~1e-8, yielding a ZERO column in U -- a silently
-    // non-orthonormal "SVD". That is not cosmetic: it broke the essential
-    // matrix decomposition, whose input is always rank 2, for ~46% of poses
-    // (D25).
+    // U 列为 A v_c/s_c，数值零奇异值需补齐方向；阈值必须相对 s_max，因 A^T A 误差开方后为约 1e-8*s_max。
+    // 过小绝对阈值会误判秩并产生零列，曾破坏约 46% 的本质矩阵位姿分解（D25）。
     const double sigTol = 1e-6 * r.s.x;
 
     Vec3 ucol[3]{};
     bool have[3] = {false, false, false};
 
-    // Trusted directions, largest singular value first, Gram-Schmidt'd as we
-    // go. The orthogonalization is not redundant: u_c = A v_c / s_c amplifies
-    // rounding by s_max/s_c, so a direction just above the cutoff can come out
-    // 1e-10 off orthogonal. Re-orthonormalizing costs nothing here and it is
-    // what makes U an actual rotation for the callers that need one.
+    // 从最大奇异值的可靠方向开始 Gram-Schmidt；除以小 s_c 会放大舍入，即使非零列也须重新正交化。
     for (int c = 0; c < 3; c++) {
         double sig = (&r.s.x)[c];
         if (sig <= sigTol) {
-            (&r.s.x)[c] = 0.0;  // it is zero; report it as zero
+            (&r.s.x)[c] = 0.0;  // 数值为零，明确返回零
             continue;
         }
         Vec3 u = mul(A, vcol[c]) * (1.0 / sig);
@@ -328,12 +281,10 @@ inline Svd3 svd3(const Mat3& A) {
             ucol[c] = u * (1.0 / n);
             have[c] = true;
         } else {
-            (&r.s.x)[c] = 0.0;  // numerically dependent on an earlier column
+            (&r.s.x)[c] = 0.0;  // 与前列数值线性相关
         }
     }
-    // Complete the remaining directions with whichever axis is furthest from
-    // the span of what we already have. Works at any rank, unlike the old
-    // cross-product special case that assumed exactly rank 2.
+    // 选择最远离现有张成空间的坐标轴补齐方向，适用于任意秩。
     const Vec3 axes[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
     for (int c = 0; c < 3; c++) {
         if (have[c]) continue;
@@ -347,7 +298,7 @@ inline Svd3 svd3(const Mat3& A) {
             if (n > bestNorm) { bestNorm = n; best = v; }
         }
         ucol[c] = bestNorm > 1e-12 ? best.normalized() : Vec3{0, 0, 1};
-        have[c] = true;  // later completions stay orthogonal to it
+        have[c] = true;  // 后续补齐方向保持与该列正交
     }
     for (int c = 0; c < 3; c++) {
         r.U[0 * 3 + c] = ucol[c].x;
@@ -357,4 +308,4 @@ inline Svd3 svd3(const Mat3& A) {
     return r;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

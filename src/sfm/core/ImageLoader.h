@@ -1,36 +1,6 @@
-// Memory-bounded parallel image decode for batch stages.
-//
-// `loadGrayImage` (stb_image, single-threaded) is the largest single cost in
-// `spirula-sfm extract` on real captures -- ~66% of the stage on 17 MP JPEGs against
-// 47 ms of GPU SIFT per image (src/sfm/README.md). The GPU side owns
-// one VkContext and must stay on one thread, so decode is the part that gets a
-// pool: workers decode ahead while the caller drives the GPU.
-//
-// The hard constraint is that this has to survive a few thousand 20 MP images,
-// where naive "decode everything on all cores" needs tens of GB. Two things
-// bound it:
-//
-//   * Delivery is strictly in input order, so the caller keeps the largest-first
-//     ordering that lets SiftExtractor allocate device buffers exactly once.
-//     Workers claim indices monotonically and block until the consumer is
-//     within `window` of them, so the in-flight set is a bounded sliding window
-//     rather than the whole dataset.
-//   * `window` and the thread count are *derived from a byte budget* and the
-//     largest image's dimensions, not fixed. Peak RSS is therefore roughly
-//     constant in the number of images.
-//
-// Both halves of that second point are load-bearing and were both wrong once:
-// a fixed 1 GiB budget against a 7 B/source-pixel decode gave 3 threads on 21
-// MP JPEGs, and extraction ran at 0.18 s/image with neither the CPU nor the
-// GPU busy. The budget now comes from the machine (defaultDecodeBudget) and
-// the per-decode peak from what is actually held (see below), which on a
-// 32-core box is 32 threads and a GPU-bound stage.
-//
-// Peak accounting per concurrent decode is stb's 3-byte RGB buffer at the
-// *source* resolution plus the downscaled outputs it is resampled into; a
-// decoded image waiting in the window costs the downscaled float image
-// (4 B/px). loadGrayImage() resamples straight out of the RGB buffer
-// (sfm/core/Image.cpp), so no full-resolution float image is ever held.
+// 受内存预算约束的并行图像解码；1700 万像素 JPEG 上解码约占提取阶段 66%，GPU SIFT 约每图 47 ms，因此 CPU 预解码与单线程 GPU 驱动重叠。
+// 按输入顺序交付，工作线程受有限滑动窗口约束；线程数和窗口大小由机器预算及最大图像决定，峰值内存不随图像总数增长。
+// 每次解码持有源 RGB 的 3 B/像素及缩小输出，不构造全尺寸 float；固定 1 GiB 曾使 2100 万像素数据仅能三线程，按物理内存分配后可利用 32 核并使提取受 GPU 限制。
 #pragma once
 
 #include <algorithm>
@@ -52,58 +22,42 @@
 namespace sfm {
 
 struct ImageLoadOptions {
-    int max_image_size = 3200;    // long-edge clamp, COLMAP's default
-    int num_threads = 0;          // 0 = hardware_concurrency, 1 = decode inline
-    bool want_color = false;      // also decode a downscaled RGB buffer (for point colors)
-    // The files' colour space; decoded pixels are converted to sRGB.
+    int max_image_size = 3200;    // 最长边限制，采用 COLMAP 默认值
+    int num_threads = 0;          // 0 使用 hardware_concurrency，1 在调用线程解码
+    bool want_color = false;      // 同时解码缩小 RGB 供点云着色
+    // 下列选项描述输入色彩空间，解码时统一转换为 sRGB。
     std::string gamut;
     std::optional<bool> is_linear;
-    // Keypoint masks (sfm/core/Mask.h), one per entry of the `paths` passed to
-    // loadImagesInOrder and in the same order; "" means "no mask for this
-    // image". Empty (the default) skips mask decoding entirely. Masks are
-    // decoded on the pool with their image because they are PNGs of the same
-    // order of magnitude -- doing them serially on the consumer thread would
-    // hand the GPU stage back the decode cost the pool exists to hide.
+    // 掩码路径与输入 paths 一一对应，空字符串表示该图无掩码，空列表完全跳过掩码。
+    // 掩码与图像在池中并行解码，避免消费者线程串行 PNG 解码重新阻塞 GPU。
     std::vector<std::string> mask_paths;
-    // Swap keep and ignore in every decoded mask (sfm/core/Mask.h). On the pool
-    // rather than the consumer thread, which the mask decode is already on.
+    // 在解码池内反转掩码保留与忽略区域。
     bool flip_mask = false;
-    // Turn every image by its EXIF Orientation (sfm/core/Image.h).
+    // 按 EXIF Orientation 旋转图像。
     bool apply_exif_orientation = false;
-    // Host memory the decoder may use for in-flight images. Half is charged to
-    // concurrent decodes, half to the ready window; both are then at least 1,
-    // so a single image larger than the budget still loads (it just runs alone).
-    //
-    // 0 = derive it from the machine (defaultDecodeBudget below). A fixed 1 GiB
-    // was the old default; it is the right answer on a 17 MP capture with four
-    // cores and badly wrong on a 21 MP one with thirty-two, where it held the
-    // pool to 3 decode threads while the GPU waited. The budget is what bounds
-    // peak RSS, so it belongs to the machine, not to the code.
+    // 内存预算一半用于并发解码，一半用于就绪窗口，两者至少为 1，超预算单图仍可独占加载；0 根据机器估算。
+    // 固定 1 GiB 对 32 核大图曾仅允许三线程，预算必须随机器调整。
     size_t memory_budget_bytes = 0;
 };
 
-// A quarter of physical RAM, clamped to [1 GiB, 8 GiB]. The decoder's peak
-// in-flight set is bounded by this, so it is peak *anonymous* RSS for the
-// stage; a quarter leaves the page cache the room it needs to keep serving the
-// very files being decoded. Falls back to the historical 1 GiB when the
-// platform will not say how much memory it has.
+// 默认物理内存的四分之一，限制在 1–8 GiB，为页缓存留空间；无法查询时使用 1 GiB。
 inline size_t defaultDecodeBudget() {
     const size_t total = physicalRamBytes();
     if (total == 0) return 1ull << 30;
     return std::min<size_t>(std::max<size_t>(total / 4, 1ull << 30), 8ull << 30);
 }
 
-// What the pool decided, for logging.
+// 解码计划的实际决策，供日志显示。
 struct ImageLoadPlan {
     int num_threads = 1;
     int window = 1;
-    size_t decode_peak_bytes = 0;  // per concurrent decode, largest image
-    size_t held_bytes = 0;         // per image waiting in the window
+    size_t decode_peak_bytes = 0;  // 最大图像的单次并发解码内存
+    size_t held_bytes = 0;         // 窗口中单张就绪图像的内存
 };
 
 namespace detail {
 
-// Downscaled size after the long-edge clamp.
+// 按最长边限制后的尺寸。
 inline void clampedSize(int w, int h, int max_image_size, int& dw, int& dh) {
     dw = w;
     dh = h;
@@ -115,10 +69,9 @@ inline void clampedSize(int w, int h, int max_image_size, int& dw, int& dh) {
     }
 }
 
-}  // namespace detail
+}  // 命名空间 detail
 
-// Derive thread count and window from the budget and the largest input.
-// `dims` are the probed (width, height) of every image, in any order.
+// 根据预算与最大输入推导线程数和窗口，dims 为各图像探测宽高，顺序不限。
 inline ImageLoadPlan planImageLoad(const std::vector<std::pair<int, int>>& dims,
                                    const ImageLoadOptions& opt) {
     ImageLoadPlan plan;
@@ -129,19 +82,12 @@ inline ImageLoadPlan planImageLoad(const std::vector<std::pair<int, int>>& dims,
         detail::clampedSize(d.first, d.second, opt.max_image_size, dw, dh);
         maxOutPix = std::max(maxOutPix, (size_t)dw * (size_t)dh);
     }
-    // stb RGB at the source resolution (3 B/src px), plus the downscaled gray
-    // float (4 B/out px) it is resampled into and, with want_color, the
-    // downscaled color buffer built before the RGB is freed (3 B/out px). A
-    // mask, when one is requested, is charged 2 B/px of the *decoded* size: 1 B
-    // for stb's gray read plus 1 B for the binarized copy. Masks are not
-    // header-probed, so this is an estimate -- they are segmentation output at
-    // or below the image resolution in every convention we have seen, and
-    // 1 B/px against the image's 3 B/px leaves the budget dominated by the
-    // image either way.
+    // 峰值包括源 RGB 的 3 B/像素、输出灰度的 4 B/像素及可选 RGB 的 3 B/像素；掩码估计解码尺寸每像素 2 B，分别用于灰度和二值副本。
+    // 掩码通常不大于源图，未额外探测其头部，预算仍由图像主导。
     const size_t mask_bytes = opt.mask_paths.empty() ? 0 : maxOutPix * 2;
     plan.decode_peak_bytes =
         maxPix * 3 + maxOutPix * (opt.want_color ? 7 : 4) + mask_bytes;
-    plan.held_bytes = maxOutPix * (opt.want_color ? 7 : 4)  // gray float (+ RGB u8)
+    plan.held_bytes = maxOutPix * (opt.want_color ? 7 : 4)  // 灰度 float，加可选 RGB uint8
                     + (opt.mask_paths.empty() ? 0 : maxOutPix);
 
     unsigned hc = std::thread::hardware_concurrency();
@@ -152,20 +98,14 @@ inline ImageLoadPlan planImageLoad(const std::vector<std::pair<int, int>>& dims,
 
     int by_mem = (int)std::max<size_t>(1, half / plan.decode_peak_bytes);
     plan.num_threads = std::max(1, std::min(want, by_mem));
-    // The window must cover every worker or a worker could block on an index
-    // the consumer is waiting for. Beyond that it is pure decode-ahead slack.
+    // 窗口必须覆盖所有工作线程，否则消费者等待的索引可能被窗口门限阻塞；额外窗口仅用于预解码。
     int win_by_mem = (int)std::max<size_t>(1, half / plan.held_bytes);
     plan.window = std::max(plan.num_threads, std::min(2 * plan.num_threads, win_by_mem));
     return plan;
 }
 
-// Decode `paths` on the pool and hand each image to `consume(index, image)`
-// **on the calling thread, in input order**. A file that fails to decode is
-// reported through `on_error(index, message)` (if given) and skipped rather
-// than aborting the batch -- one bad file in a thousand should not lose the run.
-//
-// `plan` comes from planImageLoad(); pass the one you logged so the numbers the
-// user sees are the numbers in force.
+// 工作池解码后，在调用线程按输入顺序执行 consume；坏文件经 on_error 报告后跳过，不中断整批。
+// 传入已记录日志的 plan，保证展示与实际预算一致。
 inline void loadImagesInOrder(const std::vector<std::string>& paths, const ImageLoadPlan& plan,
                               const ImageLoadOptions& opt,
                               const std::function<void(size_t, GrayImage&)>& consume,
@@ -205,7 +145,7 @@ inline void loadImagesInOrder(const std::vector<std::string>& paths, const Image
     std::vector<char> ready(n, 0);
     std::atomic<size_t> next_claim{0};
     std::atomic<bool> stop{false};
-    size_t next_consume = 0;  // guarded by mtx
+    size_t next_consume = 0;  // 由 mtx 保护
     std::mutex mtx;
     std::condition_variable cv_ready, cv_window;
 
@@ -216,7 +156,7 @@ inline void loadImagesInOrder(const std::vector<std::string>& paths, const Image
             for (;;) {
                 size_t i = next_claim.fetch_add(1);
                 if (i >= n || stop) return;
-                {   // decode-ahead gate: keep the in-flight set bounded
+                {   // 预解码门限，限制在途图像集合
                     std::unique_lock<std::mutex> lk(mtx);
                     cv_window.wait(lk, [&] {
                         return stop || i < next_consume + (size_t)plan.window;
@@ -237,9 +177,7 @@ inline void loadImagesInOrder(const std::vector<std::string>& paths, const Image
         });
     }
 
-    // A throwing consumer must not unwind past `workers`: destroying a joinable
-    // thread calls terminate, which on MSVC exits 0xC0000409 with no message
-    // and no chance for the caller's catch to print the real error.
+    // 消费者抛异常前必须汇合线程；析构仍可 join 的线程会触发 terminate，使真实错误来不及报告。
     auto join_workers = [&] {
         {
             std::lock_guard<std::mutex> lk(mtx);
@@ -257,7 +195,7 @@ inline void loadImagesInOrder(const std::vector<std::string>& paths, const Image
                 std::unique_lock<std::mutex> lk(mtx);
                 cv_ready.wait(lk, [&] { return ready[i] != 0; });
                 img = std::move(slots[i]);
-                slots[i] = GrayImage();  // release the window slot immediately
+                slots[i] = GrayImage();  // 立即释放窗口槽位
                 err = std::move(errors[i]);
                 next_consume = i + 1;
             }
@@ -275,4 +213,4 @@ inline void loadImagesInOrder(const std::vector<std::string>& paths, const Image
     join_workers();
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

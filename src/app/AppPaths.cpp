@@ -1,4 +1,4 @@
-// AppPaths.cpp -- see AppPaths.h.
+// 应用路径实现，参见 AppPaths.h。
 
 #include "app/AppPaths.h"
 
@@ -31,9 +31,7 @@ fs::path ensure(fs::path dir) {
     return dir;
 }
 
-// <base>/spirula-studio, or an existing spirulae-splat/ from before the rename,
-// adopted where it is so recents and cached models survive the upgrade. Drop it
-// with the other compatibility shims (CMakeLists.txt, src/core/Env.h).
+// 使用 <base>/spirula-studio，若旧 spirulae-splat/ 已存在则直接沿用，保留最近项目与模型缓存。
 fs::path app_dir(const fs::path& base) {
     std::error_code ec;
     const fs::path current = base / "spirula-studio";
@@ -42,7 +40,7 @@ fs::path app_dir(const fs::path& base) {
     return ensure(current);
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 std::string config_dir() {
 #ifdef _WIN32
@@ -123,4 +121,4 @@ void add_desktop_search_paths() {
 #endif
 }
 
-}  // namespace app
+}  // 命名空间 app

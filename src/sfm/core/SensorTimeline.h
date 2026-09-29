@@ -1,10 +1,6 @@
 #pragma once
-// Time-indexed queries over one video's telemetry: the IMU rotation between
-// two instants, the up direction at an instant, a pre-integration over an
-// interval, a GPS position at an instant. Every query takes video time
-// (seconds from the first frame) and adds `time_offset` to reach the IMU
-// clock. Gyro and attitude are interchangeable rotation sources, so a DJI
-// file with no raw gyro answers the same questions as an Insta360.
+// 视频遥测的时间查询：相对旋转、向上方向、预积分与 GPS 位置；输入为相对首帧的视频秒数，再加 time_offset 映射到 IMU 时钟。
+// 陀螺与融合姿态可互作旋转来源，使无原始陀螺的 DJI 文件也支持相同接口。
 
 #include <algorithm>
 #include <cctype>
@@ -47,21 +43,21 @@ inline Quat quatNlerp(const Quat& a, Quat b, double u) {
     return quatNormalized(q);
 }
 
-}  // namespace timeline_detail
+}  // 命名空间 timeline_detail
 
 struct UpVote {
     bool ok = false;
-    Vec3 up;          // unit, IMU frame: the direction the specific force averages to
-    double motion = 0;   // RMS deviation of the window's samples from that average, m/s^2
+    Vec3 up;          // IMU 坐标系单位向量，为比力平均方向
+    double motion = 0;   // 窗口样本相对均值的 RMS，单位 m/s^2
     int samples = 0;
 };
 
 class SensorTimeline {
 public:
-    double time_offset = 0;   // seconds: IMU clock = video clock + time_offset
+    double time_offset = 0;   // 单位秒：IMU 时钟 = 视频时钟 + time_offset
     ImuNoise noise;
 
-    // False with `error` when the file carries nothing this can answer with.
+    // 文件无法提供任何查询数据时返回 false 并设置 error。
     bool init(const Telemetry& t, const TelemetryCheck& c, std::string& error) {
         using namespace timeline_detail;
         _gyro.clear(); _accel.clear(); _att.clear();
@@ -121,9 +117,7 @@ public:
     bool hasRotation() const { return _use_gyro || _use_att; }
     bool hasGyro() const { return _use_gyro; }
     bool hasUp() const { return !_accel.empty(); }
-    // 20 Hz admits a camera writing one accelerometer reading per frame (the
-    // DJI's 30 Hz); the position integral over a 0.1-1 s pair still has
-    // samples to work with, and the fit's own sigma says when it does not.
+    // 20 Hz 下限兼容 DJI 每帧一条的 30 Hz 加速度；0.1–1 s 积分仍有足够样本，可靠性由拟合 sigma 判断。
     bool canPreintegrate() const {
         return hasRotation() && _accel_rate >= 20 && _accel.size() >= 2;
     }
@@ -136,16 +130,12 @@ public:
     }
     const std::vector<TelemetryGps>& gpsFixes() const { return _gps; }
 
-    // R_i(t0) <- i(t1): the rotation taking IMU-frame vectors at video time
-    // t1 into the IMU frame at t0. `sign` -1 integrates the gyro negated,
-    // the left-handed-axes hypothesis map/ImuExtrinsic.h tests.
+    // R_i(t0) <- i(t1) 将 t1 的 IMU 向量转到 t0；sign=-1 对陀螺取反，用于检验左手坐标轴假设。
     bool rotationBetween(double t0, double t1, Mat3& R, double sign = 1.0) const {
         return rotationBetweenImu(t0 + time_offset, t1 + time_offset, R, sign);
     }
 
-    // The specific force averaged over +-half_window around t, each sample
-    // rotated into the IMU frame at t first so a turning camera does not
-    // smear it. A camera at rest reads +g up, so this points UP.
+    // 在 t±half_window 平均比力，先将样本旋到 t 时刻坐标系，避免相机转动涂抹方向；静止时读数为向上的 +g。
     UpVote upAt(double t, double half_window = 0.25, double sign = 1.0) const {
         UpVote v;
         const double ti = t + time_offset;
@@ -211,9 +201,7 @@ public:
         return sfm::preintegrate(s, bg, ba, noise);
     }
 
-    // The log's position at t, interpolated between the first appearances of
-    // consecutive distinct fixes. False beyond the log or across a gap over
-    // `max_gap` seconds.
+    // 在不同 GPS 定位首次出现的时刻间插值，超出日志或跨越大于 max_gap 的间隔时失败。
     bool gpsAt(double t, TelemetryGps& out, double max_gap = 10.0) const {
         if (_gps.size() < 2) return false;
         auto it = std::lower_bound(_gps.begin(), _gps.end(), t,
@@ -243,16 +231,14 @@ private:
     };
     std::vector<Stamped> _gyro, _accel;
     std::vector<StampedQuat> _att;
-    mutable std::vector<Quat> _q_plus, _q_minus;   // cumulative gyro orientation per sample
+    mutable std::vector<Quat> _q_plus, _q_minus;   // 逐样本累计陀螺姿态
     std::vector<TelemetryGps> _gps;
-    Mat3 _P = mat3Identity();   // accel frame -> the frame the attitude acts on
+    Mat3 _P = mat3Identity();   // 加速度计坐标系 -> 姿态作用的坐标系
     Vec3 _world_up{0, 0, 1};
     double _gyro_rate = 0, _accel_rate = 0;
     bool _use_gyro = false, _use_att = false, _gps_usable = false;
 
-    // What the double integral cannot recover: a per-frame accelerometer
-    // aliases the vibration a 1 kHz stream resolves and integrates away. The
-    // second difference of a smooth signal is that content and nothing else.
+    // 低帧率加速度会混叠振动，无法像 1 kHz 数据那样积分消除；用平滑信号的二阶差分估计这种不可恢复成分。
     double accelNoiseDensity() const {
         if (_accel.size() < 32 || !(_accel_rate > 0)) return 0;
         std::vector<double> d;
@@ -277,9 +263,7 @@ private:
         return true;
     }
 
-    // Both ends must be covered by the accelerometer: a shortened interval
-    // would leave `dt` disagreeing with the frame spacing the caller pairs it
-    // with.
+    // 积分两端必须均被加速度覆盖；缩短区间会使 dt 与调用方帧间隔不一致。
     Preintegration preintegrateFromAttitude(double a, double b, const Vec3& ba) const {
         Preintegration P;
         if (a < _att.front().t || b > _att.back().t) return P;
@@ -336,8 +320,7 @@ private:
         return true;
     }
 
-    // Orientation of the IMU frame at IMU time `ti` relative to the table's
-    // origin, R_origin <- i(ti), as a quaternion.
+    // IMU 时间 ti 相对表起点的姿态四元数，R_origin <- i(ti)。
     bool orientationAt(double ti, Quat& q, double sign) const {
         using namespace timeline_detail;
         if (_use_att) return attitudeAt(ti, q);
@@ -354,4 +337,4 @@ private:
     }
 };
 
-}  // namespace sfm
+}  // 命名空间 sfm

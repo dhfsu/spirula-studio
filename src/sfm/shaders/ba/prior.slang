@@ -1,16 +1,12 @@
-// Camera-side priors (sfm/ba/Priors.h): sparse 6x6 blocks over the frame pose
-// columns, assembled on the host and added to what the observation kernels
-// built -- the packed S and g on the dense path, the preconditioner blocks and
-// the matrix-free product on the CG path. Included at the end of ba.slang.
+// 主机装配的稀疏 6×6 帧先验块，加入稠密 S/g 或 CG 预条件器与隐式乘积；由 ba.slang 包含。
 
-[[vk::binding(47)]] StructuredBuffer<uint> u_prior_rows;   // (num_frames+1) CSR offsets
-[[vk::binding(48)]] StructuredBuffer<uint> u_prior_cols;   // col frame per entry
-[[vk::binding(49)]] StructuredBuffer<uint> u_prior_erow;   // row frame per entry
-[[vk::binding(50)]] StructuredBuffer<Real> u_prior_blk;    // 36 per entry, [6a+b]: y[6 row+a] += blk x[6 col+b]
+[[vk::binding(47)]] StructuredBuffer<uint> u_prior_rows;   // num_frames+1 个 CSR 偏移
+[[vk::binding(48)]] StructuredBuffer<uint> u_prior_cols;   // 每条目的列帧索引
+[[vk::binding(49)]] StructuredBuffer<uint> u_prior_erow;   // 每条目的行帧索引
+[[vk::binding(50)]] StructuredBuffer<Real> u_prior_blk;    // 每条目 36 项，[6a+b] 对应 y[6 row+a]+=blk*x[6 col+b]
 [[vk::binding(51)]] StructuredBuffer<Real> u_prior_g;      // pose_dim
 
-// S += blocks, lower triangle: every pair is listed both ways, so an entry
-// writes only when its row frame is at or below its column frame. u0 = entries
+// S 加入先验块，双向条目只写行索引不小于列索引的下三角；u0=条目数。
 [shader("compute")] [numthreads(256, 1, 1)]
 void prior_add_s(uint3 t : SV_DispatchThreadID) {
     uint e = t.x;
@@ -25,7 +21,7 @@ void prior_add_s(uint3 t : SV_DispatchThreadID) {
         }
 }
 
-// g += prior gradient. u0 = pose_dim
+// g 加入先验梯度，u0=pose_dim。
 [shader("compute")] [numthreads(256, 1, 1)]
 void prior_add_g(uint3 t : SV_DispatchThreadID) {
     uint i = t.x;
@@ -33,9 +29,7 @@ void prior_add_g(uint3 t : SV_DispatchThreadID) {
     u_g[i] = u_g[i] + u_prior_g[i];
 }
 
-// Diagonal blocks into the block-Jacobi preconditioner. Frame f's block is
-// block f on either partition (an exclusive problem has one image per frame),
-// with the pose rows first. u0 = entries
+// 对角先验加入块 Jacobi；两种划分均以帧 f 对应块 f，位姿行在前，u0=条目数。
 [shader("compute")] [numthreads(256, 1, 1)]
 void prior_add_m(uint3 t : SV_DispatchThreadID) {
     uint e = t.x;
@@ -48,8 +42,7 @@ void prior_add_m(uint3 t : SV_DispatchThreadID) {
             u_cg_M[cb + pidx(a, b)] = u_cg_M[cb + pidx(a, b)] + u_prior_blk[36 * e + 6 * a + b];
 }
 
-// Sp += prior blocks * p over the pose rows, one thread per frame row, after
-// cg_scatter has finished with those rows. u0 = num_frames
+// cg_scatter 完成后，在位姿行执行 Sp+=先验块*p，每帧行一线程，u0=帧数。
 [shader("compute")] [numthreads(256, 1, 1)]
 void prior_matvec(uint3 t : SV_DispatchThreadID) {
     if (cgDone()) return;

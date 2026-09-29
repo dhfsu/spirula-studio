@@ -1,13 +1,4 @@
-// Fundamental matrix estimation (src/sfm/README.md).
-//
-//   estimateFundamental7  minimal 7-point solver (up to 3 real solutions),
-//                         RANSAC's minimal sampler for F.
-//   estimateFundamental8  normalized 8-point (Hartley), the >= 8 point solver
-//                         used for local optimization / refit.
-//   sampsonSq             first-order geometric (Sampson) reprojection error.
-//
-// Both solvers Hartley-normalize the sampled points first. Coordinates are in
-// pixels; residuals come back in squared pixels.
+// 基础矩阵的七点最小解、归一化八点重拟合及 Sampson 误差；两种求解均先做 Hartley 归一化，输入像素，输出平方像素残差。
 #pragma once
 
 #include <array>
@@ -18,8 +9,7 @@
 
 namespace sfm {
 
-// Hartley normalization: centroid to origin, mean distance sqrt(2). Returns T
-// and the transformed points (indexed by `idx`).
+// Hartley 归一化将中心移至原点、平均距离设为 sqrt(2)，返回 T 及 idx 指定的变换点。
 inline Mat3 hartleyNormalize(const std::vector<Vec2>& pts, const std::vector<int>& idx,
                              std::vector<Vec2>& out) {
     double cx = 0, cy = 0;
@@ -37,7 +27,7 @@ inline Mat3 hartleyNormalize(const std::vector<Vec2>& pts, const std::vector<int
     return T;
 }
 
-// Build the n x 9 epipolar constraint matrix rows x2^T F x1 = 0.
+// 构建 n×9 极线约束矩阵，各行为 x2^T F x1=0。
 inline std::vector<double> epipolarMatrix(const std::vector<Vec2>& a, const std::vector<Vec2>& b) {
     size_t n = a.size();
     std::vector<double> A(n * 9);
@@ -71,15 +61,15 @@ inline std::vector<Mat3> estimateFundamental8(const std::vector<Vec2>& p1,
     Mat3 Fn;
     for (int i = 0; i < 9; i++) Fn[i] = nv[0][i];
     Fn = enforceRank2(Fn);
-    // denormalize: F = T2^T Fn T1
+    // 反归一化：F=T2^T Fn T1
     Mat3 F = mul(mul(transpose(T2), Fn), T1);
     return {F};
 }
 
-// Real roots of a cubic c3 x^3 + c2 x^2 + c1 x + c0 (returns 1..3 roots).
+// 求三次式 c3 x^3+c2 x^2+c1 x+c0 的实根，返回 1–3 根。
 inline std::vector<double> solveCubicReal(double c3, double c2, double c1, double c0) {
     std::vector<double> roots;
-    if (std::fabs(c3) < 1e-14) {  // quadratic
+    if (std::fabs(c3) < 1e-14) {  // 退化为二次方程
         double a = c2, b = c1, c = c0;
         if (std::fabs(a) < 1e-14) {
             if (std::fabs(b) > 1e-14) roots.push_back(-c / b);
@@ -93,7 +83,7 @@ inline std::vector<double> solveCubicReal(double c3, double c2, double c1, doubl
         }
         return roots;
     }
-    // normalize to x^3 + a x^2 + b x + c
+    // 归一化为 x^3+a x^2+b x+c
     double a = c2 / c3, b = c1 / c3, c = c0 / c3;
     double q = (a * a - 3 * b) / 9.0;
     double r = (2 * a * a * a - 9 * a * b + 27 * c) / 54.0;
@@ -126,15 +116,14 @@ inline std::vector<Mat3> estimateFundamental7(const std::vector<Vec2>& p1,
     Mat3 F1, F2;
     for (int i = 0; i < 9; i++) { F1[i] = nv[0][i]; F2[i] = nv[1][i]; }
 
-    // det(alpha F1 + (1-alpha) F2) = 0, cubic in alpha. Sample det at 4 alphas
-    // and fit the cubic (robust and simple).
+    // det(alpha F1+(1-alpha)F2)=0 为 alpha 的三次式，取四个样本拟合系数。
     auto detAt = [&](double al) {
         Mat3 F;
         for (int i = 0; i < 9; i++) F[i] = al * F1[i] + (1 - al) * F2[i];
         return det3(F);
     };
     double d0 = detAt(0.0), d1 = detAt(1.0), d2 = detAt(2.0), dm1 = detAt(-1.0);
-    // fit p(a)=c3 a^3 + c2 a^2 + c1 a + c0 through (0,d0),(1,d1),(2,d2),(-1,dm1)
+    // 通过 (0,d0)、(1,d1)、(2,d2)、(-1,dm1) 拟合 p(a)=c3 a^3+c2 a^2+c1 a+c0。
     double c0 = d0;
     double c3 = (d2 - 3 * d1 + 3 * d0 - dm1) / 6.0;
     double c2 = (d1 + dm1 - 2 * d0) / 2.0;
@@ -149,21 +138,9 @@ inline std::vector<Mat3> estimateFundamental7(const std::vector<Vec2>& p1,
     return out;
 }
 
-// ---- the same algebra on unit bearings (D45) ----------------------------
-//
-// The epipolar constraint b2^T E b1 = 0 holds for *viewing rays*, and only
-// coincides with x2^T F x1 = 0 on pixels when the lens is a pinhole. A fisheye
-// keypoint 100 deg off axis has no pinhole pixel at all, so a pixel-space F
-// cannot explain it and verification silently throws those correspondences
-// away (docs/notes/sfm-design.md D45). Given a camera model we can hand the same
-// linear algebra unit bearings instead and get geometry that is valid over the
-// whole field of view.
-//
-// What is estimated is a general rank-2 3x3, not a metric essential matrix:
-// exactly the uncalibrated F story, one coordinate system down. That costs two
-// spurious degrees of freedom and buys tolerance to an imperfect focal prior,
-// which at verification time we certainly have. `projectToEssential` imposes
-// the missing constraint later, where the prior has been refined.
+// ---------------- 单位视线上的相同代数（D45）----------------
+// b2^T E b1=0 对任意视场有效，像素基础矩阵只适用于针孔，不能解释离轴 100 度的鱼眼观测。
+// 验证先估一般秩二矩阵，保留额外两自由度容忍不精确焦距；视线标定更可靠后再由 projectToEssential 施加本质约束。
 
 inline std::vector<double> epipolarMatrix3(const std::vector<Vec3>& a, const std::vector<Vec3>& b) {
     size_t n = a.size();
@@ -179,10 +156,7 @@ inline std::vector<double> epipolarMatrix3(const std::vector<Vec3>& a, const std
     return A;
 }
 
-// Unit bearings need no Hartley normalization: they already have norm 1 and
-// span the sphere, so the constraint matrix is well conditioned by
-// construction. (Normalizing them like image points would move them off the
-// sphere and break the geometry.)
+// 单位视线已归一化并覆盖球面，无需 Hartley 归一化；按图像点方式平移缩放会破坏球面几何。
 inline std::vector<Mat3> estimateEpipolar8Bearing(const std::vector<Vec3>& b1,
                                                   const std::vector<Vec3>& b2,
                                                   const std::vector<int>& idx) {
@@ -227,8 +201,7 @@ inline std::vector<Mat3> estimateEpipolar7Bearing(const std::vector<Vec3>& b1,
     return out;
 }
 
-// Nearest essential matrix: singular values (1,1,0). Valid to apply once the
-// bearings are trusted -- it is the constraint the 7-point fit above omits.
+// 将奇异值投影为 (1,1,0)，得到最近本质矩阵；仅在视线标定可信后施加。
 inline Mat3 projectToEssential(const Mat3& E) {
     Svd3 s = svd3(E);
     double m = 0.5 * (s.s.x + s.s.y);
@@ -236,15 +209,12 @@ inline Mat3 projectToEssential(const Mat3& E) {
     return mul(mul(s.U, D), transpose(s.V));
 }
 
-// Sampson error on the sphere, in squared radians. Same first-order geometric
-// approximation as sampsonSq, but the perturbation lives in each bearing's
-// tangent plane (2 DOF on the sphere) rather than on the z=1 image plane --
-// which is what makes it meaningful for a ray pointing sideways.
+// 球面 Sampson 误差以平方弧度表示，扰动位于各视线的二维切平面，因而适用于侧向射线。
 inline double sampsonSqBearing(const Mat3& E, const Vec3& b1, const Vec3& b2) {
     Vec3 Eb1 = mul(E, b1);
     Vec3 Etb2 = mul(transpose(E), b2);
     double num = b2.dot(Eb1);
-    // project each gradient onto the tangent plane of its own bearing
+    // 将各梯度投影到其视线的切平面
     Vec3 g1 = Etb2 - b1 * b1.dot(Etb2);
     Vec3 g2 = Eb1 - b2 * b2.dot(Eb1);
     double den = g1.dot(g1) + g2.dot(g2);
@@ -252,7 +222,7 @@ inline double sampsonSqBearing(const Mat3& E, const Vec3& b1, const Vec3& b2) {
     return num * num / den;
 }
 
-// Squared Sampson distance for correspondence a (image 1) <-> b (image 2).
+// 图像 1 的 a 与图像 2 的 b 对应的 Sampson 距离平方。
 inline double sampsonSq(const Mat3& F, const Vec2& a, const Vec2& b) {
     Vec3 x1 = {a.x, a.y, 1}, x2 = {b.x, b.y, 1};
     Vec3 Fx1 = mul(F, x1);
@@ -263,4 +233,4 @@ inline double sampsonSq(const Mat3& F, const Vec2& a, const Vec2& b) {
     return num * num / den;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

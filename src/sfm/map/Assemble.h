@@ -1,30 +1,6 @@
-// Turning a set of models into reconstructions (D57, D63).
-//
-// Two mappers produce that set and from there they need the identical thing.
-// The flat one seeds, grows until nothing else registers, and seeds again among
-// what is left (D41); the bottom-up one cuts the view graph into atoms and
-// reconstructs them concurrently (sfm/map/Bottomup.h). Either way what comes
-// out is several models that overlap in places, and the rest of the work is:
-//
-//   * merge the ones that belong together, checking each result against
-//     evidence the merge itself never used (ModelOps.h's seam validator);
-//   * grow the ones that did not merge, because merging cannot invent overlap
-//     that is not there and registration is the only operation that creates it;
-//   * optimize what changed, so the next round judges a settled model;
-//   * and once at the end, do what no amount of merging can: break a model its
-//     own correspondences contradict, cut a fold, register the tail, seed among
-//     whatever nothing reached.
-//
-// The first three are a *level*, and levels repeat until one stops changing
-// anything. That is a merge tree when the input is hundreds of atoms and two or
-// three rounds when it is the flat mapper's handful of components -- the same
-// loop either way, which is why it is here and not in either mapper.
-//
-// This replaced the manage loop (D44), which drove the same operations in
-// rounds but re-ran the expensive ones over models nothing had touched, and
-// whose repair pass grew every model it repaired without a bound: on a
-// 5356-image capture it spent 65 minutes to merge three models and recover 119
-// images, ending with three near-copies of the same reconstruction.
+// flat 与 bottom-up 共用的模型装配（D57/D63）：逐层合并有可靠重叠的模型、扩展未合并模型、优化变更，再重复到稳定。
+// 最终仅一次执行审查、冲突拆分、折叠检查、尾部配准与重新播种；合并验证使用未参与对齐的独立证据。
+// 限制重复修复与扩展，避免小模型长成主模型副本；5356 图数据中无界管理曾耗时 65 分钟仅合并三个模型并新增 119 图。
 #pragma once
 
 #include <algorithm>
@@ -48,90 +24,44 @@
 namespace sfm {
 
 struct AssembleOptions {
-    // Levels of the merge tree. Each halves the model count, so the ceiling is
-    // log2(models) plus the extra levels a refused pair earns after a
-    // refinement.
+    // 合并树层数上限，约为 log2(模型数) 加上精化后重新尝试拒绝合并所需的层数。
     int max_rounds = 16;
-    // One bundle adjustment across every live model with intrinsics shared per
-    // camera group, after every level that changed anything.
+    // 有变化的层后执行跨模型联合 BA，按相机组共享内参。
     bool joint_intrinsics = true;
-    // Run those joint solves to the growth-phase tolerance rather than the
-    // solver's full one (Mapper::jointRefine). A level's solve is followed by
-    // more merges and another solve, so converging it tightly is work the next
-    // level discards -- but the merge tests that run in between are measured in
-    // pixels of reprojection error, so a half-converged model is also a model
-    // the cross-seam test judges more harshly.
+    // 中间联合求解可使用增长阶段容差以节省后续会被重算的收敛工作，但过松会增大像素残差，使接缝验证更严格。
     bool coarse_joint_ba = true;
-    // Levels between those joint solves. Every level costs one bundle
-    // adjustment over the whole capture, and a tree over a thousand images is
-    // seven to nine levels deep, so 2 halves that bill at the price of letting
-    // a level align on seams one level older. The last level always solves --
-    // it is the geometry the finishing passes and the caller see.
-    //
-    // 1 anyway. At 2, four of five medium captures were 5-56 s faster at the
-    // same accuracy (windmill's tree solves 152 -> 93 s, vicon_room 31 -> 25 s)
-    // and the fifth dropped 6 points -- but that fifth capture fragments into
-    // six or seven components and swings 9.3 points between two runs of the
-    // *same* configuration, so it cannot arbitrate this and nothing else can
-    // outvote it. The flag is there for a capture that needs the time.
+    // 联合优化的层间隔，最终层始终求解；默认 1。间隔 2 在五组中四组快 5–56 s，另一组下降 6 分，而该组相同配置本身波动 9.3 分，因此不改默认。
+    // 例如 windmill 树求解 152->93 s，vicon_room 31->25 s；可通过选项自行权衡。
     int joint_every = 1;
-    // Levels between growth passes over the models that did not merge; 0
-    // disables in-level growth. `max_grow_passes` bounds the total so a large
-    // tree cannot spend all its time registering.
+    // 未合并模型的增长层间隔，0 禁用；max_grow_passes 限制总轮数，避免大树只顾配准。
     int grow_every = 1;
     int max_grow_passes = 8;
-    // What one growth pass may add to a model, as a fraction of what it already
-    // holds and never fewer than `grow_budget_min`. The pass is asked for a
-    // bridge to its neighbour, not for a reconstruction: the overlap bound in
-    // growByPnP limits only images another model holds, so without this a model
-    // beside a large uncovered region grows into all of it.
+    // 单次增长上限按模型规模比例且至少 grow_budget_min；目标仅为建立合并重叠，防止模型扩展到整个未覆盖区域。
     double grow_budget_frac = 0.25;
     size_t grow_budget_min = 25;
-    // Merges on shared *structure* when a level runs out of shared images
-    // (D70), per level. Each is a RANSAC over thousands of point
-    // correspondences, so only the model pairs the correspondence graph joins
-    // most strongly are worth trying, and only a few of them.
-    //
-    // **Off**, and the reason is not the alignment -- that works, and recovers
-    // pairs no shared image could ever align. It is that turning it on breaks
-    // the independence the acceptance tests rely on. An ordinary merge is
-    // aligned on shared *poses* and then judged on *matches* that the alignment
-    // never saw, which is what catches two places that merely look alike; a
-    // merge aligned on matches is judged on the same evidence that produced it,
-    // so a wrong one sails through. Measured on a 7620-image capture that is
-    // half building interior, over seven runs: every run with this on scored
-    // 17.0 to 25.7 AUC@10, every run without it 44.7 to 46.3, and the merges it
-    // made added nine and sixty-five images. It needs an independent test
-    // before it can be a default.
+    // 无共同图像时可按共同三维结构尝试桥接，但默认关闭：用匹配对齐再用同一匹配验证，破坏证据独立性。
+    // 7620 图室内混合数据七次测量，启用时 AUC@10 为 17.0–25.7，禁用为 44.7–46.3，而仅新增 9 或 65 图；成为默认前需要独立验证。
     int max_bridges = 0;
-    size_t bridge_min_matches = 500;  // matched features joining two models
-    // Seed attempts the finishing reseed pass may spend. Far below the mapper's
-    // own budget: what is left after the levels is the tail of the view graph,
-    // and failing three times there means there is nothing to find.
+    size_t bridge_min_matches = 500;  // 连接两个模型的特征匹配数量
+    // 收尾重新播种使用远小于主建图器的预算，残余弱连接连续三次失败通常已无值得寻找的模型。
     int reseed_trials = 3;
-    // Cap on what the audit's repair may grow a model to, as a fraction of what
-    // it held. Uncapped, that repair is a full incremental growth pass at the
-    // repair's cadence rather than the schedule's (see Mapper::audit) -- which
-    // is what the manage loop did, and what turned its small models into copies
-    // of its large ones.
+    // 审查修复后的模型大小按原规模比例限制，避免每次修复都变成完整增量重建并复制大模型。
     double audit_growth_frac = 0.25;
     bool verbose = true;
-    const char* tag = "asm";  // log prefix, so a run says which mapper it came from
+    const char* tag = "asm";  // 日志前缀，用于标明建图器来源
 };
 
 struct AssembleStats {
     size_t models_in = 0;
     size_t rounds = 0;
     size_t merges = 0, merges_refused = 0;
-    size_t bridges = 0;            // ... of which came from shared structure alone
+    size_t bridges = 0;            // 其中仅依靠共同结构完成的合并数
     size_t joint_ba = 0;
-    size_t grown_images = 0;       // registered by a level's growth pass
-    size_t grown_rejected = 0;     // ... and dropped again by the pose check
-    ManagerStats finish;           // what the passes in ModelOps.h did
+    size_t grown_images = 0;       // 逐层增长新增的配准图像数
+    size_t grown_rejected = 0;     // 其中又被位姿检查剔除的数量
+    ManagerStats finish;           // ModelOps 各处理步骤的统计
     double t_merge = 0, t_ba = 0, t_grow = 0;
-    // The finishing passes, one by one: they answer different failures and cost
-    // wildly different amounts, and a single total hides which one is worth its
-    // price on a given capture.
+    // 各收尾步骤分别计时，以评估它们处理不同问题的成本。
     double t_audit = 0, t_split = 0, t_grow_tail = 0, t_reseed = 0, t_final_merge = 0, t_fold = 0;
     double finishSecs() const {
         return t_audit + t_split + t_grow_tail + t_reseed + t_final_merge + t_fold;
@@ -140,22 +70,8 @@ struct AssembleStats {
 
 namespace detail {
 
-// One level: every model absorbs at most one other, best overlap first and
-// smallest pair first, so the models grow *together*.
-//
-// The alternative -- MergeSession::runAuto, which chains until nothing else
-// merges -- is both slower and worse here. Slower because every attempt copies
-// the anchor (the merge has no cheaper inverse), and an anchor that absorbs a
-// hundred atoms in turn is copied at every size it passes through: quadratic,
-// where a matching copies the smaller half and doubles the model size per
-// level. Worse because each link in the chain is a seam that has never been
-// optimized, and the ones at the end of the chain are asked to align across all
-// of them at once.
-//
-// Every `carry` array is reindexed with the surviving models, and `stalled` is
-// filled with which of them got through the level without merging -- so the
-// caller can tell "changed" from "has a new seam", which are different
-// questions and want different treatment afterwards.
+// 每层每模型最多吸收一个伙伴，优先最大重叠、较小模型对，使规模同步增长。
+// 连续吸收会反复复制不断变大的锚点，产生二次开销并累积未优化接缝；分层可逐轮解决。carry 随模型重编号，stalled 标记未合并者。
 inline size_t mergeLevel(std::vector<Reconstruction>& models, const MergeOptions& opt,
                          std::vector<std::vector<char>*> carry, std::vector<char>& stalled,
                          size_t& refused, std::map<std::string, size_t>* why = nullptr) {
@@ -175,16 +91,14 @@ inline size_t mergeLevel(std::vector<Reconstruction>& models, const MergeOptions
     size_t merges = 0;
     for (const MergeCandidate& c : cands) {
         if (busy[c.dst] || busy[c.src]) continue;
-        // A refusal does not retire either model for the level: it may still
-        // have a partner it can align with.
+        // 合并被拒绝后双方仍可尝试本层其他伙伴。
         const MergeAttempt a = s.tryMerge(c.dst, c.src);
         if (a.merged) {
             merges++;
             busy[c.dst] = busy[c.src] = 1;
         } else {
             refused++;
-            // Reasons carry counts, which would make every one unique; keep the
-            // leading words so a level's refusals group into kinds.
+            // 去除原因中的具体计数，按前导文本汇总拒绝类别。
             if (why) {
                 std::string k = a.reason.substr(0, a.reason.find_first_of("0123456789"));
                 while (!k.empty() && (k.back() == ' ' || k.back() == '(')) k.pop_back();
@@ -199,7 +113,7 @@ inline size_t mergeLevel(std::vector<Reconstruction>& models, const MergeOptions
     for (std::vector<char>* c : carry) c->clear();
     for (size_t i = 0; i < s.numModels(); i++) {
         if (!s.alive(i)) continue;
-        stalled.push_back(busy[i] ? 0 : 1);  // survived the level without merging
+        stalled.push_back(busy[i] ? 0 : 1);  // 本层保留且未发生合并
         models.push_back(std::move(s.modelMut(i)));
         for (size_t k = 0; k < carry.size(); k++)
             carry[k]->push_back(i < was[k].size() ? was[k][i] : 0);
@@ -207,26 +121,8 @@ inline size_t mergeLevel(std::vector<Reconstruction>& models, const MergeOptions
     return merges;
 }
 
-// Register whatever each model can still take, largest first, by PnP alone.
-//
-// This is the incremental half of the hybrid, and it is what a stalled level
-// needs. A level stops for one of two reasons and growth answers both: either
-// too few pairs still share `min_common_images`, in which case the models are
-// not wrong but simply do not touch, and only registering more images can make
-// them touch; or a merge was refused on thin evidence, in which case more
-// shared images give the alignment more to fit and the cross-seam test more to
-// judge on -- so a correct merge that was refused gets another chance, and a
-// wrong one is refused with more confidence.
-//
-// An image another model already holds is a legitimate target, and in fact the
-// point: that overlap *is* what the next Sim(3) aligns on. `growByPnP` bounds
-// it by Mapper::overlapBudget -- enough to determine a transform, and more than
-// that while the pass is still finding ground of its own -- with the size cap
-// below stopping it well short of absorbing a neighbour, and it checks every
-// image it registered against the rest of the model before returning -- which
-// is not optional. Unaudited, growth does not merely add bad poses, it makes
-// the cross-seam test agree with the merges built on them (measured: 21 points
-// of AUC@5, and the same whole-session displacement the flat mapper produces).
+// 优先扩展大模型，通过 PnP 增加共享图像，为下次 Sim(3) 对齐提供重叠与更强证据。
+// 增长受重叠和规模预算限制，并逐图检查新位姿；未经审查的增长曾损失 21 分 AUC@5，还会让接缝检查错误支持坏合并。
 inline size_t growModels(Mapper& mapper, std::vector<Reconstruction>& models,
                          std::vector<char>& dirty, const std::vector<char>& which,
                          double budget_frac, size_t budget_min, size_t& rejected) {
@@ -243,11 +139,7 @@ inline size_t growModels(Mapper& mapper, std::vector<Reconstruction>& models,
         std::vector<const Reconstruction*> others;
         for (size_t j = 0; j < models.size(); j++)
             if (j != i) others.push_back(&models[j]);
-        // Bridge, not reconstruct. The pass is asked for enough images to make
-        // a merge possible, scaled to the model so a big one may reach further
-        // than a small one, and it is stopped well before it could grow into a
-        // whole uncovered region on its own -- which would be the flat mapper
-        // again, at the flat mapper's cost.
+        // 增长只需建立合并桥梁，预算随模型大小变化，并在吞并整个未覆盖区域前停止。
         const uint32_t budget =
             (uint32_t)std::max((double)budget_min, budget_frac * (double)have);
         Mapper::GrowStats gs;
@@ -263,19 +155,8 @@ inline size_t growModels(Mapper& mapper, std::vector<Reconstruction>& models,
     return registered;
 }
 
-// Merge models the correspondence graph joins but no shared image does (D70).
-//
-// This is what a level cannot reach. `mergeLevel` only ever proposes pairs with
-// `min_common_images` in common, so two models that see the same place from two
-// passes -- and register none of the same frames -- are never candidates, and no
-// amount of growth changes that when registration between them is what failed in
-// the first place.
-//
-// Run only when a level merged nothing, and bounded to `max_bridges` attempts:
-// each one is a RANSAC over thousands of point correspondences, and the pairs
-// worth trying are the few with the most evidence. Everything after the
-// transform is the ordinary merge, so the splice test, the fold test and the
-// seam validator all still have their say.
+// 层内没有成功合并时，可对对应图连接最强但无共同图像的少量模型对做三维 RANSAC 桥接，次数受 max_bridges 限制。
+// 求得变换后仍执行普通拼接、折叠和接缝检查（D70）。
 inline size_t bridgeModels(Mapper& mapper, std::vector<Reconstruction>& models,
                            const MergeOptions& opt, size_t min_matches, int max_bridges,
                            std::vector<std::vector<char>*> carry, size_t& refused,
@@ -295,14 +176,12 @@ inline size_t bridgeModels(Mapper& mapper, std::vector<Reconstruction>& models,
     for (const Mapper::StructureLink& l : links) {
         if (tried >= max_bridges) break;
         if (busy[l.a] || busy[l.b]) continue;
-        // The bigger model keeps its gauge and its intrinsics, as everywhere.
+        // 较大模型保留其坐标规范与内参。
         const bool a_first = s.model(l.a).numRegistered() >= s.model(l.b).numRegistered();
         const size_t dst = a_first ? l.a : l.b, src = a_first ? l.b : l.a;
         tried++;
         AlignmentResult al = mapper.alignByStructure(s.model(dst), s.model(src), opt);
-        // Printed in full, not grouped: there are at most `max_bridges` of
-        // these a level, and each one is the answer to "why are those two
-        // models still apart".
+        // 桥接尝试很少，完整打印原因，便于解释具体两模型仍未合并的原因。
         if (opt.verbose)
             slog::diag(slog::Tag::Merge,
                        "[merge] structure link %zu <- %zu (%zu matched features): %s", dst,
@@ -339,13 +218,9 @@ inline size_t bridgeModels(Mapper& mapper, std::vector<Reconstruction>& models,
     return merges;
 }
 
-}  // namespace detail
+}  // 命名空间 detail
 
-// The levels: merge, grow what did not merge, optimize, repeat.
-//
-// `dirty` marks models something changed and `seamed` the ones that absorbed
-// another; both are sized to `models` on entry and reindexed with it, and the
-// finishing passes read them to skip work that has already been done.
+// 逐层合并、增长、优化；dirty 标记变化，seamed 标记新接缝，均随模型重编号，供收尾跳过重复工作。
 inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
                          const MergeOptions& merge_opt, const ManagerOptions& mopt,
                          const AssembleOptions& opt, AssembleStats& st,
@@ -357,7 +232,7 @@ inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
     seamed.resize(models.size(), 0);
     std::vector<char> stalled(models.size(), 1);
     int grow_passes = 0;
-    bool solve_pending = false;  // a level merged and its joint solve was deferred
+    bool solve_pending = false;  // 已有合并但联合求解被延后
     if (!mopt.do_merge && !mopt.do_grow) return;
     for (int round = 0; round < std::max(1, opt.max_rounds) && models.size() > 1; round++) {
         st.rounds = (size_t)round + 1;
@@ -377,19 +252,14 @@ inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
             slog::diag(slog::Tag::Merge,
                        "[%s] level %zu: %zu merge(s), %zu refused, %zu model(s) left",
                        opt.tag, st.rounds, merges, refused, models.size());
-            // Hundreds of merges a level, so the reasons are summarized by kind
-            // rather than printed one by one -- but they have to be visible, or
-            // a level that refuses everything looks the same as one with
-            // nothing left to merge.
+            // 按类别汇总拒绝原因，使全部被拒绝与没有候选两种状态可区分。
             for (const auto& kv : why)
                 slog::diag(slog::Tag::Merge, "[%s]   %4zu x %s", opt.tag, kv.second,
                            kv.first.c_str());
         }
         if (models.size() <= 1) break;
 
-        // Grow the models that did *not* merge, before the joint refinement.
-        // Models that just merged are left alone -- they have a fresh seam to
-        // settle and already have work at the next level.
+        // 联合优化前仅增长未合并模型；刚合并者先让新接缝稳定，下一层再处理。
         size_t reg = 0;
         if (mopt.do_grow && opt.grow_every > 0 && grow_passes < opt.max_grow_passes &&
             (round % opt.grow_every) == 0) {
@@ -411,11 +281,7 @@ inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
                                models.size(), st.grown_rejected);
             }
         }
-        // A level that merged nothing has exhausted what shared images can do.
-        // What the correspondence graph can still say is a different question,
-        // and one growth cannot answer: two models that see the same place from
-        // two passes share no frame, so no amount of registering brings them
-        // within `min_common_images` of each other (D70).
+        // 本层无合并表示共同图像证据已耗尽，可选再尝试无共同帧但有结构对应的桥接（D70）。
         size_t bridged = 0;
         if (merges == 0 && mopt.do_merge && opt.max_bridges > 0) {
             t0 = clk();
@@ -436,36 +302,15 @@ inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
             }
         }
 
-        // Nothing merged, and what grew cannot change that. A level costs a
-        // joint solve over the whole capture, and it is only worth paying when
-        // the growth before it plausibly gave some pair enough new overlap to
-        // align on -- one model's minimum budget is the least that could.
-        // Measured on a 7620-image capture: levels 5 to 9 merged nothing while
-        // growth trickled 13, 5, 7 and 0 images, and each still solved.
+        // 没有合并且增长不足以提供新重叠时停止，避免继续整数据集联合求解；7620 图测量的后续层仅增长 13/5/7/0 图却各付出一次求解成本。
         if (merges == 0 && bridged == 0 && reg < opt.grow_budget_min) break;
 
-        // Growth aims models at images their neighbours hold, so it is growth,
-        // not merging, that turns a small model into a copy of a bigger one.
-        // Dropping those here rather than at the end keeps them out of the next
-        // level's candidate list and out of the next joint solve.
+        // 增长可能使小模型变成大模型副本，立即丢弃以避免参与下一层候选与联合 BA。
         models = dropRedundantModels(std::move(models), mopt, st.finish,
                                      {&dirty, &seamed, &stalled});
 
-        // One solve over every live model, intrinsics shared per camera group.
-        //
-        // Unconditionally, even once the models agree about the intrinsics and
-        // the manage loop's skip rule (focalSpreadPx) would fire. That rule is
-        // right for a loop whose alternative is doing nothing; here the
-        // alternative is one refine per changed model, and measured on four
-        // captures that was consistently slower than the single joint solve it
-        // replaced. A bundle adjustment's cost on this device is dominated by
-        // submits rather than by arithmetic, so N small solves beat one large
-        // one at no size that occurs here.
-        //
-        // Not necessarily at every level: `joint_every` lets a level align on
-        // seams the level below left unsettled. Once two models are left the
-        // next level ends it, so from there it always solves, and an exit on a
-        // skipped level solves on the way out.
+        // 按相机组共享内参的一次联合 BA，实测比逐个精化变更模型更快，设备提交延迟是主要因素。
+        // 允许按 joint_every 跳层，但仅剩两个模型或即将退出时必须补做求解。
         const bool solve_now =
             opt.joint_every <= 1 || models.size() <= 2 || (round % opt.joint_every) == 0;
         if (!solve_now) {
@@ -499,14 +344,7 @@ inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
                   (long long)st.rounds, (long long)st.merges,
                   (long long)st.merges_refused, (long long)st.grown_images,
                   (long long)f.covered_before, (long long)coveredImages(models).size()});
-        // The seam test's own numbers stay English: they are a diagnostic for
-        // whoever is calibrating the merge validator, not for the person
-        // waiting on a reconstruction (sfm/core/Log.h).
-        // A refusal over a handful of cross-seam pairs is a seam with nothing
-        // on it, and no refinement can rescue that -- only more overlap can.
-        // One over hundreds that still explains a third of them is a seam that
-        // is merely out of true. The two want opposite responses, so the report
-        // has to separate them.
+        // 接缝诊断保持英文，分别报告少量证据和大量但不完全一致证据；前者需要更多重叠，后者可能由精化修复。
         if (f.seam_refused)
             slog::diag(slog::Tag::Merge,
                        "[%s]   a refused merge explained a median %.0f%% of its cross-seam "
@@ -523,11 +361,7 @@ inline void mergeUpwards(Mapper& mapper, std::vector<Reconstruction>& models,
     }
 }
 
-// What the levels cannot do by construction.
-//
-// Once, in this order, and never in a loop. Each answers a failure merging has
-// no move against, and each is a pass from ModelOps.h with the same thresholds
-// the merging used.
+// 分层无法解决的故障按固定顺序收尾一次，复用 ModelOps 和相同阈值，不循环执行。
 inline std::vector<Reconstruction> finishModels(Mapper& mapper,
                                                 std::vector<Reconstruction> models,
                                                 const MergeOptions& merge_opt,
@@ -540,17 +374,8 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
     ManagerOptions fopt = mopt;
     fopt.audit_growth_frac = opt.audit_growth_frac;
 
-    // The joint pass optimizes but does not filter: it is one bundle
-    // adjustment, with none of the mapper's retriangulation, track completion
-    // or de-registration, and a single similarity cannot place both halves of a
-    // drifted model correctly. So every model with a new seam is audited
-    // against the correspondence graph and then refined -- which is what the
-    // audit ends with anyway, so this replaces the refine rather than adding to
-    // it. A model that merely grew was checked image by image as it grew
-    // (growByPnP rejects a registration the rest of the model contradicts), and
-    // one that did neither was refined by the run that built it -- so what is
-    // left for the audit is the seam, which is what it is for. Those two still
-    // want the refine the audit ends with.
+    // 联合 BA 不执行重三角化、补轨迹或撤销配准；有新接缝的模型须按对应图审查后精化。
+    // 仅增长者已逐图检查，未变化者已有精化结果，因此避免重复完整审查。
     for (size_t i = 0; i < models.size(); i++) {
         if (i < seamed.size() && seamed[i]) continue;
         if (i < dirty.size() && dirty[i] && models[i].numRegistered() >= 2)
@@ -561,10 +386,7 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
     models = auditModels(mapper, std::move(models), fopt, memo, st.finish);
     st.t_audit = secs(t0, clk());
 
-    // A model whose own verified pairs contradict it. Merging refuses a bad
-    // result before it commits, but a model can be wrong on its own -- a chain
-    // of registrations through repeated structure does the same damage -- and
-    // growth builds on whatever it was given.
+    // 模型自身也可能因重复结构链式配准而与验证匹配矛盾，不能只在合并时检查。
     size_t changed = 0;
     if (mopt.do_split) {
         t0 = clk();
@@ -574,23 +396,8 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
         st.t_split = secs(t0, clk());
     }
 
-    // Images no model holds, offered to the models that might take them.
-    //
-    // In-level growth only runs on models that failed to *merge*, and it stops
-    // entirely once one model is left -- so a capture that comes back in one
-    // piece never gets a growth pass at all, and whatever was left at the
-    // boundaries stays out. That tail is worth more than it looks: on a
-    // 550-image capture the difference between a 2.4x-cover partition and a
-    // 1.5x one was eight images, and eight images is 2.6 points of AUC@10
-    // because every pair involving them counts as a failure. Their *poses* were
-    // never the problem -- median position error is 0.05 % of scene extent
-    // either way.
-    //
-    // With the mapper's own schedule, not growByPnP: this is the last pass that
-    // will register anything, there is no joint solve after it to pay for the
-    // geometry, and by here there are a handful of images to find rather than a
-    // bridge to build. Bounded by what is actually missing, so it cannot become
-    // the incremental mapper again.
+    // 最后向可接纳模型补配未覆盖图像，使用建图器完整增长与优化节奏，而非只做 PnP。
+    // 预算仅覆盖缺失图像；550 图数据少配八图即可损失 2.6 分 AUC@10，即使已配准位姿误差几乎不变。
     if (mopt.do_grow) {
         t0 = clk();
         mapper.claimAll(models);
@@ -611,12 +418,7 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
                 mapper.claimAll(models);
             }
             st.grown_images += reg;
-            // Registration is the one operation that creates overlap, and
-            // overlap is what a merge aligns on -- so this pass can make a
-            // merge possible that was not before. On a 5356-image capture it
-            // is *the* thing that does: the two components that came out of
-            // the tree only came to share images (1291 of them) once this had
-            // run, and without counting it the merge below never ran at all.
+            // 配准可创建原本不存在的重叠，必须触发新合并；5356 图数据的两个模型直到此步才共享 1291 张图。
             if (reg) changed++;
             if (opt.verbose)
                 slog::diag(slog::Tag::Merge,
@@ -626,14 +428,7 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
         st.t_grow_tail = secs(t0, clk());
     }
 
-    // Images nothing reached: a component the partition cut too thin to seed,
-    // or one the whole capture only connects to weakly. This is the one
-    // finishing pass that can still find a model rather than repair one.
-    // Bounded twice, because unbounded it is the manage loop's reseed pass with
-    // none of the manage loop's reasons: what is left here is barely connected
-    // to the view graph, and a handful of such images cannot make a model worth
-    // keeping. Measured on a 1146-image capture, an unbounded pass spent 21.6 s
-    // to find nothing.
+    // 对完全未覆盖、被切得过小或弱连接区域重新播种，同时限制尝试与规模；1146 图数据无界播种曾耗时 21.6 s 却无结果。
     if (mopt.do_reseed) {
         t0 = clk();
         mapper.claimAll(models);
@@ -653,7 +448,7 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
         st.t_reseed = secs(t0, clk());
     }
 
-    // Anything the last two passes produced has never been offered a merge.
+    // 将最后两步新产生的模型再尝试合并。
     if (changed && models.size() > 1 && mopt.do_merge) {
         t0 = clk();
         std::vector<char> s2(models.size(), 1);
@@ -674,10 +469,7 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
 
     models = dropRedundantModels(std::move(models), mopt, st.finish);
 
-    // Folds are cut last, once. Two similar-looking parts of the capture
-    // written on top of each other is the failure every agreement test misses,
-    // because a fold agrees with itself; it is detected from what the model is
-    // *missing* (D46).
+    // 折叠检查最后仅执行一次；重复场景重叠到一起可能内部自洽，须根据应有却缺失的共同结构判断（D46）。
     if (mopt.do_duplicate_split) {
         t0 = clk();
         const size_t before = models.size();
@@ -705,9 +497,7 @@ inline std::vector<Reconstruction> finishModels(Mapper& mapper,
     return models;
 }
 
-// Levels, then the finishing passes: everything both mappers do after they have
-// models. `mopt` supplies the merge and cleanup thresholds -- there is one set
-// of them and this is the same set.
+// 两种建图器得到模型后共用分层与收尾流程，mopt 统一提供合并和清理阈值。
 inline std::vector<Reconstruction> assembleModels(Mapper& mapper,
                                                   std::vector<Reconstruction> models,
                                                   const ManagerOptions& mopt,
@@ -716,26 +506,16 @@ inline std::vector<Reconstruction> assembleModels(Mapper& mapper,
     st.finish.models_before = models.size();
     st.finish.covered_before = coveredImages(models).size();
 
-    // Before anything expensive touches them. The flat mapper's seed retries
-    // and its sub-model search can both hand over a model a bigger one already
-    // contains (D19, D41), and this is set arithmetic -- without it the first
-    // level bundle-adjusts, splits, merges, audits and grows every copy.
+    // 昂贵处理前先按图像集合删除被大模型覆盖的重复种子结果，避免对每个副本重复优化、审查与增长。
     models = dropRedundantModels(std::move(models), mopt, st.finish);
 
-    // The only test that catches repeated structure is the one the merger
-    // cannot run by itself (D45): without it a capture with two similar rooms
-    // merges one onto the other and every internal test agrees, because a fold
-    // agrees with itself.
+    // 重复结构可能使模型内部全部检查自洽，必须借助合并器自身没有的对应图接缝验证（D45）。
     MergeOptions merge_opt = mopt.merge;
     merge_opt.duplicate = mopt.duplicate;
     merge_opt.validate = seamValidator(mapper, mopt, &st.finish);
     merge_opt.rigs = mapper.rigs();
 
-    // A component that fitted its own focal to its own noise cannot align with
-    // anything, and on a rig every component is looking at the same physical
-    // cameras. Before the first merge, because the tests that accept one are
-    // measured in pixels. Two steps: a focal that has run away needs replacing
-    // rather than averaging, and only then is one shared solve meaningful.
+    // 首轮合并前先替换明显偏离的组焦距，再联合优化共享内参；直接平均错误焦距会使像素级合并检查失去意义。
     if (mopt.focal_consensus_tol > 0) refitOutlierCameras(mapper, models, mopt, st.finish);
     if (opt.joint_intrinsics && models.size() > 1 && focalSpreadPx(models) > kJointBaMovedPx) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -754,4 +534,4 @@ inline std::vector<Reconstruction> assembleModels(Mapper& mapper,
     return finishModels(mapper, std::move(models), merge_opt, mopt, opt, st, memo, dirty, seamed);
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

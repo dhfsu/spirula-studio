@@ -1,24 +1,11 @@
 #pragma once
 
-// Which language the UI is in, and how that is decided.
-//
-// Resolution order, first hit wins (§6.7 of the localization plan):
-//
-//   1. `--lang <code>` on the command line
-//   2. the SS_LANG environment variable
-//   3. the settings file (the GUI's language picker writes it here)
-//   4. the OS locale
-//   5. SS_DEFAULT_LANG, the compile-time default
-//
-// Step 5 is a *language*, not "English": a build shipped as
-// -DSS_DEFAULT_LANG=ja must come up Japanese in a container with no LANG set,
-// which is exactly the case a hard-coded English fallback gets wrong.
+// 界面语言按优先级选择：命令行 --lang、SS_LANG、保存的 GUI 设置、系统区域、编译期 SS_DEFAULT_LANG。
+// 最后一项是构建指定的语言，不固定为英语；例如日语默认构建在无 LANG 的容器中仍应显示日语。
 
 #include "i18n/Message.h"
 
-// The compile-time default is an identifier, not a string, so a typo in
-// -DSS_DEFAULT_LANG is a compile error naming the bad language rather than a
-// binary that silently comes up English.
+// 编译期默认语言使用标识符而非字符串，使拼写错误直接导致明确的编译错误。
 #ifndef SS_DEFAULT_LANG
 #define SS_DEFAULT_LANG en
 #endif
@@ -28,44 +15,34 @@ namespace i18n {
 
 inline constexpr Lang kDefaultLang = Lang::SS_DEFAULT_LANG;
 
-// "zh-Hans" -- the canonical code, what `--lang` prints and what the settings
-// file stores.
+// 规范语言码，如 zh-Hans，用于 --lang 输出与设置文件。
 const char* code(Lang l);
-// "简体中文" -- the language's own name, for the picker. Never translated.
+// 语言自称，如“简体中文”，供选择器使用，不再翻译。
 const char* native_name(Lang l);
-// "Chinese (Simplified)" -- for `--help` and diagnostics, always English.
+// 语言英文名称，如 Chinese (Simplified)，供帮助与诊断使用。
 const char* english_name(Lang l);
 
-// Accepts our own codes and anything an OS is likely to hand us:
-// "ja", "ja_JP.UTF-8", "zh-Hans-CN", "zh_TW", "pt-BR", "zh_hant". Returns
-// false and leaves `out` alone if nothing matches; "C" and "POSIX" do not
-// match (they mean "no preference", not "English").
+// 接受 ja、ja_JP.UTF-8、zh-Hans-CN、zh_TW、pt-BR、zh_hant 等形式；无匹配时返回 false 且不改 out。
+// C 与 POSIX 表示未指定偏好，不参与匹配。
 bool parse_lang(const char* s, Lang* out);
 
-// The OS's idea of the user's language, or kDefaultLang if it has none we
-// recognize.
+// 返回系统语言；无法识别时返回 kDefaultLang。
 Lang detect_os_lang();
 
-// Runs the resolution chain above and calls set_current(). `cli` and `saved`
-// may be null or empty. Returns what it settled on.
+// 按优先级解析并调用 set_current()；cli 与 saved 可为空，返回最终语言。
 Lang init(const char* cli, const char* saved);
 
-// True for the languages that cannot be rendered from the Latin font alone.
+// 判断是否无法仅靠拉丁字体渲染。
 bool needs_cjk_font(Lang l);
 
-// Scans argv for `--lang <code>` / `--lang=<code>`, REMOVES the arguments it
-// consumes (so no per-tool parser has to know about the flag), and returns the
-// value, or nullptr if the flag was absent. An unparseable value is left for
-// init() to reject with a message listing the codes.
+// 识别并移除 argv 中的 --lang <code> 或 --lang=<code>，返回值或 nullptr；非法值由 init() 报告并列出语言码。
 const char* take_lang_arg(int* argc, char** argv);
 
-// What take_lang_arg() found, for a component that learns the saved preference
-// only later: the GUI reads its settings file long after main() has parsed
-// argv, and has to re-run the chain without --lang losing to a stored value.
+// 保存 take_lang_arg() 的结果，供 GUI 加载设置后重新解析，保证命令行优先于保存的偏好。
 const char* lang_arg();
 
-// One line per language, for `--help`.
+// 帮助中每种语言占一行。
 std::string language_list();
 
-}  // namespace i18n
-}  // namespace spirula
+}  // 命名空间 i18n
+}  // 命名空间 spirula

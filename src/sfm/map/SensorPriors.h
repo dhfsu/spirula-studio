@@ -1,10 +1,5 @@
-// The video's IMU and GPS as a PriorSource (sfm/core/PriorSource.h): the
-// gyro's rotation between two frames, gravity in each frame, the
-// accelerometer's metric scale and the GPS position, each as a factor a
-// bundle adjustment takes while the model is built. The IMU-to-lens rotation
-// is calibrated from verified pairs before mapping and refined with gravity
-// once a model exists; every gauge quantity (up, scale, biases, the metric
-// frame) is refitted from the poses it is handed. docs/notes/sensor-priors.md.
+// 将视频 IMU/GPS 封装为 PriorSource，提供帧间旋转、重力、加速度尺度与位置 BA 因子。
+// 建图前由验证图像对标定 IMU 到镜头旋转，模型建立后用重力精化；向上、尺度、偏置和公制规范随输入位姿重拟合。
 #pragma once
 
 #include <algorithm>
@@ -27,24 +22,23 @@
 namespace sfm {
 
 struct SensorPriorOptions {
-    bool rotation = true;    // gyro relative rotations
-    bool up = true;          // gravity direction
-    bool scale = true;       // accelerometer triples
-    bool gps = true;         // GPS positions
-    double max_dt = 3.0;     // seconds a relative-rotation prior may span
-    // Sigma of a relative rotation grows with the gap: the calibration's own
-    // residual plus a gyro bias's drift (a MEMS bias of 0.03 deg/s).
+    bool rotation = true;    // 陀螺相对旋转
+    bool up = true;          // 重力方向
+    bool scale = true;       // 加速度三帧组约束
+    bool gps = true;         // GPS 位置
+    double max_dt = 3.0;     // 相对旋转先验的最大跨度，秒
+    // 旋转 sigma 随间隔增长，包含标定残差与 MEMS 约 0.03 度/秒偏置漂移。
     double drift_deg_per_s = 0.03;
     double min_rot_sigma_deg = 0.2;
     double min_up_sigma_deg = 1.0;
-    int calib_min_pairs = 30;    // two-view pairs a group needs before mapping
-    int calib_min_frames = 20;   // posed frames a group needs for the gravity refit
-    double gps_max_error = 5.0;  // metres, the fit's inlier radius
+    int calib_min_pairs = 30;    // 建图前每组所需双视图对数
+    int calib_min_frames = 20;   // 重力重拟合所需已定姿态帧数
+    double gps_max_error = 5.0;  // 拟合内点半径，米
     double gps_max_error_frac = 0.03;
     bool verbose = false;
 };
 
-// A verified pair's relative rotation, R_j = R_ji R_i over world -> camera.
+// 验证对相对旋转满足 R_j=R_ji R_i，各 R 为世界到相机旋转。
 struct PairRotationObs {
     uint32_t i = 0, j = 0;
     Mat3 R_ji;
@@ -54,17 +48,17 @@ struct SensorGroupState {
     int capture = -1;
     uint32_t camera = 0;
     std::string name;
-    bool ok = false;          // an extrinsic to use
-    bool from_pairs = false;  // ... calibrated from two-view rotations alone
-    bool gravity = false;     // ... refined with gravity from a model
+    bool ok = false;          // 已有可用外参
+    bool from_pairs = false;  // 仅通过双视图旋转标定
+    bool gravity = false;     // 已结合模型重力精化
     ExtrinsicFit fit;
-    Mat3 X = mat3Identity();  // camera <- IMU
-    double sign = 1.0;        // gyro integration sign
+    Mat3 X = mat3Identity();  // 相机 <- IMU
+    double sign = 1.0;        // 陀螺积分符号
     int frames_at_calib = 0;
-    int pairs = 0;            // two-view pairs offered
+    int pairs = 0;            // 输入双视图对数
 };
 
-// What the last factors() call produced, for the log.
+// 最近一次 factors 的输出统计，供日志使用。
 struct SensorFactorStats {
     int frames = 0;
     int rotations = 0, ups = 0, triples = 0, gps = 0;
@@ -116,7 +110,7 @@ public:
             }
             grp_[i] = it->second;
         }
-        // Time order per capture, for neighbours().
+        // 各采集按时间排序，供 neighbours 查询。
         order_.assign(caps_.size(), {});
         for (uint32_t i = 0; i < n; i++)
             if (cap_[i] >= 0) order_[(size_t)cap_[i]].push_back(i);
@@ -142,7 +136,7 @@ public:
             if (g.ok && caps_[(size_t)g.capture].timeline->hasRotation()) return true;
         return false;
     }
-    // Whether a two-view pair is worth offering to calibrateFromPairs.
+    // 判断双视图对是否适合用于标定。
     bool calibrationPair(uint32_t i, uint32_t j) const {
         if (!has(i) || !has(j) || cap_[i] != cap_[j] || grp_[i] != grp_[j]) return false;
         const double dt = std::fabs(t_[j] - t_[i]);
@@ -150,16 +144,14 @@ public:
                caps_[(size_t)cap_[i]].timeline->hasRotation();
     }
 
-    // The IMU-to-lens rotation per group from verified pairs alone: the
-    // clock offset per capture first, then the hand-eye fit. Gravity is not
-    // available yet, so the sign of X stays open until a model settles it.
+    // 先估逐采集时钟偏移，再用验证旋转做组内手眼拟合；尚无重力时 X 符号留待模型确定。
     void calibrateFromPairs(const std::vector<PairRotationObs>& obs) {
         std::lock_guard<std::mutex> lk(mu_);
         std::vector<std::vector<RotationPairObs>> per_group(groups_.size());
         for (const PairRotationObs& o : obs) {
             if (!calibrationPair(o.i, o.j)) continue;
             uint32_t a = o.i, b = o.j;
-            // A = R(t0) R(t1)^T with t0 < t1: R_i R_j^T = R_ji^T when i is first.
+            // A=R(t0)R(t1)^T，t0<t1；i 在前时 R_i R_j^T=R_ji^T。
             Mat3 A = transpose(o.R_ji);
             if (t_[a] > t_[b]) {
                 std::swap(a, b);
@@ -196,7 +188,7 @@ public:
         preint_.clear();
     }
 
-    // ---- PriorSource ----
+    // ---------------- 先验源接口 ----------------
 
     bool has(uint32_t img) const override { return img < cap_.size() && cap_[img] >= 0; }
 
@@ -211,8 +203,7 @@ public:
         const SensorGroupState& gi = groups_[(size_t)grp_[i]];
         const SensorGroupState& gj = groups_[(size_t)grp_[j]];
         if (!gi.ok || !gj.ok || gi.sign != gj.sign) return false;
-        // Before gravity settled it the sign of X is open, but X B^T X^T does
-        // not care; what it cannot survive is a degenerate (one-axis) fit.
+        // X B^T X^T 不受 X 符号影响，但无法容忍单轴运动的退化标定。
         if (gi.fit.degenerate || gj.fit.degenerate) return false;
         const double ti = time(i), tj = time(j);
         const double dt = std::fabs(tj - ti);
@@ -255,7 +246,7 @@ public:
     }
 
     PosePriors factors(const std::vector<PosedImage>& imgs) override {
-        // Atom mappers on several threads share one source (map/Atoms.h).
+        // 多个原子建图线程共享同一先验源。
         std::lock_guard<std::mutex> lk(mu_);
         return factorsLocked(imgs);
     }
@@ -290,7 +281,7 @@ private:
         }
         stats_.frames = (int)frames.size();
         if (frames.size() < 3) return out;
-        // The cameras' mean up, which settles each group's sign.
+        // 相机平均向上方向用于确定各组符号。
         Vec3 mean_up{0, 0, 0};
         for (const SensorFrame& f : frames) mean_up = mean_up + mul(transpose(f.R), Vec3{0, -1, 0});
         if (mean_up.norm() > 0) mean_up = mean_up.normalized();
@@ -302,7 +293,7 @@ private:
         refineClocks(frames, by_group);
         for (size_t g = 0; g < groups_.size(); g++) refineGroup(g, frames, by_group[g], mean_up);
 
-        // Up votes, the consensus, and the groups' signs against it.
+        // 向上投票、总体共识及各组符号。
         for (SensorFrame& f : frames) {
             const SensorGroupState& st = groups_[(size_t)f.group];
             if (!st.ok) continue;
@@ -322,7 +313,7 @@ private:
                 u.sigma = std::max(st.fit.sig_grav_deg, opt_.min_up_sigma_deg) * M_PI / 180.0;
                 out.ups.push_back(u);
             }
-        // Relative rotations along each lens's own chain.
+        // 沿每镜头自身时间链生成相对旋转。
         if (opt_.rotation)
             for (size_t g = 0; g < groups_.size(); g++) {
                 const std::vector<size_t>& fi = by_group[g];
@@ -343,9 +334,7 @@ private:
 
     double time(uint32_t img) const { return t_[img] + clock_[(size_t)cap_[img]]; }
 
-    // The IMU clock offset again, from the model's own rotations once a
-    // capture has enough posed frames and each time that count has doubled:
-    // the two-view rotations the pair stage searched it on are the noisier.
+    // 模型有足够已配准帧且数量翻倍时重估 IMU 时钟偏移，模型旋转通常比双视图阶段更准确。
     void refineClocks(std::vector<SensorFrame>& frames,
                       const std::vector<std::vector<size_t>>& by_group) {
         if (clock_frames_.size() != caps_.size()) clock_frames_.assign(caps_.size(), 0);
@@ -374,8 +363,7 @@ private:
         }
     }
 
-    // The gravity-inclusive calibration of one group over the model's frames,
-    // once it has enough of them and each time that count has doubled.
+    // 组内帧数足够且每次翻倍后，结合重力重新标定。
     void refineGroup(size_t g, const std::vector<SensorFrame>& frames,
                      const std::vector<size_t>& idx, const Vec3& mean_up) {
         SensorGroupState& st = groups_[g];
@@ -402,9 +390,7 @@ private:
         preint_.clear();
     }
 
-    // Each group's votes must agree with the cameras' mean up, then with the
-    // consensus of every group -- a lens looking straight down has no mean up
-    // to speak of, and X and -X satisfy the hand-eye constraint alike.
+    // 各组先与相机平均向上方向一致，再与跨组共识一致；俯拍镜头平均轴不可靠，X 与 -X 又都满足手眼约束。
     UpConsensus settleSigns(const std::vector<SensorFrame>& frames,
                             const std::vector<std::vector<size_t>>& by_group, const Vec3& mean_up) {
         auto vote = [&](const SensorFrame& f) {
@@ -451,8 +437,7 @@ private:
             .first->second;
     }
 
-    // The velocity-free triples of every lens, one scale per capture, and a
-    // centre factor per triple at the fitted scale, biases and gravity.
+    // 各镜头构造无速度三帧约束，每采集共用尺度，再按拟合偏置、重力和尺度生成中心因子。
     void scaleFactors(const std::vector<SensorFrame>& frames,
                       const std::vector<std::vector<size_t>>& by_group, const Vec3& up_w,
                       PosePriors& out) {
@@ -516,8 +501,7 @@ private:
                         f.A[2][k] = mat3Identity()[k] * d1;
                     }
                     f.b = (T.Q + up_w * (T.Gs * -9.81)) * (1.0 / fit.s);
-                    // A triple the fit rejected still gets its factor; the
-                    // Huber weight in the solve is what discounts it.
+                    // 尺度拟合排除的三帧组仍生成因子，由 BA 的 Huber 权重降低影响。
                     f.sigma = {sigma, sigma, sigma};
                     out.centres.push_back(f);
                 }
@@ -541,9 +525,7 @@ private:
         enu_origin_ok_ = true;
     }
 
-    // A similarity from the model onto the GPS track, then one position
-    // factor per inlier frame with the receiver's error inflated for its
-    // correlation (D74: the residuals under-state it by ~4x).
+    // 拟合模型到 GPS 轨迹的相似变换，为内点帧生成位置因子；接收器相关误差需放大约四倍（D74）。
     void gpsFactors(const std::vector<SensorFrame>& frames, const Vec3* up_w, PosePriors& out) {
         MetricRef ref;
         for (const SensorFrame& f : frames) {
@@ -579,13 +561,13 @@ private:
 
     std::vector<SensorCapture> caps_;
     SensorPriorOptions opt_;
-    std::vector<int32_t> cap_, grp_;    // per image; -1 = not timed
-    std::vector<double> t_;             // per image, video time
-    std::vector<double> clock_;         // per capture: the fitted IMU clock offset
-    std::vector<size_t> clock_frames_;  // ... and the posed frames it was last fitted on
+    std::vector<int32_t> cap_, grp_;    // 逐图像时间来源，-1 表示没有时间
+    std::vector<double> t_;             // 逐图像视频时间
+    std::vector<double> clock_;         // 逐采集拟合的 IMU 时钟偏移
+    std::vector<size_t> clock_frames_;  // 上次拟合使用的已配准帧数
     std::vector<TimeOffsetFit> offset_;
-    std::vector<std::vector<uint32_t>> order_;   // per capture, images by time
-    std::vector<uint32_t> rank_;                 // per image, its place in order_
+    std::vector<std::vector<uint32_t>> order_;   // 逐采集按时间排序的图像
+    std::vector<uint32_t> rank_;                 // 逐图像在 order_ 中的位置
     std::vector<SensorGroupState> groups_;
     std::unordered_map<uint64_t, Preintegration> preint_;
     SensorFactorStats stats_;
@@ -594,4 +576,4 @@ private:
     mutable std::mutex mu_;
 };
 
-}  // namespace sfm
+}  // 命名空间 sfm

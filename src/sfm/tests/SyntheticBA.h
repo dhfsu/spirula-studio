@@ -1,5 +1,4 @@
-// Synthetic bundle-adjustment problems for the solver tests: cameras on a
-// sphere looking at points inside it, optionally as rig frames.
+// BA 合成问题：球面相机观测内部点，可选组成 rig 帧。
 #pragma once
 
 #include <cmath>
@@ -13,8 +12,7 @@
 
 namespace synth {
 
-// Camera-frame +z is forward for every model but Snavely's, which projects
-// along -z; the generator flips the look-at frame for those two.
+// 除 Snavely 沿 -z 外，各模型沿 +z 投影；生成器为两种 Snavely 模型翻转观察坐标。
 inline bool forwardIsMinusZ(uint32_t model) { return model == 0 || model == 1; }
 
 inline const double* defaultIntr(uint32_t model, int& n) {
@@ -48,9 +46,7 @@ inline void project(uint32_t model, const double* intr, const double p[3], doubl
     bacpu::withModel(model, [&](auto M) { decltype(M)::template project<double>(intr, p, out); });
 }
 
-// nImg cameras on a sphere looking at the origin, nPt points inside it.
-// `groups` is 1 (one shared camera) or nImg (one per image); `rig` > 1 makes
-// each camera a frame of that many members, `rig_mask` of each refined.
+// nImg 个球面相机看向原点，内部 nPt 点；groups 为 1 或 nImg，rig>1 时每相机扩成多个成员的帧，rig_mask 指定自由外参。
 inline BAProblem makeProblem(uint32_t model, uint32_t nImg, uint32_t nPt, uint32_t groups,
                       double noise, uint32_t seed, int nfree = -1, uint32_t rig = 0,
                       bool rig_free = true, uint32_t rig_mask = kExtAll) {
@@ -100,7 +96,7 @@ inline BAProblem makeProblem(uint32_t model, uint32_t nImg, uint32_t nPt, uint32
         const sfm::Vec3 fw = (sfm::Vec3{0, 0, 0} - c).normalized();
         const sfm::Vec3 rt = sfm::Vec3{0, 1, 0}.cross(fw).normalized();
         const sfm::Vec3 u2 = fw.cross(rt);
-        // -z forward for Snavely; flipping two rows keeps det = +1
+        // Snavely 沿 -z，翻转两行保持 det=+1
         const double s = minusZ ? -1.0 : 1.0;
         const sfm::Mat3 R{rt.x,     rt.y,     rt.z,     s * u2.x, s * u2.y,
                           s * u2.z, s * fw.x, s * fw.y, s * fw.z};
@@ -131,7 +127,7 @@ inline BAProblem makeProblem(uint32_t model, uint32_t nImg, uint32_t nPt, uint32
     P.intr.resize((size_t)ni * groups);
     for (uint32_t g = 0; g < groups; g++) {
         for (int j = 0; j < ni; j++) P.intr[(size_t)ni * g + j] = base[j] * (1.0 + 0.005 * unit(rng));
-        // EQUIRECTANGULAR's two parameters are the image size and never refine
+        // 等距柱状模型的两个参数为图像尺寸，不能优化
         const uint32_t nf = model == 9 ? 0u : (uint32_t)(nfree >= 0 ? std::min(nfree, ni) : ni);
         P.groups[g] = {(uint32_t)(ni * g), 0, nf, model};
     }
@@ -181,11 +177,11 @@ inline BAProblem makeProblem(uint32_t model, uint32_t nImg, uint32_t nPt, uint32
     P.n_dim = P.pose_dim + P.ext_dim + P.free_intr;
     finalizeTables(P);
 
-    // perturb, so the solver has something to do
+    // 加入扰动使求解器有可优化误差
     for (uint32_t i = 0; i < 6 * nFrames; i++) P.poses[i] += 0.004 * gauss(rng);
     for (uint32_t i = 0; i < P.exts.size(); i++) P.exts[i] += 0.003 * gauss(rng);
     for (uint32_t p = 0; p < 3 * nPt; p++) P.points[p] += 0.01 * gauss(rng);
     return P;
 }
 
-}  // namespace synth
+}  // 命名空间 synth

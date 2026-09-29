@@ -1,21 +1,18 @@
 #pragma once
 
-// Quarter turns and mirroring of an interleaved host image buffer: the EXIF
-// Orientation transform (sfm/core/Exif.h ExifTransform) applied to pixels, in
-// the one place every path that bakes it in reads it from.
+// 主机交错图像的四分之一圈旋转与镜像，统一实现 ExifTransform 所描述的像素方向变换。
 
 #include <cstddef>
 #include <utility>
 
 namespace spirula {
 
-// The size `turns_cw` quarter turns leave a w x h image at.
+// w × h 图像顺时针旋转 turns_cw 个四分之一圈后的尺寸。
 inline void oriented_size(int turns_cw, int& w, int& h) {
     if (turns_cw & 1) std::swap(w, h);
 }
 
-// Turn clockwise, then mirror horizontally, matching ExifTransform. `dst` holds
-// w*h*channels elements and may not alias `src`.
+// 先顺时针旋转，再水平镜像，与 ExifTransform 一致；dst 容纳 w*h*channels 个元素且不能与 src 重叠。
 template <typename T>
 void orient_pixels(const T* src, int w, int h, int channels,
                    int turns_cw, bool mirror, T* dst) {
@@ -40,4 +37,4 @@ void orient_pixels(const T* src, int w, int h, int channels,
     }
 }
 
-}  // namespace spirula
+}  // 命名空间 spirula

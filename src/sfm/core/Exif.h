@@ -1,26 +1,5 @@
-// EXIF metadata: the focal-length prior and the camera identity, read straight
-// from the file header.
-//
-// Why this exists at all: without a prior, a new camera starts at COLMAP's
-// geometric guess (1.2*max(w,h) for a pinhole). On a 24 mm full-frame capture
-// that guess is 6739 px against a true 3637 -- 85% long, and
-// focal is the parameter the incremental mapper is least able to recover on its
-// own, because a too-long focal is absorbed by distortion and a shallow
-// baseline. EXIF turns that guess into a measurement for every camera that
-// records one, which is most of them (D46).
-//
-// We parse the TIFF block ourselves rather than teaching the vendored stb_image
-// about EXIF: stb hands back pixels and we only want ~six tags, the format is
-// small and well specified, and keeping the vendored decoder pristine means it
-// can still be updated by dropping in a new file (D5). Only the file header is
-// read -- a few KB, not the image.
-//
-// Deliberately *not* ported: COLMAP's sensor-width database (specs.h, a few
-// thousand hand-collected make/model -> sensor width rows). It is data, not an
-// algorithm, and it only matters for cameras that record FocalLength but
-// neither FocalLengthIn35mmFilm nor FocalPlaneXResolution. Those two cover
-// every camera in our datasets; a miss just falls back to the geometric guess,
-// exactly as before.
+// 从文件头读取 EXIF 焦距和相机身份；24 mm 全画幅的几何猜测可达 6739 px，而真实约 3637 px，过长焦距容易被畸变与浅基线吸收。
+// 独立解析少量 TIFF 标签，不修改第三方像素解码器，仅需读取数 KB。缺少可换算传感器尺度的标签时回退几何猜测。
 #pragma once
 
 #include <cmath>
@@ -34,25 +13,23 @@
 namespace sfm {
 
 struct ExifData {
-    bool valid = false;         // an EXIF block was found and parsed
+    bool valid = false;         // 已找到并解析 EXIF 块
     std::string make, model;
     double focal_mm = 0;        // Exif:FocalLength
     double focal_35mm = 0;      // Exif:FocalLengthIn35mmFilm
     double focal_plane_x_res = 0;   // Exif:FocalPlaneXResolution
-    int focal_plane_unit = 0;       // Exif:FocalPlaneResolutionUnit (2=in, 3=cm, 4=mm, 5=um)
+    int focal_plane_unit = 0;       // Exif:FocalPlaneResolutionUnit，2=英寸、3=厘米、4=毫米、5=微米
     int pixel_width = 0, pixel_height = 0;  // Exif:PixelXDimension/PixelYDimension
-    int orientation = 1;        // Exif:Orientation, 1..8 (1 = stored as shown)
+    int orientation = 1;        // Exif:Orientation，范围 1..8，1 表示存储方向即显示方向
 
-    double exposure_time = 0;   // Exif:ExposureTime, seconds
+    double exposure_time = 0;   // Exif:ExposureTime，单位秒
     double f_number = 0;        // Exif:FNumber
-    double iso = 0;             // Exif:PhotographicSensitivity (+ SOS/REI/ISOSpeed fallbacks)
-    // APEX forms, NaN when absent (Tv=0 means a 1 s exposure, so 0 cannot
-    // mark "missing"): t = 2^-Tv, N = 2^(Av/2).
+    double iso = 0;             // Exif:PhotographicSensitivity，兼容 SOS/REI/ISOSpeed
+    // APEX 缺值为 NaN，因为 Tv=0 是合法的 1 s 曝光：t=2^-Tv，N=2^(Av/2)。
     double shutter_apex  = std::numeric_limits<double>::quiet_NaN();  // Exif:ShutterSpeedValue
     double aperture_apex = std::numeric_limits<double>::quiet_NaN();  // Exif:ApertureValue
 
-    // GPS, from the separate IFD tag 0x8825 points at. Degrees, signed by the
-    // hemisphere ref; altitude negated when GPSAltitudeRef says below sea level.
+    // GPS 位于 0x8825 指向的独立 IFD；经纬度以度表示并按半球决定符号，海平面以下高度取负。
     bool has_gps = false;
     bool has_alt = false;
     double lat_deg = 0, lon_deg = 0, alt_m = 0;
@@ -62,9 +39,7 @@ struct ExifData {
 
 namespace detail {
 
-// Bounds-checked little/big-endian reader over the TIFF block. Every accessor
-// returns 0 out of range, so a truncated or hostile file yields empty fields
-// instead of a read past the buffer.
+// TIFF 大小端读取均检查边界，越界返回 0，使截断或恶意文件只产生空字段，不越界访问。
 struct TiffReader {
     const uint8_t* p = nullptr;
     size_t n = 0;
@@ -91,8 +66,7 @@ inline size_t tiffTypeSize(uint16_t t) {
     }
 }
 
-// One IFD entry's value as a double (first component only, which is all any tag
-// we read is). Returns false for types we do not decode.
+// 将 IFD 条目的首分量转为 double，不支持的类型返回 false。
 inline bool tiffValue(const TiffReader& r, size_t entry, double& out) {
     uint16_t type = r.u16(entry + 2);
     uint32_t count = r.u32(entry + 4);
@@ -121,8 +95,7 @@ inline bool tiffValue(const TiffReader& r, size_t entry, double& out) {
     }
 }
 
-// The first `n` components of a RATIONAL entry. tiffValue reads one, which is
-// all the lens tags need; a DMS coordinate is three.
+// 读取 RATIONAL 的前 n 个分量；镜头标签只需一个，经纬度的度分秒需要三个。
 inline bool tiffRationals(const TiffReader& r, size_t entry, int n, double* out) {
     if (r.u16(entry + 2) != 5 || (int)r.u32(entry + 4) < n) return false;
     const size_t vo = (8u * (unsigned)n <= 4) ? entry + 8 : r.u32(entry + 8);
@@ -142,13 +115,12 @@ inline std::string tiffString(const TiffReader& r, size_t entry) {
     size_t len = std::min((size_t)count, r.n - vo);
     while (len > 0 && r.p[vo + len - 1] == '\0') len--;
     std::string s((const char*)r.p + vo, len);
-    // Trailing spaces are common ("NIKON CORPORATION   ").
+    // 相机制造商名称常带末尾空格，需要裁剪。
     while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
     return s;
 }
 
-// The GPS IFD, which numbers its own tags 1..31 -- the same numbers IFD0 uses
-// for width, height and compression. It gets its own switch for that reason.
+// GPS IFD 使用独立标签编号，与 IFD0 编号重叠，因此必须单独分派。
 inline void parseGpsIfd(const TiffReader& r, size_t off, ExifData& out) {
     if (off + 2 > r.n) return;
     uint16_t count = r.u16(off);
@@ -179,8 +151,7 @@ inline void parseGpsIfd(const TiffReader& r, size_t off, ExifData& out) {
     out.has_gps = true;
 }
 
-// Walk one IFD, filling `out`. `depth` guards against a file whose Exif-IFD
-// pointer loops back on itself.
+// 遍历 IFD 填充 out，depth 限制防止恶意子 IFD 指针形成循环。
 inline void parseIfd(const TiffReader& r, size_t off, ExifData& out, int depth) {
     if (depth > 3 || off + 2 > r.n) return;
     uint16_t count = r.u16(off);
@@ -195,10 +166,10 @@ inline void parseIfd(const TiffReader& r, size_t off, ExifData& out, int depth) 
                 break;
             case 0x010F: out.make = tiffString(r, e); break;
             case 0x0110: out.model = tiffString(r, e); break;
-            case 0x8769:  // Exif sub-IFD, where the lens tags live
+            case 0x8769:  // 镜头标签所在的 EXIF 子 IFD
                 if (tiffValue(r, e, v) && v > 0) parseIfd(r, (size_t)v, out, depth + 1);
                 break;
-            case 0x8825:  // GPS IFD; a separate walk, not this switch
+            case 0x8825:  // GPS IFD 使用独立遍历
                 if (tiffValue(r, e, v) && v > 0) parseGpsIfd(r, (size_t)v, out);
                 break;
             case 0x829A: if (tiffValue(r, e, v) && v > 0) out.exposure_time = v; break;
@@ -220,9 +191,9 @@ inline void parseIfd(const TiffReader& r, size_t off, ExifData& out, int depth) 
     }
 }
 
-}  // namespace detail
+}  // 命名空间 detail
 
-// Parse a TIFF block (starting at the "II"/"MM" byte-order mark).
+// 从 II/MM 字节序标记开始解析 TIFF 块。
 inline ExifData parseExifTiff(const uint8_t* data, size_t size) {
     ExifData out;
     if (size < 8) return out;
@@ -242,9 +213,7 @@ inline ExifData parseExifTiff(const uint8_t* data, size_t size) {
 
 namespace detail {
 
-// The first APP1 segment whose payload starts with `sig`, `sig` included. The
-// marker chain is SEEKED -- a dataset parse asks every image for its
-// Orientation, and a fixed prefix would read megabytes per image.
+// 查找首个以 sig 开头的 APP1 载荷并保留 sig；通过 seek 跳过其他段，避免每张照片读取数 MB 前缀。
 inline std::vector<uint8_t> readApp1Segment(const std::string& path, const char* sig,
                                             size_t sig_len) {
     std::vector<uint8_t> seg_buf;
@@ -259,18 +228,17 @@ inline std::vector<uint8_t> readApp1Segment(const std::string& path, const char*
     while (at(o, hdr, 2)) {
         if (hdr[0] != 0xFF) break;
         const uint8_t marker = hdr[1];
-        // 0xFF is also the fill byte writers pad with before a marker.
+        // 写入器可在标记前用 0xFF 填充。
         if (marker == 0xFF) { o += 1; continue; }
         if (marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
             o += 2;
             continue;
         }
-        if (marker == 0xDA || marker == 0xD9) break;  // scan data / end: no more metadata
+        if (marker == 0xDA || marker == 0xD9) break;  // 遇到扫描数据或结束标记后不再有元数据
         if (!at(o + 2, hdr, 2)) break;
         const size_t seg = (size_t)(hdr[0] << 8 | hdr[1]);
         if (seg < 2) break;
-        // APP1 carries both Exif and XMP, so a segment of the other kind keeps
-        // the walk going rather than ending it.
+        // APP1 可装 EXIF 或 XMP，遇到另一类型时继续查找。
         if (marker == 0xE1 && seg >= 2 + sig_len) {
             seg_buf.resize(sig_len);
             if (!at(o + 4, seg_buf.data(), sig_len)) break;
@@ -290,40 +258,34 @@ inline std::vector<uint8_t> readApp1Segment(const std::string& path, const char*
     return seg_buf;
 }
 
-}  // namespace detail
+}  // 命名空间 detail
 
-// A JPEG's APP1 Exif segment, "Exif\0\0" and the TIFF block after it; empty
-// when there is none.
+// 返回 JPEG APP1 中的 Exif\0\0 与随后 TIFF 块，不存在时为空。
 inline std::vector<uint8_t> readExifSegment(const std::string& path) {
     return detail::readApp1Segment(path, "Exif\0\0", 6);
 }
 
-// A JPEG's XMP packet, the text after the namespace header; empty when there
-// is none.
+// 返回 JPEG XMP 命名空间头之后的文本，不存在时为空。
 inline std::string readXmpPacket(const std::string& path) {
-    static const char kSig[] = "http://ns.adobe.com/xap/1.0/";   // the NUL is part of it
+    static const char kSig[] = "http://ns.adobe.com/xap/1.0/";   // 末尾 NUL 属于标记的一部分
     const std::vector<uint8_t> seg = detail::readApp1Segment(path, kSig, sizeof kSig);
     if (seg.size() <= sizeof kSig) return {};
     return std::string((const char*)seg.data() + sizeof kSig, seg.size() - sizeof kSig);
 }
 
-// Read EXIF from an image file. Anything without one comes back invalid, which
-// every caller treats as "no prior".
+// 没有 EXIF 的图像返回无效结果，调用方将其视为没有先验。
 inline ExifData readExif(const std::string& path) {
     const std::vector<uint8_t> seg = readExifSegment(path);
     if (seg.size() <= 6) return ExifData();
     return parseExifTiff(seg.data() + 6, seg.size() - 6);
 }
 
-// ---------------------------------------------------------------------------
-// Orientation
-// ---------------------------------------------------------------------------
+// ---------------- 图像方向 ----------------
 
-// What an Orientation tag asks for, as the transform from the STORED pixels to
-// the displayed image: turn clockwise first, then mirror horizontally.
+// Orientation 将存储像素变成显示图像：先顺时针旋转，再水平镜像。
 struct ExifTransform {
-    int  turns_cw = 0;      // 0..3 quarter turns
-    bool mirror = false;    // horizontal mirror, applied after the turns
+    int  turns_cw = 0;      // 0..3 个四分之一圈
+    bool mirror = false;    // 旋转后应用水平镜像
     bool identity() const { return turns_cw == 0 && !mirror; }
 };
 
@@ -340,9 +302,7 @@ inline ExifTransform exifTransform(int orientation) {
     }
 }
 
-// Up, in the camera frame of the STORED image (x right, y down, z forward).
-// A mirror leaves it where it is, which is what lets an orientation carrying
-// one still fix a reconstruction's gauge without touching any pixels.
+// 存储图像相机坐标系的向上方向，轴为右、下、前；镜像不改变向上方向，因此无需修改像素也能用于规范对齐。
 inline void exifUpInCamera(int orientation, double up[3]) {
     static const double kX[4] = {0, -1, 0, 1};
     static const double kY[4] = {-1, 0, 1, 0};
@@ -352,14 +312,12 @@ inline void exifUpInCamera(int orientation, double up[3]) {
     up[2] = 0;
 }
 
-// The Orientation tag alone; 1 for a file that carries none.
+// 仅读取 Orientation 标签，无标签时返回 1。
 inline int exifOrientation(const std::string& path) {
     return readExif(path).orientation;
 }
 
-// Rewrite an EXIF block to describe pixels that already carry the turn, and
-// unlink the thumbnail, which is still the old way up. Every tag written is a
-// SHORT or LONG inside its own IFD entry, so no offset in the block moves.
+// 像素已旋转后更新 EXIF，并断开仍保留旧方向的缩略图；仅改 IFD 条目内的 SHORT/LONG 值，不移动块内偏移。
 inline void exifFlattenOrientation(uint8_t* tiff, size_t size, int w, int h) {
     if (size < 8) return;
     detail::TiffReader r;
@@ -376,7 +334,7 @@ inline void exifFlattenOrientation(uint8_t* tiff, size_t size, int w, int h) {
         const uint16_t type = r.u16(entry + 2);
         if (r.u32(entry + 4) != 1 || entry + 12 > size) return;
         uint8_t* v = tiff + entry + 8;
-        if (type == 3) {              // SHORT: the low half of the value field
+        if (type == 3) {              // SHORT 使用值字段的低半部分
             for (int i = 0; i < 2; i++) v[r.le ? i : 1 - i] = (uint8_t)(value >> (8 * i));
         } else if (type == 4) {       // LONG
             for (int i = 0; i < 4; i++) v[r.le ? i : 3 - i] = (uint8_t)(value >> (8 * i));
@@ -409,9 +367,7 @@ inline void exifFlattenOrientation(uint8_t* tiff, size_t size, int w, int h) {
     if (next + 4 <= size) for (int i = 0; i < 4; i++) tiff[next + i] = 0;
 }
 
-// Zero FocalLength and FocalLengthIn35mmFilm -- both read as "unknown" -- for
-// pixels they no longer describe: a 360 camera states the pinhole equivalent
-// of its whole frame, and exifFocalPx would make that a KNOWN fisheye focal.
+// 对已不适用原焦距的视图清零 FocalLength 与等效 35 mm 焦距；360 全帧针孔等效焦距不能误作为鱼眼已知焦距。
 inline void exifClearFocal(uint8_t* tiff, size_t size) {
     if (size < 8) return;
     detail::TiffReader r;
@@ -442,27 +398,15 @@ inline void exifClearFocal(uint8_t* tiff, size_t size) {
             at = e + 8;
             len = type == 3 ? 2 : 4;
         } else if (tag == 0x920A && type == 5) {
-            at = r.u32(e + 8);   // the numerator; the denominator stays nonzero
+            at = r.u32(e + 8);   // 仅清零分子，分母保持非零
             len = 4;
         }
         if (len > 0 && at + len <= size) std::memset(tiff + at, 0, len);
     }
 }
 
-// The focal length in pixels of the *stored* image, or 0 if EXIF cannot say.
-// COLMAP's rules (sensor/bitmap.cc ExifFocalLength), in the same order:
-//
-//   1. FocalLengthIn35mmFilm: by the CIPA definition this is the focal a 35 mm
-//      frame (43.27 mm diagonal) would need for the same angle of view, so
-//      f_px = f35 / 43.27 * image_diagonal.
-//   2. FocalLength with FocalPlaneXResolution: the resolution gives sensor
-//      pixels per mm directly, so f_px = f_mm * px_per_mm.
-//
-// One addition over COLMAP: rule 2's resolution describes the sensor readout,
-// and a file that was resized after capture keeps its EXIF while its pixel
-// dimensions change. When EXIF records the capture dimensions and they differ
-// from the actual ones, px_per_mm is rescaled by the ratio. A no-op whenever
-// they agree, which is the common case.
+// 计算存储图像的像素焦距；优先 f_px = f35 / 43.27 * image_diagonal，其次 f_px = f_mm * px_per_mm，无法确定时为 0。
+// 焦平面分辨率属于原始传感器读出；若实际图像已缩放且 EXIF 保留原尺寸，则按尺寸比修正 px_per_mm。
 inline double exifFocalPx(const ExifData& e, int width, int height) {
     if (!e.valid || width <= 0 || height <= 0) return 0;
     if (e.focal_35mm > 0) {
@@ -473,26 +417,22 @@ inline double exifFocalPx(const ExifData& e, int width, int height) {
         e.focal_plane_unit <= 5) {
         double px_per_mm = 0;
         switch (e.focal_plane_unit) {
-            case 2: px_per_mm = e.focal_plane_x_res / 25.4; break;   // inches
-            case 3: px_per_mm = e.focal_plane_x_res / 10.0; break;   // cm
-            case 4: px_per_mm = e.focal_plane_x_res; break;          // mm
-            case 5: px_per_mm = e.focal_plane_x_res * 1000.0; break; // um
+            case 2: px_per_mm = e.focal_plane_x_res / 25.4; break;   // 英寸
+            case 3: px_per_mm = e.focal_plane_x_res / 10.0; break;   // 厘米
+            case 4: px_per_mm = e.focal_plane_x_res; break;          // 毫米
+            case 5: px_per_mm = e.focal_plane_x_res * 1000.0; break; // 微米
             default: return 0;
         }
         if (e.pixel_width > 0 && e.pixel_width != width)
             px_per_mm *= (double)width / e.pixel_width;
         double f = e.focal_mm * px_per_mm;
-        // A sanity floor/ceiling: a focal outside [0.1, 100] x the long edge is
-        // a misparsed tag, not a lens, and feeding it to the mapper is worse
-        // than having no prior at all.
+        // 焦距超出图像长边的 [0.1,100] 倍通常意味着标签误读，应放弃先验而非传给建图器。
         if (f > 0.1 * std::max(width, height) && f < 100.0 * std::max(width, height)) return f;
     }
     return 0;
 }
 
-// Relative capture exposure in EV stops, log2(t / N^2 * ISO), preferring the
-// direct tags over their APEX forms. A missing component counts as 1; false
-// only when the file records none of the three.
+// 相对曝光 EV 为 log2(t / N^2 * ISO)，直接标签优先于 APEX；缺项按 1 处理，三项全缺时返回 false。
 inline bool exifExposureEv(const ExifData& e, double& ev) {
     if (!e.valid) return false;
     double t = e.exposure_time > 0 ? e.exposure_time
@@ -507,16 +447,8 @@ inline bool exifExposureEv(const ExifData& e, double& ev) {
     return true;
 }
 
-// The identity two images must share to be assumed the same physical camera:
-// make, model and frame size. Empty when EXIF cannot identify the camera, which
-// means "do not group by it".
-//
-// COLMAP's ExifCameraModel also puts the focal length in this string, so a zoom
-// lens at 24.0 and at 25.0 mm is two cameras. That is the right instinct and the
-// wrong test: EXIF quantizes the focal to whole millimetres, which is a 4% step
-// at the wide end, so string equality splits one fixed lens in two while
-// treating a 1.02x zoom as decisive. The focal is compared separately, with a
-// tolerance (detail::exifFocalClusters, D48).
+// 相机身份由制造商、型号和尺寸组成，未知时为空且不据此分组。
+// 焦距单独按容差聚类，避免 EXIF 整毫米量化将固定镜头的 24/25 mm 记录误拆为两个相机（D48）。
 inline std::string exifCameraKey(const ExifData& e, int width, int height) {
     if (!e.valid || e.make.empty() || e.model.empty() || !e.hasFocal()) return {};
     char buf[32];
@@ -524,4 +456,4 @@ inline std::string exifCameraKey(const ExifData& e, int width, int height) {
     return e.make + "-" + e.model + buf;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

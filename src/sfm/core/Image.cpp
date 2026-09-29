@@ -1,9 +1,4 @@
-// The decode path declared in sfm/core/Image.h.
-//
-// stb_image is instantiated once for the whole repository, in
-// src/external/stb_image_impl.cpp, which cmake/SsSfm.cmake adds to this
-// library. Do NOT define STB_IMAGE_IMPLEMENTATION here: spirula-gui links both
-// this library and the engine, which carries that TU too.
+// Image.h 的解码实现；stb_image 在 src/external/stb_image_impl.cpp 中统一实例化，此处不能再次定义 STB_IMAGE_IMPLEMENTATION。
 #include "sfm/core/Image.h"
 
 #include "core/ColorSpace.h"
@@ -16,10 +11,7 @@
 
 namespace sfm {
 
-// Box-average an interleaved-RGB uint8 image to (dw,dh). A cheap area filter is
-// enough: the color is only ever point-sampled at keypoints for the point cloud,
-// not fed to SIFT. Downscaling avoids holding a full-res color buffer alongside
-// the gray one, which matters for the batch decoder's memory budget.
+// 用区域均值将交错 RGB 缩到目标尺寸，颜色仅用于点云采样，无需昂贵滤波；避免与灰度同时保留全分辨率彩色缓冲。
 static std::vector<uint8_t> downscaleRgb(const unsigned char* src, int w, int h, int dw, int dh) {
     std::vector<uint8_t> out((size_t)dw * dh * 3);
     for (int y = 0; y < dh; y++) {
@@ -39,7 +31,7 @@ static std::vector<uint8_t> downscaleRgb(const unsigned char* src, int w, int h,
     return out;
 }
 
-// Rec.601 luma, matching COLMAP's FreeImage grayscale conversion.
+// Rec.601 亮度权重，与 COLMAP 的 FreeImage 灰度转换一致。
 static constexpr float kLumaR = 0.299f / 255.0f;
 static constexpr float kLumaG = 0.587f / 255.0f;
 static constexpr float kLumaB = 0.114f / 255.0f;
@@ -49,13 +41,8 @@ static inline float lumaAt(const unsigned char* rgb, int w, int x, int y) {
     return kLumaR * p[0] + kLumaG * p[1] + kLumaB * p[2];
 }
 
-// Bilinearly resample interleaved-RGB uint8 straight to a (dw,dh) gray float
-// image, converting to luma at the four taps. Arithmetically identical to
-// building the full-resolution gray image and running resizeGray() on it --
-// same expression, same order, same rounding -- but it never materializes the
-// full-resolution float buffer. That buffer was 4 of the 7 bytes per source
-// pixel the batch decoder budgets per concurrent decode (sfm/core/ImageLoader.h),
-// and on 20 MP inputs the budget was what capped the decode pool at 3 threads.
+// 直接从 RGB 四邻点计算亮度并双线性重采样为目标灰度，与先转全尺寸灰度再缩放的运算顺序和舍入一致。
+// 省去每源像素 4 字节的全尺寸浮点缓冲，改善大图解码并发预算。
 static void resizeGrayFromRgb(const unsigned char* rgb, int w, int h, int dw, int dh,
                               std::vector<float>& out) {
     out.resize((size_t)dw * dh);
@@ -84,9 +71,7 @@ static void resizeGrayFromRgb(const unsigned char* rgb, int w, int h, int dw, in
 
 namespace {
 
-// Turn a decoded image, its colour and its mask by the EXIF Orientation. Done
-// on the DOWNSCALED buffers: a quarter turn commutes with the resample, and
-// turning the full-resolution RGB would double what a concurrent decode holds.
+// 在缩小后的灰度、颜色和掩码上应用 EXIF 旋转；四分之一圈旋转与重采样可交换，避免全尺寸 RGB 旋转使峰值内存翻倍。
 void applyExifOrientation(GrayImage& img) {
     const ExifTransform xf = exifTransform(img.exif.orientation);
     if (xf.turns_cw != 0) {
@@ -116,15 +101,14 @@ void applyExifOrientation(GrayImage& img) {
     img.exif.orientation = 1;
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 GrayImage loadGrayImage(const std::string& path, int max_image_size, bool want_color,
                         const std::string& mask_path,
                         const std::string& gamut, std::optional<bool> is_linear,
                         bool flip_mask, bool apply_exif_orientation) {
     int w = 0, h = 0, chan = 0;
-    // Force 3 channels; we do our own luma so behavior is decoder-independent.
-    // An EXR decodes on this thread: the pool above already owns every core.
+    // 强制解码三通道并统一计算亮度，消除解码器差异；EXR 使用当前线程，外层池已占用全部核心。
     std::vector<uint8_t> exr_rgb;
     unsigned char* rgb = nullptr;
     if (exr::is_exr(path)) {
@@ -150,7 +134,7 @@ GrayImage loadGrayImage(const std::string& path, int max_image_size, bool want_c
     img.orig_width = w;
     img.orig_height = h;
 
-    // Downscale so the long edge is at most max_image_size (COLMAP default 3200).
+    // 将最长边限制到 max_image_size，COLMAP 默认值为 3200。
     int dw = w, dh = h;
     int longEdge = std::max(w, h);
     if (max_image_size > 0 && longEdge > max_image_size) {
@@ -160,8 +144,7 @@ GrayImage loadGrayImage(const std::string& path, int max_image_size, bool want_c
     }
     img.width = dw;
     img.height = dh;
-    // Keep the color companion at the *gray* (post-downscale) resolution, so a
-    // keypoint's coordinates index it directly.
+    // 颜色缓冲与缩小后的灰度尺寸一致，使关键点可直接索引。
     if (want_color) {
         img.rgb = (dw == w && dh == h) ? std::vector<uint8_t>(rgb, rgb + (size_t)w * h * 3)
                                        : downscaleRgb(rgb, w, h, dw, dh);
@@ -174,24 +157,19 @@ GrayImage loadGrayImage(const std::string& path, int max_image_size, bool want_c
         resizeGrayFromRgb(rgb, w, h, dw, dh, img.data);
     }
     if (exr_rgb.empty()) stbi_image_free(rgb);
-    // Kept at the mask file's own resolution: applyMask() samples it in uv, so
-    // resampling it to match `img` would only lose detail (D39).
+    // 保留掩码自身分辨率并按 UV 采样，避免额外缩放损失边界细节（D39）。
     if (!mask_path.empty()) {
         img.mask = loadMask(mask_path);
         if (flip_mask) img.mask.invert();
     }
-    img.exif = readExif(path);  // header bytes only; see sfm/core/Exif.h
+    img.exif = readExif(path);  // 仅读取文件头，见 Exif.h
     if (apply_exif_orientation) applyExifOrientation(img);
     return img;
 }
 
 Mask loadMask(const std::string& path) {
     int w = 0, h = 0, chan = 0;
-    // One channel: a mask is categorical, and every convention in the wild
-    // (1-bit PNG, 8-bit gray, RGB white-on-black, RGBA alpha) reduces to the
-    // same thing under stb's gray conversion -- except an alpha-only mask,
-    // which stb would flatten to white. Masks that carry their signal in alpha
-    // are handled below.
+    // 常见二值、灰度、RGB 掩码统一转为单通道；仅 alpha 携带形状的掩码须另行处理，灰度转换会丢失 alpha。
     unsigned char* px = stbi_load(path.c_str(), &w, &h, &chan, 1);
     if (!px || w <= 0 || h <= 0) {
         if (px) stbi_image_free(px);
@@ -204,11 +182,7 @@ Mask loadMask(const std::string& path) {
     for (size_t i = 0; i < m.bits.size(); i++) m.bits[i] = px[i] != 0 ? 1 : 0;
     stbi_image_free(px);
 
-    // An RGBA mask that is uniformly white in RGB carries its shape in alpha
-    // (what "cut out the subject" exporters produce). stb's gray conversion
-    // drops alpha, so that mask decodes as all-ones; re-read the alpha channel
-    // and use it instead. Only done when the gray read was fully saturated, so
-    // an ordinary opaque RGBA mask is untouched.
+    // RGB 全白的 RGBA 掩码可能仅在 alpha 中保存主体形状；仅当灰度读取全部饱和时重读 alpha，普通不透明掩码保持原样。
     if (chan == 4) {
         bool all_keep = true;
         for (uint8_t b : m.bits)
@@ -239,4 +213,4 @@ bool imageSize(const std::string& path, int& width, int& height) {
     return stbi_info(path.c_str(), &width, &height, &comp) != 0;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

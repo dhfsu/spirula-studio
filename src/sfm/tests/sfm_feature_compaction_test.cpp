@@ -1,4 +1,4 @@
-// Lossless feature compaction invariants and failure paths.
+// 无损特征压缩的不变量与失败路径。
 #include <cstdio>
 #include <functional>
 #include <stdexcept>

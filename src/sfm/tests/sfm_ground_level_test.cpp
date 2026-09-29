@@ -1,7 +1,4 @@
-// Levelling on the ground (map/Orient.h groundTransform): a room whose cameras
-// were held tilted, handed over in an arbitrary gauge (host only).
-//
-// Prints PASS/FAIL and returns 0/1. See docs/testing.md.
+// 纯主机地面调平测试：相机倾斜的房间置于任意坐标规范，验证 groundTransform。
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -14,7 +11,7 @@
 
 using namespace sfm;
 
-// Camera at C looking along `dir`, its up tipped towards `lean`.
+// 相机位于 C，看向 dir，向上方向向 lean 倾斜。
 static Pose lookAlong(const Vec3& C, const Vec3& dir, const Vec3& lean) {
     const Vec3 f = dir.normalized();
     const Vec3 down = (Vec3{0, 0, -1} + lean).normalized();
@@ -25,8 +22,7 @@ static Pose lookAlong(const Vec3& C, const Vec3& dir, const Vec3& lean) {
     return {R, {-t.x, -t.y, -t.z}};
 }
 
-// Floor z = 0 over 6 x 4, four walls 2.5 high, a table; every camera 1.6 up,
-// held with its up leaning 9 degrees the same way.
+// 6×4 地板、2.5 高四墙与桌子，相机高度 1.6，全部同向倾斜 9 度。
 static Reconstruction room(std::mt19937& rng) {
     std::uniform_real_distribution<double> u(0.0, 1.0);
     std::normal_distribution<double> g(0.0, 0.004);
@@ -62,7 +58,7 @@ static double offIdentity(const Mat3& R) {
     return s;
 }
 
-// The floor points' mean height and spread, in the model's current frame.
+// 当前模型坐标中的地板平均高度及离散程度。
 static void floorStats(const Reconstruction& rec, double& mean, double& spread) {
     double s = 0, s2 = 0;
     int n = 0;
@@ -91,7 +87,7 @@ int cmdGroundSelftest(int, char**) {
     gauge.t = {5.0, -2.0, 7.0};
     applySim3(rec, gauge);
 
-    // ---- T1: the camera frame alone is tilted by the lean -------------------
+    // ---------------- T1：仅相机向上轴会保留持机倾斜 ----------------
     Reconstruction cams = rec;
     applySim3(cams, uprightTransform(cams));
     double mean = 0, spread = 0;
@@ -99,12 +95,12 @@ int cmdGroundSelftest(int, char**) {
     printf("  T1: camera frame, floor spread %.4f\n", spread);
     check(spread > 0.05 * gauge.scale, "T1: cameras' up leaves the floor tilted");
 
-    // ---- T2: the ground levels it, at z = 0, scale kept ---------------------
+    // ---------------- T2：地面调平到 z=0，尺度不变 ----------------
     const Sim3 T0 = uprightTransform(rec);
     const GroundFit g = groundTransform(rec, true, T0);
     check(g.found, "T2: a ground is found");
     applySim3(rec, composeSim3(g.T, T0));
-    // The floor's own 4 mm of noise, in this frame's units.
+    // 地面本身 4 mm 噪声换算到当前单位。
     const double noise = 0.004 * gauge.scale * T0.scale;
     floorStats(rec, mean, spread);
     printf("  T2: ground frame, floor at %.5f, spread %.5f, share %.2f\n", mean, spread,
@@ -117,7 +113,7 @@ int cmdGroundSelftest(int, char**) {
     cz /= (double)rec.images.size();
     check(cz > 0.0, "T2: cameras above the floor");
 
-    // ---- T3: a measured frame only moves along Z ----------------------------
+    // ---------------- T3：已有测量坐标只沿 Z 平移 ----------------
     Sim3 lift;
     lift.R = angleAxisToRotation(Vec3{0, 0, 1} * 0.6);
     lift.t = {0.3, -0.2, 0.45};

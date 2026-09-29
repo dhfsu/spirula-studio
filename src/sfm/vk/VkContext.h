@@ -1,6 +1,4 @@
-// Minimal Vulkan compute context: device setup, storage buffers with chunked
-// staging upload/download, a single shared descriptor set, named compute
-// pipelines from one SPIR-V module, and command recording helpers.
+// 最小 Vulkan 计算上下文，封装设备、分块上传下载、共享描述符集、命名计算流水线与命令记录。
 #pragma once
 
 
@@ -24,14 +22,10 @@
 #include "sfm/core/Log.h"
 #include "i18n/catalog/Sfm.h"
 
-// One shared device record: the SfM context stores the resolved identity so a
-// BA capability probe can be keyed by UUID instead of an ordinal.
+// 共享设备记录保存规范标识，使 BA 能力缓存按 UUID 而非易变序号索引。
 using VkDeviceRecord = spirula::vkselect::DeviceRecord;
 
-// The result codes worth naming: the ones a user can act on. Everything else
-// prints its number. Out-of-memory in particular used to surface as a bare
-// "Vulkan error -2" from a buffer allocation, which says nothing about the
-// 3681-image model or the other job sharing the GPU that caused it.
+// 为用户可处理的错误码提供名称，其余显示数值，避免显存不足仅表现为不明的 Vulkan -2。
 inline const char* vkResultName(int r) {
     switch (r) {
         case -1: return "VK_ERROR_OUT_OF_HOST_MEMORY";
@@ -58,11 +52,7 @@ inline bool hasDeviceExtension(VkPhysicalDevice phys, const char* name) {
     return false;
 }
 
-// A driver implementing only a subset of Vulkan (MoltenVK, the sole driver on
-// macOS) stays hidden from vkEnumeratePhysicalDevices unless the instance opts
-// in, and vkCreateInstance fails with VK_ERROR_INCOMPATIBLE_DRIVER when it is
-// the only one installed. Where no such driver exists the extension is absent
-// and this does nothing. `exts` must outlive the vkCreateInstance call.
+// MoltenVK 等可移植子集驱动需实例显式启用枚举，否则可能隐藏设备或报不兼容驱动；扩展缺失时跳过，exts 生命周期须覆盖实例创建。
 inline void vkEnablePortability(VkInstanceCreateInfo& ici,
                                 std::vector<const char*>& exts) {
     uint32_t n = 0;
@@ -81,16 +71,13 @@ inline void vkEnablePortability(VkInstanceCreateInfo& ici,
     }
 }
 
-// A failed call, thrown rather than exited on: a lost device or a refused
-// allocation ends one bundle adjustment, not the reconstruction, and
-// sfm/map/Bundle.h re-runs the solve on the host.
+// 失败调用抛异常而非退出，设备丢失或分配失败可由 Bundle 层回退 CPU 继续重建。
 struct VkError : std::runtime_error {
     VkError(int r, const std::string& what) : std::runtime_error(what), result(r) {}
     int result;
 };
 
-// Losing the device, or being refused memory, says nothing about whether the
-// same work fits on the host; every other code is a bug in the caller.
+// 设备丢失或内存拒绝允许尝试主机；其他错误视为调用方问题。
 inline bool vkErrorIsResourceFailure(int r) {
     return r == VK_ERROR_DEVICE_LOST || r == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
            r == VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -105,14 +92,11 @@ inline std::string vkErrorText(int r, const char* file, int line) {
 #define VK_CHECK(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) \
     throw VkError((int)_r, vkErrorText((int)_r, SS_FILE, __LINE__)); } while (0)
 
-// Must match the push constant block in sfm/shaders/ba/ba.slang.
+// 推送常量布局必须与 ba.slang 一致。
 struct Push {
     uint32_t u0 = 0, u1 = 0, u2 = 0, u3 = 0;
     float f0 = 0, f1 = 0, f2 = 0, f3 = 0;
-    // Appended, so the first 32 bytes keep the layout every existing shader
-    // declares; the matcher needs more than four integer slots. Vulkan
-    // guarantees at least 128 bytes of push constants, and a shader may declare
-    // a smaller range than the pipeline layout provides.
+    // 新增字段追加在后，保持前 32 字节兼容；Vulkan 保证至少 128 字节，着色器可声明小于流水线布局的范围。
     uint32_t u4 = 0, u5 = 0, u6 = 0, u7 = 0;
 };
 
@@ -124,47 +108,36 @@ struct GpuBuffer {
 
 struct VkContextOptions {
     bool needFloat64 = false;
-    bool needFloatAtomics = false;   // VK_EXT_shader_atomic_float (f32 add, and f64 add if needFloat64)
-    bool needInt64Atomics = false;   // buffer int64 atomics (emulated-double CAS)
-    bool needIntDotProduct = false;  // VK_KHR_shader_integer_dot_product (packed uint8x4, matcher)
-    // External/test input only, and only when `selector` is empty; -1 = auto.
+    bool needFloatAtomics = false;   // VK_EXT_shader_atomic_float：f32 原子加，需 fp64 时还要求 f64 原子加
+    bool needInt64Atomics = false;   // 缓冲 int64 原子操作，用于 DF 的 CAS
+    bool needIntDotProduct = false;  // 打包 uint8x4 点积扩展
+    // 下列设备序号仅为外部兼容输入，selector 为空时生效，-1 表示自动。
     int deviceIndex = -1;
-    // Resolved identity (core/VulkanDeviceSelection.h), re-resolved in each
-    // context's own instance -- what makes a uuid request survive reordering.
+    // 每上下文在自身实例中重新解析 UUID，保持跨枚举顺序变化的设备身份。
     std::string selector;
     bool validate = false;
-    bool profile = false;            // per-dispatch GPU timestamps, aggregated by pipeline name
+    bool profile = false;            // 逐分派 GPU 时间戳，按流水线名称汇总
 };
 
-// What a device can actually do, as far as this module cares. Integrated parts
-// are not a subset of discrete ones: Intel's Xe iGPU has int64 buffer atomics
-// but neither fp64 nor a float32 atomic add, which is the exact opposite of
-// what a "smaller GPU has fewer features" reading would predict. So the BA
-// scalar type has to be chosen from a probe (see pickRealForDevice), not assumed
-// -- vkCreateDevice returns VK_ERROR_FEATURE_NOT_PRESENT for anything asked
-// for and missing, and that used to abort a reconstruction at the first solve.
+// 必须实际探测设备能力，不能按独显或集显推断；例如部分 Intel 集显有 int64 原子却无 fp64/f32 原子加。
+// 缺失能力应在创建设备前明确报告，供 BA 选择算术路径。
 struct VkDeviceCaps {
-    bool float64 = false;           // shaderFloat64
-    bool float32AtomicAdd = false;  // VK_EXT_shader_atomic_float, buffer f32 add
-    bool float64AtomicAdd = false;  // ... and its f64 counterpart
-    bool int64Atomics = false;      // shaderInt64 + shaderBufferInt64Atomics
-    bool intDotProduct = false;     // VK_KHR_shader_integer_dot_product
-    // ... and whether the packed uint8x4 form is a hardware instruction. A
-    // driver may emulate it (MoltenVK does, worse than our own spelling: 114 vs
-    // 43 ms per 8192x8192 pair on an M2), so this is what picks the blob.
+    bool float64 = false;           // shaderFloat64 能力
+    bool float32AtomicAdd = false;  // 缓冲 f32 原子加能力
+    bool float64AtomicAdd = false;  // 缓冲 f64 原子加能力
+    bool int64Atomics = false;      // shaderInt64 与 shaderBufferInt64Atomics
+    bool intDotProduct = false;     // 整数点积扩展是否可用
+    // 下项另检查打包形式是否硬件加速；M2 模拟曾耗时每对 114 ms，手工展开为 43 ms，因此按加速属性选模块。
     bool intDotProductFast = false;
 };
 
-// The resolver's reason for the last refused device request in this thread.
-// Kept beside the context rather than in it: the failure happens before any
-// context exists, and the caller (or the test) needs the wording.
+// 线程内保存最近设备请求失败原因，因失败发生在上下文创建前，不能存于尚不存在的对象。
 inline std::string& lastVkSelectError() {
     static thread_local std::string e;
     return e;
 }
 
-// Options carrying only the device request, for a capability probe. Callers
-// that need features add them to the copy that actually creates a context.
+// 能力探测仅携带设备请求，真正创建上下文的副本再加入所需特性。
 inline VkContextOptions deviceOnlyOpt(int deviceIndex, const std::string& selector) {
     VkContextOptions o;
     o.deviceIndex = deviceIndex;
@@ -175,17 +148,11 @@ inline VkContextOptions deviceOnlyOpt(int deviceIndex, const std::string& select
 class VkContext {
 public:
     VkContext() = default;
-    // Owners hold VkContext by value and hand out GpuBuffers freely; a copy would
-    // double-destroy every handle.
+    // 禁止复制上下文，避免所有 Vulkan 句柄被重复销毁。
     VkContext(const VkContext&) = delete;
     VkContext& operator=(const VkContext&) = delete;
 
-    // Full teardown. Every buffer ever created through this context is freed
-    // here (createBufferRaw tracks them), so a scoped VkContext -- the mapper's
-    // per-global-BA solver, the prefilter's matcher -- returns its VRAM when
-    // it dies instead of leaking it for the life of the process. Before this,
-    // a 1363-image run OOMed: each of the mapper's periodic global BAs leaked
-    // a device plus problem-sized buffers.
+    // 析构释放本上下文记录的全部缓冲与设备，防止周期 BA 累积泄漏；1363 图运行曾因每轮设备与问题缓冲未释放而耗尽显存。
     ~VkContext() {
         if (device_ == VK_NULL_HANDLE) {
             if (instance_ != VK_NULL_HANDLE) vkDestroyInstance(instance_, nullptr);
@@ -210,18 +177,14 @@ public:
         vkDestroyInstance(instance_, nullptr);
     }
 
-    // The device this context runs on, as probed at init(). Zeroed before then.
+    // init 探测到的设备能力，初始化前为零。
     const VkDeviceCaps& caps() const { return caps_; }
 
-    // Identity of the device this context resolved to: the canonical selector
-    // (what a cache key and a log line want) and the driver's reported name.
-    // Empty before init().
+    // 规范设备选择器与驱动名称，供缓存和日志使用，init 前为空。
     const std::string& selector() const { return selector_; }
     const std::string& deviceName() const { return deviceName_; }
 
-    // Same features without owning a context, for callers that must choose a
-    // code path (a BA scalar type, say) before one exists. All-false when the
-    // request names no usable device.
+    // 无需拥有上下文即可探测能力，供提前选择 BA 路径；无可用设备时全部为 false。
     static VkDeviceCaps probeCaps(const VkContextOptions& opt) {
         return probe(opt).caps;
     }
@@ -229,8 +192,7 @@ public:
         return probeCaps(deviceOnlyOpt(deviceIndex, std::string()));
     }
 
-    // Side-effect-free enumeration used by pickers and entry-point resolution;
-    // no logical device or allocation.
+    // 无副作用枚举，供选择器和入口解析，不创建逻辑设备或分配缓冲。
     static std::vector<VkDeviceRecord> listDevices() {
         std::vector<VkDeviceRecord> out;
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -247,15 +209,13 @@ public:
         return out;
     }
 
-    // Resolve to canonical UUID; failures return an error without creating hardware.
+    // 将请求解析为 UUID，失败仅返回原因，不创建设备。
     static spirula::vkselect::Resolution resolveSelector(
         const spirula::vkselect::Request& req) {
         return spirula::vkselect::resolveRequest(req, listDevices());
     }
 
-    // The same, memoized on the request's spelling. Enumeration means an
-    // instance plus a device walk, and the mapper's scoped solves would pay it
-    // per bundle adjustment; the machine's device set does not change under us.
+    // 按请求写法缓存解析结果，避免每次 BA 创建实例并枚举设备，假定运行中设备集合稳定。
     static const spirula::vkselect::Resolution& cachedSelector(
         const spirula::vkselect::Request& req) {
         static std::mutex m;
@@ -267,8 +227,7 @@ public:
         return it->second;
     }
 
-    // The same, for a caller that already has an options object (an int
-    // boundary or a resolved selector), memoized like cachedSelector.
+    // 对已有配置对象的设备请求执行相同缓存解析。
     static const spirula::vkselect::Resolution& cachedResolution(const VkContextOptions& opt) {
         spirula::vkselect::Request req;
         if (!opt.selector.empty()) {
@@ -282,9 +241,7 @@ public:
         return cachedSelector(req);
     }
 
-    // Same probe, keeping the identity it resolved to: `resolved` is false when
-    // the request names no device this instance can see, which is a selection
-    // error rather than a featureless device.
+    // 探测同时保留设备身份；resolved=false 表示选择错误，不等同于选中无特性的设备。
     struct Probe {
         VkDeviceCaps caps;
         VkDeviceRecord device;
@@ -311,7 +268,7 @@ public:
     }
 
     void init(const VkContextOptions& opt) {
-        // ---- instance ----
+        // ---------------- 实例 ----------------
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         app.pApplicationName = "vk_ba";
         app.apiVersion = VK_API_VERSION_1_2;
@@ -326,12 +283,11 @@ public:
         }
         VK_CHECK(vkCreateInstance(&ici, nullptr, &instance_));
 
-        // ---- physical device ----
+        // ---------------- 物理设备 ----------------
         VkDeviceRecord record;
         phys_ = choosePhysical(instance_, opt, &record);
         if (phys_ == VK_NULL_HANDLE) {
-            // A refused request is a selection error, not a missing device: the
-            // resolver already said which value failed and why.
+            // 请求被拒绝是选择错误，解析器已提供具体原因，不能误报设备缺失。
             const std::string& why = lastVkSelectError();
             throw std::runtime_error(why.empty() ? "no Vulkan devices" : why);
         }
@@ -345,7 +301,7 @@ public:
             sfm::slog::Tag::Device, spirula::i18n::msg::sfm::device_using,
             {deviceName_ + " [" + selector_ + "]"});
 
-        // ---- queue family ----
+        // ---------------- 队列族 ----------------
         uint32_t qn = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(phys_, &qn, nullptr);
         std::vector<VkQueueFamilyProperties> qf(qn);
@@ -355,11 +311,8 @@ public:
             if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { queueFamily_ = i; break; }
         if (queueFamily_ == ~0u) throw std::runtime_error("no compute queue");
 
-        // ---- device ----
-        // Everything asked for below has to be there: vkCreateDevice fails the
-        // whole call with VK_ERROR_FEATURE_NOT_PRESENT otherwise. So report a
-        // missing feature as a missing feature, by name, instead of letting the
-        // driver turn it into an unattributable error code.
+        // ---------------- 逻辑设备 ----------------
+        // 创建前逐项检查所需能力，明确命名缺失特性，避免驱动仅返回 FEATURE_NOT_PRESENT。
         auto require = [&](bool want, bool have, const char* what) {
             if (want && !have)
                 throw std::runtime_error(
@@ -396,9 +349,7 @@ public:
         VkPhysicalDeviceShaderAtomicFloatFeaturesEXT fAtom{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
         std::vector<const char*> exts;
-        // Mandatory where advertised: the spec forbids creating a device from
-        // a portability physical device without it. Spelled out rather than
-        // using the macro, which is behind VK_ENABLE_BETA_EXTENSIONS.
+        // 可移植设备声明此扩展时必须启用；使用字面名称，避免依赖仅在 beta 宏下定义的名称宏。
         if (hasDeviceExtension(phys_, "VK_KHR_portability_subset"))
             exts.push_back("VK_KHR_portability_subset");
         if (opt.needFloatAtomics) {
@@ -413,8 +364,7 @@ public:
             exts.push_back(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
         }
 
-        // Packed uint8x4 dot product for the descriptor matcher (D21). Core in
-        // Vulkan 1.3; we ask for 1.2, so take it as an extension.
+        // 描述子打包点积在 Vulkan 1.3 为核心，此处请求 1.2，因此以扩展启用（D21）。
         VkPhysicalDeviceShaderIntegerDotProductFeatures fDot{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES};
         if (opt.needIntDotProduct) {
@@ -443,14 +393,8 @@ public:
         VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         VK_CHECK(vkCreateFence(device_, &fci, nullptr, &fence_));
 
-        // Two staging buffers, because the two directions want opposite memory.
-        // The first HOST_VISIBLE|HOST_COHERENT type on a discrete GPU is
-        // write-combined: excellent to write through, and *uncached to read* --
-        // a memcpy out of it runs at a small fraction of RAM speed. Every
-        // readback in the pipeline goes through this path (match results, SIFT
-        // keypoints and descriptors, BA parameters), so downloads get their own
-        // buffer that asks for HOST_CACHED, and fall back to the shared type on
-        // a device that has no such heap.
+        // 上传与下载使用独立暂存缓冲：独显 HOST_COHERENT 常为合并写内存，读取无缓存很慢。
+        // 下载优先请求 HOST_CACHED，无对应堆时才回退共享类型。
         staging_ = createBufferRaw(kStagingSize,
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -480,10 +424,7 @@ public:
         return b;
     }
 
-    // Free one buffer early (a long-lived context whose users come and go --
-    // the persistent BA solver -- must not defer everything to ~VkContext). Safe
-    // immediately after any submit(): submits are fenced synchronous, so no
-    // GPU work can still reference the buffer.
+    // 持久上下文允许提前释放单缓冲；submit 同步等待栅栏完成，因此返回后无设备任务仍引用它。
     void destroyBuffer(GpuBuffer& b) {
         if (b.buf == VK_NULL_HANDLE) return;
         vkDestroyBuffer(device_, b.buf, nullptr);
@@ -512,16 +453,8 @@ public:
         }
     }
 
-    // Several host->device copies in one submit.
-    //
-    // `upload` fences per call, and a bundle-adjustment problem uploads
-    // seventeen buffers. Uncontended that is a few milliseconds; with a solver
-    // per thread on one device -- the atom phase of a bottom-up run -- the
-    // fences serialize against each other and it becomes most of a small
-    // solve's cost (measured: 3 ms of upload per solve at one thread, 69 ms at
-    // eight). Everything that fits in the staging buffer goes in one command
-    // buffer; the rest flushes and starts a new one, so an item larger than
-    // the staging buffer still works, by the chunked path.
+    // 多个上传合并到一次提交，暂存装不下时刷新再继续，超大单项走分块。
+    // 十七次独立栅栏上传在单线程约 3 ms，八线程争用时约 69 ms，曾成为小型原子 BA 主开销。
     struct UploadItem {
         const GpuBuffer* dst;
         const void* src;
@@ -545,7 +478,7 @@ public:
         for (size_t i = 0; i < n; i++) {
             const UploadItem& it = items[i];
             if (!it.dst || !it.size) continue;
-            if (it.size > kStagingSize) {  // does not fit whole: the chunked path
+            if (it.size > kStagingSize) {  // 无法整体容纳，使用分块上传
                 flush();
                 upload(*it.dst, it.src, it.size);
                 continue;
@@ -555,8 +488,7 @@ public:
             memcpy((uint8_t*)stagingPtr_ + used, it.src, it.size);
             copies.push_back(VkBufferCopy{used, 0, it.size});
             dsts.push_back(it.dst->buf);
-            // Keep every source offset 16-byte aligned: cheap, and it stops a
-            // driver from taking a slow path on an unaligned copy.
+            // 源偏移保持 16 字节对齐，避免驱动走非对齐慢路径。
             used = (used + it.size + 15) & ~(VkDeviceSize)15;
         }
         flush();
@@ -574,11 +506,7 @@ public:
         }
     }
 
-    // Fold a readback into a command buffer the caller is already recording:
-    // record the copy with recordDownload(), submit once, then take the bytes
-    // with stagingDownloadPtr(). Saves the extra submit-and-fence that a
-    // separate download() costs after every dispatch batch. `size` must not
-    // exceed stagingCapacity().
+    // 将回读复制记录到现有命令缓冲，提交一次后直接读取映射暂存区，省独立 download 的额外栅栏；大小不得超过暂存容量。
     void recordDownload(VkCommandBuffer cb, const GpuBuffer& src, VkDeviceSize size,
                         VkDeviceSize srcOff = 0, VkDeviceSize dstOff = 0) {
         VkBufferCopy c{srcOff, dstOff, size};
@@ -587,11 +515,8 @@ public:
     const void* stagingDownloadPtr() const { return stagingDlPtr_; }
     static constexpr VkDeviceSize stagingCapacity() { return kStagingSize; }
 
-    // ---- descriptor set (one set of N storage buffers shared by all pipelines) ----
-    // Idempotent: the first call builds layout/pool/set, later calls (same
-    // binding count) just rewrite the buffer bindings -- how a persistent
-    // context re-targets the pipelines at a new problem's buffers. Safe
-    // between submits (fenced synchronous, never while recording).
+    // ---------------- 共用存储缓冲描述符集 ----------------
+    // 首次创建布局、池与集合，后续相同绑定数只重写缓冲，供持久上下文换问题；仅可在同步提交之间执行，不能在记录期间修改。
     void createDescriptors(const std::vector<VkBuffer>& buffers) {
         uint32_t nb = (uint32_t)buffers.size();
         if (setLayout_ != VK_NULL_HANDLE) {
@@ -658,12 +583,7 @@ public:
         loadPipelines((const uint32_t*)code.data(), sz, entries);
     }
 
-    // One module holding every entry point (slangc -fvk-use-entrypoint-name),
-    // either read from disk above or taken from the embedded blobs. Entry
-    // points already created are skipped, so a caller may come back for more
-    // as it discovers it needs them -- which is the point: compiling one is
-    // ~90 ms on a cold driver cache, and the bundle-adjustment module has
-    // thirty-odd, most of them camera models a given problem never uses.
+    // 单模块包含命名入口，按需创建流水线并跳过已有项；冷缓存每入口约 90 ms，避免编译本问题不使用的相机模型。
     void loadPipelines(const uint32_t* code, size_t codeBytes,
                        const std::vector<std::string>& entries) {
         if (shaderModule_ == VK_NULL_HANDLE) {
@@ -673,10 +593,7 @@ public:
             VK_CHECK(vkCreateShaderModule(device_, &smi, nullptr, &shaderModule_));
         }
 
-        // Compiling the BA module is seconds of wall clock on a cold driver
-        // cache, and it is not evenly spread: SS_SFM_MAP_PROF names the
-        // entry points that cost more than 100 ms, which is how you find out
-        // that one kernel is carrying the whole bill.
+        // SS_SFM_MAP_PROF 报告超过 100 ms 的入口编译，定位冷驱动缓存的主要开销。
         const bool prof = spirula::env("SFM_MAP_PROF") != nullptr;
         for (const auto& e : entries) {
             if (pipelines_.count(e)) continue;
@@ -700,7 +617,7 @@ public:
         }
     }
 
-    // ---- recording ----
+    // ---------------- 命令记录 ----------------
     VkCommandBuffer begin() {
         VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         ai.commandPool = cmdPool_;
@@ -754,7 +671,7 @@ public:
         vkCmdFillBuffer(cb, b.buf, 0, VK_WHOLE_SIZE, 0);
     }
 
-    // offset and size must be 4-byte multiples (vkCmdFillBuffer's rule)
+    // vkCmdFillBuffer 要求偏移和大小均为四字节倍数
     void fillZero(VkCommandBuffer cb, const GpuBuffer& b, VkDeviceSize offset, VkDeviceSize size) {
         vkCmdFillBuffer(cb, b.buf, offset, size, 0);
     }
@@ -815,7 +732,7 @@ public:
 private:
     static constexpr VkDeviceSize kStagingSize = 64ull << 20;
 
-    // Enumeration uses the same usability probe as choosePhysical.
+    // 枚举与 choosePhysical 共用可用性探测。
     static std::vector<VkDeviceRecord> enumerateRecords(
         VkInstance inst, std::vector<VkPhysicalDevice>* handles = nullptr) {
         uint32_t n = 0;
@@ -835,8 +752,7 @@ private:
             for (uint32_t h = 0; h < mp.memoryHeapCount; ++h)
                 if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
                     r.vram_bytes += mp.memoryHeaps[h].size;
-            // The same baseline the other runtimes require, so an unusable
-            // device is rejected here rather than at vkCreateDevice.
+            // 按共享运行时基线提前拒绝不可用设备，避免等到 vkCreateDevice 失败。
             VkPhysicalDeviceVulkan12Features f12{
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
             VkPhysicalDeviceFeatures2 f2{
@@ -880,8 +796,7 @@ private:
         return devs[(size_t)res.device.index];
     }
 
-    // What the options ask for: the resolved identity first, then the legacy
-    // ordinal (a caller that still hands one in), then the shared precedence.
+    // 设备请求优先规范身份，其次兼容序号，最后共享环境与自动选择规则。
     static spirula::vkselect::Request deviceRequest(const VkContextOptions& opt) {
         if (!opt.selector.empty()) return spirula::vkselect::parseRequest(opt.selector);
         if (opt.deviceIndex >= 0) {
@@ -894,10 +809,7 @@ private:
     }
 
     static VkDeviceCaps queryCaps(VkPhysicalDevice phys) {
-        // The atomic-float features live behind an extension, so ask only if
-        // the device advertises it -- chaining an unsupported feature struct
-        // into vkGetPhysicalDeviceFeatures2 is undefined behaviour, not a
-        // false answer.
+        // 仅设备声明原子浮点扩展时查询对应特性结构，不能把不支持结构链入 Features2。
         uint32_t en = 0;
         vkEnumerateDeviceExtensionProperties(phys, nullptr, &en, nullptr);
         std::vector<VkExtensionProperties> exts(en);
@@ -946,8 +858,7 @@ private:
         return c;
     }
 
-    // `preferFlags` are tried on top of `memFlags` and dropped if no memory
-    // type offers both.
+    // 先同时满足必需和偏好内存标志，无匹配时仅保留必需标志。
     GpuBuffer createBufferRaw(VkDeviceSize size, VkBufferUsageFlags usage,
                               VkMemoryPropertyFlags memFlags,
                               VkMemoryPropertyFlags preferFlags = 0) {
@@ -983,7 +894,7 @@ private:
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice phys_ = VK_NULL_HANDLE;
     VkDeviceCaps caps_{};
-    std::string selector_;   // canonical uuid:<hex> of phys_, empty before init
+    std::string selector_;   // phys_ 的规范 uuid:<hex>，init 前为空
     std::string deviceName_;
     uint8_t deviceUUID_[VK_UUID_SIZE] = {};
     VkDevice device_ = VK_NULL_HANDLE;
@@ -1003,12 +914,12 @@ private:
     void* stagingPtr_ = nullptr;
     void* stagingDlPtr_ = nullptr;
     VkDeviceSize totalAllocated_ = 0;
-    std::vector<std::pair<VkBuffer, VkDeviceMemory>> allocations_;  // freed in ~VkContext
+    std::vector<std::pair<VkBuffer, VkDeviceMemory>> allocations_;  // 由上下文析构释放
 
     static constexpr uint32_t kMaxQueries = 16384;
     bool profiling_ = false;
     float timestampPeriod_ = 1.0f;
     VkQueryPool queryPool_ = VK_NULL_HANDLE;
     std::vector<std::string> queryNames_;
-    std::map<std::string, std::pair<uint64_t, double>> profStats_;  // name -> (count, total ms)
+    std::map<std::string, std::pair<uint64_t, double>> profStats_;  // 名称 ->（次数，总毫秒）
 };

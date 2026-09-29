@@ -1,22 +1,8 @@
 #pragma once
 
-// What `spirula sfm --help` and `spirula sfm <command> --help` say around the
-// flag table -- the command summaries, the descriptions, the labels of each
-// block, and the hand-parsed options each command owns.
-//
-// The per-flag sentences live next door in i18n/catalog/SfmFields.h, one per
-// row of SFM_CONFIG_FIELDS. Here is everything else.
-//
-// What stays as it is, in every language:
-//   - the ARGUMENT SYNTAX (`<MATCHES.BIN> <FEATURE_DIR> -o SPARSE_DIR`) and the
-//     EXAMPLES. They are what the reader types, character for character.
-//   - flag names, file names, format names, and the D-numbers, which cite the
-//     decision records in src/sfm/README.md.
-//
-// Descriptions are written as ONE STRING PER PARAGRAPH, separated by a blank
-// line, and wrapped at print time by i18n::wrap -- which measures in terminal
-// columns and can break Chinese and Japanese, neither of which a hand-wrapped
-// English paragraph could have done.
+// SfM 帮助页面的命令简介、段落、标题及手动解析选项；逐字段说明位于 SfmFields.h。
+// 参数语法、可执行示例、选项名、文件名、格式名及 D 编号保持原文。
+// 每段存为单个字符串，输出时由 i18n::wrap 按终端列宽及当前语言规则换行。
 
 #include "i18n/BeginCatalog.h"
 
@@ -25,9 +11,7 @@ namespace i18n {
 namespace msg {
 namespace sfmhelp {
 
-// ===========================================================================
-// The labels a help page is built from
-// ===========================================================================
+// ================ 帮助页面标签 ================
 
 SS_MSG(label_usage,
     EN("Usage:"), JA("使い方:"), ZH_HANS("用法："), ZH_HANT("用法："),
@@ -174,9 +158,7 @@ SS_MSG(env_map_prof,
     RU("печатать время построителя с разбивкой по стадиям"),
     TR("haritalayıcının süresini aşama aşama dökerek yazdır"));
 
-// ===========================================================================
-// What each command is, in one line
-// ===========================================================================
+// ================ 命令单行简介 ================
 
 SS_MSG(sum_auto,
     EN("reconstruct a sparse model from a directory of images, in one command"),
@@ -277,9 +259,7 @@ SS_MSG(sum_ba,
     RU("уравнять разреженную модель"),
     TR("seyrek bir modeli demet dengelemesinden geçir"));
 
-// ===========================================================================
-// What each command does, at length
-// ===========================================================================
+// ================ 命令详细说明 ================
 
 SS_MSG(desc_auto_1,
     EN("Runs extract -> match -> map -> merge with COLMAP's "
@@ -940,9 +920,7 @@ SS_MSG(desc_merge_2,
        "demet dengelemesinin görmediği bir dikiş boyunca yapıştırılmasıdır; bu "
        "yüzden --no-ba verilmedikçe sonradan üzerinden bir tane geçirilir."));
 
-// ===========================================================================
-// The options each command parses itself
-// ===========================================================================
+// ================ 各命令自行解析的选项 ================
 
 SS_MSG(opt_auto_output,
     EN("Workspace to write: features/, matches.bin and sparse/0.. land in it."),
@@ -1319,9 +1297,7 @@ SS_MSG(opt_merge_output,
     TR("Birleştirilmiş modellerin yazılacağı dizin. --in-place verilmedikçe "
        "zorunludur."));
 
-// ===========================================================================
-// `auto`'s exit status
-// ===========================================================================
+// ================ auto 的退出状态 ================
 
 SS_MSG(exit_0,
     EN("a reconstruction that looks sound"),
@@ -1393,9 +1369,7 @@ SS_MSG(exit_3,
        "izdüşüm 2 px'in üzerinde"));
 
 
-// ===========================================================================
-// `spirula sfm ba` -- one global bundle adjustment of a model
-// ===========================================================================
+// ================ ba：模型的全局光束法平差 ================
 
 SS_MSG(exit_4,
     EN("the model was written, but not in the metric frame that was asked for"),
@@ -2041,9 +2015,9 @@ SS_MSG(opt_sequence,
        "bu yüzden bir rigin lensleri tek bir dizidir (cam0,cam1). Birden çok dizi "
        "için yineleyin; `.` görüntü dizininin kendisidir."));
 
-}  // namespace sfmhelp
-}  // namespace msg
-}  // namespace i18n
-}  // namespace spirula
+}  // 命名空间 sfmhelp
+}  // 命名空间 msg
+}  // 命名空间 i18n
+}  // 命名空间 spirula
 
 #include "i18n/EndCatalog.h"

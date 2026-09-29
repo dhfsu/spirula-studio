@@ -1,13 +1,6 @@
-// spirula-sfm: the SfM pipeline CLI. Subcommands are the stage graph
-// (src/sfm/README.md: auto, extract, match, map, merge, ba), each reading and
-// writing files on disk so any one of them can be replaced by COLMAP's
-// equivalent to bisect a failure.
-//
-// This file is presentation and plumbing only: what a flag *means* lives in
-// sfm/SfmConfig.h's descriptor table, which is also what `--help` prints and
-// what the GUI edits. Flags that do not name one scalar field are parsed here
-// first, so a hand-parsed name wins -- `map --audit` (run an audit pass) has to
-// beat the table's `--audit` / `--no-audit` switch.
+// SfM 命令行入口，各阶段独立读写磁盘数据，便于用 COLMAP 对应阶段替换并定位问题；流程见 src/sfm/README.md。
+// 选项含义统一定义于 SfmConfig；此文件仅处理展示和命令分派。
+// 非标量参数优先手动解析，保证 map --audit 的单次审查含义优先于配置表中的开关。
 #include "app/Tools.h"
 #include "sfm/Pipeline.h"
 
@@ -63,20 +56,19 @@
 #include "i18n/catalog/SfmHelp.h"
 #include "i18n/TimeFormat.h"
 
-// `spirula-sfm ba`, in sfm_ba.cpp. It prints its own help.
+// spirula-sfm ba 由 sfm_ba.cpp 实现并提供帮助。
 int cmdBa(int argc, char** argv);
 void printBaHelp(FILE* out);
 
-// Set by the build (CMakeLists.txt provides it).
+// 由 CMakeLists.txt 在构建时设置。
 #ifndef SS_VERSION
 #define SS_VERSION "dev"
 #endif
 
 namespace fs = std::filesystem;
 
-// ---- merging (D43) ----
-// Bundle-adjust whatever absorbed something: a merged model is two separately
-// optimized halves glued along a seam never optimized as one.
+// ---------------- 模型合并（D43）----------------
+// 合并后必须执行 BA，使独立优化的两部分及其连接处共同收敛。
 struct MergeSummary {
     size_t before = 0, after = 0, merges = 0, refused = 0;
     double seconds = 0, ba_seconds = 0;
@@ -84,22 +76,17 @@ struct MergeSummary {
 using namespace sfm;
 using spirula::i18n::format_duration;
 
-// Every line this tool prints goes out tagged and translated; see
-// sfm/core/Log.h for the mechanism and for what stays English.
+// 工具输出统一添加标签并翻译；日志机制与保留英文的范围见 sfm/core/Log.h。
 namespace L = sfm::slog;
 namespace M = spirula::i18n::msg::sfm;
 namespace CM = spirula::i18n::msg::cli;
 namespace H = spirula::i18n::msg::sfmhelp;
 using sfm::slog::Tag;
 
-// How this tool was invoked ("spirula sfm" as dispatched); see app/Tools.h.
-// The examples in the command tables below are written against the historical
-// name and rewritten at print time.
+// 实际调用名来自 app/Tools.h；命令表中的示例在打印时替换为该名称。
 static const char* kProgram = "spirula sfm";
 
-// Ctrl-C sets the token the library polls, so a run unwinds and frees the
-// device instead of dying inside a Vulkan submit. A second one is the user
-// saying they meant it: restore the default and let it kill the process.
+// 首次 Ctrl-C 设置库轮询的取消标记，使运行正常展开并释放设备；再次触发时恢复默认处理，立即终止进程。
 static std::atomic<bool> g_interrupted{false};
 
 extern "C" void sfmOnInterrupt(int sig) {
@@ -113,34 +100,27 @@ static std::string with_program_name(const char* text) {
     return app::help_text(text, "spirula-sfm");
 }
 
-// ---------------------------------------------------------------------------
-// Command help
-// ---------------------------------------------------------------------------
-// One record per subcommand: what the top-level list shows, the argument
-// syntax, the paragraph that says what the stage does, the flags this file
-// parses by hand (the table prints the rest), and worked examples. Kept
-// together so the six help screens stay in one shape.
+// ---------------- 命令帮助 ----------------
+// 每条记录集中描述子命令名称、语法、阶段说明、手动解析选项及示例，统一各帮助页面的结构。
 struct CommandInfo {
     const char* name;
     uint32_t mask;
-    // The prose is translated (i18n/catalog/SfmHelp.h); the syntax and the
-    // examples are what the reader types, so they are not.
-    const spirula::i18n::Msg* summary;              // one line, for `--help`
-    const char* usage;                              // argument syntax
-    const spirula::i18n::Msg* description[4];       // one per paragraph, then null
+    // 说明由 i18n/catalog/SfmHelp.h 翻译；参数语法与可执行示例保留原文。
+    const spirula::i18n::Msg* summary;              // --help 使用的单行简介
+    const char* usage;                              // 参数语法
+    const spirula::i18n::Msg* description[4];       // 每项一个段落，以 null 结尾
     void (*own_options)(FILE*);
-    const char* examples;                           // pre-wrapped, indented
-    bool exit_status;                               // print `auto`'s footer
+    const char* examples;                           // 已换行并缩进
+    bool exit_status;                               // 输出 auto 的页尾说明
 };
 
-// A description paragraph, wrapped where the language allows rather than where
-// an English hand-wrap once put a newline.
+// 按当前语言允许的位置换行，不沿用英文手工断行。
 static void printParagraph(FILE* out, const spirula::i18n::Msg& m) {
     for (const std::string& line : spirula::i18n::wrap(m.get(), 94))
         std::fprintf(out, "  %s\n", line.c_str());
 }
 
-// One line of a command's own (hand-parsed) options, in the table's layout.
+// 手动解析的命令选项沿用配置表布局。
 static void helpLine(FILE* out, const char* flag, const char* value, const char* help) {
     printOptionLine(out, flag, value, help);
 }
@@ -250,8 +230,7 @@ static void printCommandHelp(const CommandInfo& c) {
     }
     std::fprintf(out, "\n%s\n", H::label_options.get());
     c.own_options(out);
-    // Defaults are printed from a fresh config, which is exactly what the
-    // command starts from; `auto` says separately what its presets then move.
+    // 由新建配置打印真实默认值；auto 另行说明预设修改。
     SfmConfig defaults;
     printConfigOptions(out, c.mask, defaults);
     std::fprintf(out, "\n%s\n%s\n", H::label_examples.get(),
@@ -284,9 +263,7 @@ static void printTopHelp(FILE* out) {
     std::fprintf(out, "  %-19s %s\n", "SS_SFM_MAP_PROF=1", H::env_map_prof.get());
 }
 
-// A usage error, in the shape every command-line tool uses: what was wrong, and
-// where to look. Never exit code 2 or 3 -- `auto` spends those on the quality
-// of the reconstruction, and a batch script must be able to tell them apart.
+// 参数错误输出原因与帮助位置；不能用退出码 2 或 3，auto 用它们表示重建质量，批处理必须能区分。
 static int usageError(const char* cmd, const std::string& msg) {
     std::fprintf(stderr, "%s %s: %s\n", kProgram, cmd,
                  spirula::i18n::format(CM::error_line, {msg}).c_str());
@@ -297,8 +274,7 @@ static int usageError(const char* cmd, const std::string& msg) {
     return 1;
 }
 
-// Offer one token to the descriptor table. Returns 1 handled, 0 not a flag of
-// this command, -1 usage error (already reported).
+// 尝试由描述表解析一个参数：1 表示已处理，0 表示不属于本命令，-1 表示已报告参数错误。
 static int tableFlag(SfmConfig& cfg, uint32_t cmd, const char* cmdname, const std::string& a,
                      int argc, char** argv, int& i, std::set<std::string>& seen) {
     std::string err;
@@ -308,9 +284,7 @@ static int tableFlag(SfmConfig& cfg, uint32_t cmd, const char* cmdname, const st
     return 0;
 }
 
-// --camera-model / --focal / --distortion: a bare value sets the dataset-wide
-// default (which is a table field), PREFIX=VALUE names one camera group (which
-// is not).
+// --camera-model / --focal / --distortion 的裸值设置全局默认；PREFIX=VALUE 指定单个相机分组。
 static bool cameraOverride(SfmConfig& cfg, OverrideKind kind, const std::string& v,
                            std::set<std::string>& seen, std::string& err) {
     const char* flag = kind == OverrideKind::Focal        ? "focal"
@@ -323,7 +297,7 @@ static bool cameraOverride(SfmConfig& cfg, OverrideKind kind, const std::string&
         err = std::string("bad --") + flag + " '" + v + "' (" + form + ")";
         return false;
     }
-    if (v.find('=') != std::string::npos) return true;  // per-group only
+    if (v.find('=') != std::string::npos) return true;  // 仅针对相机分组
     switch (kind) {
         case OverrideKind::Focal:
             cfg.focal = std::atof(v.c_str());
@@ -345,7 +319,7 @@ static bool cameraOverride(SfmConfig& cfg, OverrideKind kind, const std::string&
     return true;
 }
 
-// The three flags above, recognized by name; false for anything else.
+// 按名称识别上述三个选项，其余返回 false。
 static bool cameraOverrideFlag(const std::string& a, OverrideKind& kind) {
     if (a == "--camera-model") kind = OverrideKind::Model;
     else if (a == "--focal") kind = OverrideKind::Focal;
@@ -354,8 +328,7 @@ static bool cameraOverrideFlag(const std::string& a, OverrideKind& kind) {
     return true;
 }
 
-// Did the command line say anything about cameras? If not, `map` keeps the
-// setup verification recorded in matches.bin rather than deriving its own (D47).
+// 未显式指定相机参数时，map 沿用 matches.bin 中验证阶段记录的设置（D47）。
 static bool sawCameraFlags(const std::set<std::string>& seen) {
     static const char* kCameraFlags[] = {"camera-mode", "camera-model", "focal", "distortion",
                                          "exif-focal", "exif-groups", "exif-focal-tol"};
@@ -369,15 +342,12 @@ static bool sawCameraFlags(const std::set<std::string>& seen) {
 
 
 
-// The CLI's progress lines, derived from the event stream rather than printed
-// where the work happens -- so the GUI's bar and this text cannot disagree
-// about what a stage is doing. A quiet run still emits, and still traces.
+// CLI 进度由事件流生成，与 GUI 进度条共用事实来源；静默模式仍发出事件并支持跟踪。
 static bool g_print_progress = false;
 
 static void printEvent(const sfm::Event& e) {
     using K = sfm::Event::Kind;
-    // SS_SFM_EVENT_TRACE=1 shows the stream a front end sees. The one way to
-    // check that what the GUI reads and what the CLI prints are the same run.
+    // SS_SFM_EVENT_TRACE=1 显示前端所见事件流，用于核对 GUI 与 CLI 的进度一致性。
     static const bool trace = spirula::env("SFM_EVENT_TRACE") != nullptr;
     if (trace) {
         static const char* kKind[] = {"stage-begin", "stage-end", "progress",
@@ -391,8 +361,7 @@ static void printEvent(const sfm::Event& e) {
                 (long long)e.total, (long long)e.registered, (long long)e.points,
                 e.name.c_str());
     }
-    // The same facts, for a front end watching this process from outside.
-    // A no-op without --progress-dir.
+    // 向外部前端提供相同进度；未设置 --progress-dir 时不执行操作。
     sfm::progress::status(e);
     if (!g_print_progress) return;
     switch (e.kind) {
@@ -407,9 +376,7 @@ static void printEvent(const sfm::Event& e) {
                         (long long)e.features});
             break;
         case K::Progress: {
-            // A line a second on a fast GPU and one every five minutes on an
-            // Apple M2 matching 8192-feature images, which reads as a hung
-            // program. Rate-limit by time, keeping the count for a parser.
+            // 按时间限流并保留可解析计数；按批次输出在快 GPU 上每秒一行，在 Apple M2 的 8192 特征匹配中可能五分钟才一行，容易被误认为卡住。
             static double last = 0.0;
             if (e.stage != sfm::Stage::Match) break;
             const double t = now();
@@ -443,10 +410,7 @@ static void installEventPrinter(const SfmConfig& cfg) {
 
 
 
-// Mean/median reprojection error straight from a model, with no FeatureSets in
-// hand: Image::points2D already carries the keypoint coordinates. `merge`
-// starts from models on disk, where that is all there is. Observations behind
-// the camera are excluded rather than counted as infinite, as reprojStats does.
+// 利用模型 points2D 中的坐标计算平均与中位重投影误差，无需 FeatureSet；与 reprojStats 一样排除相机后方观测。
 static void modelReprojStats(const Reconstruction& rec, double& mean, double& median,
                              size_t& nobs) {
     std::vector<double> e;
@@ -484,7 +448,7 @@ static std::vector<Reconstruction> mergeModels(std::vector<Reconstruction> model
         if (!a.merged) sum.refused++;
     if (refine && sum.merges) {
         const double tb = now();
-        VkContext ctx;  // one device + pipeline set for every model, as the mapper does
+        VkContext ctx;  // 所有模型共用一套设备与流水线，与建图器一致
         for (size_t i : session.changed()) {
             Reconstruction& m = session.modelMut(i);
             BundleOptions bo;
@@ -508,10 +472,8 @@ static std::vector<Reconstruction> mergeModels(std::vector<Reconstruction> model
     return out;
 }
 
-// ---- reading models back off disk ----
-// An input is either one model directory or a `sparse/` holding 0, 1, 2, ...
-// Numbered sub-directories are read in numeric order, so index 0 stays the
-// model with the most structure and therefore the natural anchor.
+// ---------------- 读取磁盘模型 ----------------
+// 输入可以是单个模型目录，或包含编号子目录的 sparse/；按数值顺序读取，保持 0 为默认主模型锚点。
 static bool isModelDir(const fs::path& p) {
     return fs::exists(p / "cameras.bin") && fs::exists(p / "images.bin");
 }
@@ -565,9 +527,7 @@ static bool readModels(const std::string& dir, std::vector<Reconstruction>& mode
 
 
 
-// -----------------------------------------------------------------------
-// extract
-// -----------------------------------------------------------------------
+// ---------------- 特征提取 ----------------
 
 
 
@@ -601,7 +561,7 @@ static int cmdExtract(int argc, char** argv) {
     if (image.empty())
         return usageError("extract", "an image or a directory of images is required");
 
-    // ---- directory (batch) ----
+    // ---------------- 目录批处理 ----------------
     if (fs::is_directory(image)) {
         adoptExrColorSpace(cfg, image, seen);
         fs::path outdir = output.empty() ? fs::path("features") : fs::path(output);
@@ -621,9 +581,8 @@ static int cmdExtract(int argc, char** argv) {
         return (st.failed || st.unreadable) ? 1 : 0;
     }
 
-    // ---- single image ----
-    // One image has no relative path to key on, so the mask is looked up by
-    // filename -- MaskIndex's basename fallback resolves it either way.
+    // ---------------- 单张图像 ----------------
+    // 单图没有相对路径，按文件名查找掩码，使用 MaskIndex 的基本文件名回退。
     std::string maskpath;
     if (!cfg.mask_dir.empty()) {
         maskpath = MaskIndex(cfg.mask_dir).find(fs::path(image).filename().generic_string());
@@ -657,9 +616,7 @@ static int cmdExtract(int argc, char** argv) {
     return 0;
 }
 
-// -----------------------------------------------------------------------
-// match
-// -----------------------------------------------------------------------
+// ---------------- 特征匹配 ----------------
 
 
 
@@ -736,9 +693,7 @@ static int cmdMatch(int argc, char** argv) {
     return 0;
 }
 
-// -----------------------------------------------------------------------
-// map
-// -----------------------------------------------------------------------
+// ---------------- 重建 ----------------
 
 static int cmdMap(int argc, char** argv) {
     SfmConfig cfg;
@@ -758,9 +713,7 @@ static int cmdMap(int argc, char** argv) {
             sfm::progress::set_dir(argv[++i]);
             continue;
         }
-        // Before the table, which also owns "audit" -- as the assembler's
-        // audit stage (--no-audit). Here the positive spelling is the one-shot
-        // pass over adopted models, which is what it has always meant.
+        // 优先解析 --audit 为对已有模型执行单次审查，避免被配置表中的装配审查开关截获。
         if (a == "--audit") { audit_first = true; continue; }
         if (a == "--no-manage") {
             cfg.manager.do_merge = cfg.manager.do_grow = cfg.manager.do_reseed = false;
@@ -812,15 +765,13 @@ static int cmdMap(int argc, char** argv) {
     if (cfg.compact_unused_features) compaction.emplace(buildFeatureCompactionPlan(db));
     std::vector<FeatureSet> feats(db.images.size());
     {
-        // Descriptors are skipped: matching is over, and on a 5000-image
-        // capture they are several gigabytes of file that nothing downstream
-        // reads. Parallel because it is pure per-file work landing by index.
+        // 匹配完成后不再读取描述子，五千张图像可省去数 GB 无用读取；各文件按索引独立加载，可并行处理。
         const unsigned hc = std::thread::hardware_concurrency();
         int nt = cfg.threads > 0 ? cfg.threads : (hc > 0 ? (int)hc : 1);
         nt = std::max(1, std::min<int>(nt, (int)db.images.size()));
         std::atomic<size_t> next{0};
         std::mutex err_mtx;
-        std::string first_error;  // a bad file must report itself, not terminate
+        std::string first_error;  // 坏文件须报告错误，不能直接终止进程
         std::vector<std::thread> pool;
         for (int t = 0; t < nt; t++)
             pool.emplace_back([&] {
@@ -849,13 +800,12 @@ static int cmdMap(int argc, char** argv) {
     if (compaction) {
         remapMatches(db, *compaction, feats);
         const FeatureCompactionStats stats = compaction->stats;
-        // old_to_new is the only temporary proportional to the original row count.
+        // old_to_new 是唯一与原始特征行数成正比的临时缓冲。
         compaction.reset();
         if (opt.verbose) reportFeatureCompaction(stats);
     }
 
-    // The camera setup, in order of authority: what the command line asked for,
-    // else what verification recorded in matches.bin (D47), else derived here.
+    // 相机设置优先级：命令行显式值、matches.bin 的验证记录（D47）、现场推导。
     const bool cam_args = sawCameraFlags(seen) || !cfg.camera.overrides.empty();
     CameraSetup cs;
     const bool from_db = !cam_args && loadCameraSetup(db, cs);
@@ -868,13 +818,8 @@ static int cmdMap(int argc, char** argv) {
             L::err(Tag::Map, M::map_camera_setup_rebuilt, {matchesPath});
     }
 
-    // A fisheye group with no focal prior and none recorded (D45/D46/D47).
-    // `spirula-sfm auto` and `spirula-sfm match` measure this before verifying, on raw putative
-    // matches, and it now travels in the match database; this is the fallback
-    // for a matches.bin that predates that or arrived from elsewhere. The
-    // sample here is verified *inliers*, so if the verification was itself
-    // calibrated the answer is pulled towards the focal it used -- which is
-    // exactly why carrying the measured one is better than re-deriving it.
+    // 鱼眼相机缺少焦距先验和数据库记录时的回退（D45/D46/D47）；auto 和 match 使用原始候选匹配估计焦距并保存。
+    // 此处只能使用已验证内点，会偏向验证时使用的焦距，因此应优先沿用数据库中的测量值。
     if (!from_db && db.pairs.size() >= 8) {
         std::vector<std::pair<uint32_t, uint32_t>> sample;
         std::vector<std::vector<FeatureMatch>> sm;
@@ -902,7 +847,7 @@ static int cmdMap(int argc, char** argv) {
         L::fail(Tag::Map, M::rig_bad, {e.what()});
         return 1;
     }
-    // The sensors, calibrated against the gyro on the verified pairs.
+    // 用已验证图像对的旋转标定陀螺传感器。
     const SensorCaptures sensors = loadSensorCaptures(cfg, opt.verbose);
     std::unique_ptr<TelemetryPriors> priors =
         cfg.sensor_map ? makeSensorPriors(cfg, sensors, db, cs.ids) : nullptr;
@@ -915,13 +860,9 @@ static int cmdMap(int argc, char** argv) {
     if (cfg.resume.empty()) {
         models = runMapper(mapper, db, feats, cfg, ast);
     } else {
-        // Adopt what a previous run wrote and work on it instead. The models
-        // must come from this database (image ids are positions in it); adopt()
-        // checks the names and says so if they do not.
+        // 继续处理已有模型；图像 ID 必须对应当前数据库索引，adopt() 会核对名称。
         if (!readModels(cfg.resume, models, opt.verbose)) return 1;
-        // point2D_idx indexes this run's feature arrays. A model written with a
-        // different --compact-unused-features would index other keypoints, and
-        // the mapper can only drop those observations, not recover them.
+        // point2D_idx 索引本次运行的特征数组；若 --compact-unused-features 与原运行不同，将指向错误关键点，无法恢复观测。
         for (const Reconstruction& m : models)
             for (const auto& kv : m.images) {
                 if (!kv.second.registered || kv.first >= feats.size()) continue;
@@ -945,10 +886,7 @@ static int cmdMap(int argc, char** argv) {
         return 1;
     }
 
-    // Diagnostic (D45): does each model agree with the two-view geometries it
-    // was built from? A model welded together at a wrong relative pose is
-    // internally perfect and fails no other test, but the verified pairs that
-    // span the weld do not hold, and the images fall into disconnected groups.
+    // 检查模型与其双视图几何是否一致（D45）；错误相对位姿拼接的模型可能内部自洽，但跨接缝的验证匹配会揭示分离的图像组。
     if (cfg.check) {
         for (size_t i = 0; i < models.size(); i++) {
             Mapper::SplitStats ss;
@@ -973,9 +911,7 @@ static int cmdMap(int argc, char** argv) {
             printf("    duplicate structure: %zu of %zu co-located pairs share no points "
                    "and never matched (%.0f%%; %zu more share none but did match)\n",
                    dr.conflicts, dr.colocated, 100.0 * dr.ratio(), dr.unmatched_but_seen);
-            // The cut is reported whenever there are conflicts at all, not only
-            // when the rate passes: the whole point is that the rate is not the
-            // criterion (D46), so both numbers have to be visible side by side.
+            // 存在冲突就报告切割结果，不能仅按冲突率阈值决定；D46 的判断还需同时查看切断的共视比例。
             if (!dr.pairs.empty()) {
                 size_t dropped = 0;
                 DuplicateCut cut;
@@ -997,9 +933,7 @@ static int cmdMap(int argc, char** argv) {
         return 0;
     }
 
-    // Audit models that came from elsewhere before doing anything with them:
-    // every image's pose is checked against the correspondence graph, and the
-    // ones the model cannot support are re-registered (D44).
+    // 使用外部模型前按对应图审查每张图像位姿，重新配准缺乏支持的图像（D44）。
     if (audit_first) {
         for (size_t i = 0; i < models.size(); i++) {
             Mapper::AuditStats as;
@@ -1018,8 +952,7 @@ static int cmdMap(int argc, char** argv) {
     printAssembly(ast, models.size());
 
     resolveImageNames(models, cfg.image_dir);
-    // The mapper reported its own stage when run() returned; the passes that
-    // assemble its models add to the same counters.
+    // run() 返回时已报告建图阶段；后续装配沿用同一组计数器。
     g_map_prof.report(0, "map");
 
     const Reconstruction& rec = models.front();
@@ -1045,9 +978,7 @@ static int cmdMap(int argc, char** argv) {
     return map_metric ? 0 : 4;
 }
 
-// -----------------------------------------------------------------------
-// merge: fold the models of a fragmented capture back together (D43)
-// -----------------------------------------------------------------------
+// ---------------- 合并分散的重建模型（D43）----------------
 
 static int cmdMerge(int argc, char** argv) {
     SfmConfig cfg;
@@ -1083,8 +1014,7 @@ static int cmdMerge(int argc, char** argv) {
             return usageError("merge", "--in-place takes exactly one input directory");
         if (output.empty()) output = inputs[0];
     }
-    // Writing merged models over their own inputs is destructive (model 0 is
-    // replaced and the absorbed ones are removed), so it has to be asked for.
+    // 原地写回会替换模型 0 并删除被吸收的模型，必须显式请求。
     if (!cfg.in_place)
         for (const fs::path& d : dirs)
             if (fs::exists(output) && fs::equivalent(fs::path(output), d.parent_path())) {
@@ -1104,8 +1034,7 @@ static int cmdMerge(int argc, char** argv) {
                {d.string(), models.back().numRegistered(),
                 (long long)models.back().points3D.size()});
     }
-    // A reference re-gauges a model instead of joining it to another, which is
-    // the one thing this command does that one model can want (D74).
+    // 参考模型可用于重新确定坐标规范；此操作不要求另一个待合并模型（D74）。
     const bool metric = cfg.metric_gps != "none" || !cfg.metric_positions.empty() ||
                         (!cfg.telemetry_inputs.empty() && cfg.sensor_gauge != "none") ||
                         (cfg.orient && cfg.exif_attitude != "none" && !cfg.image_dir.empty());
@@ -1143,13 +1072,12 @@ static int cmdMerge(int argc, char** argv) {
     }
 
     std::vector<sfm::ModelGauge> merge_gauge;
-    // These models came off disk, which records no Orientation tag.
+    // 磁盘模型未保存 Orientation 标签。
     if (cfg.exif_orientation == "orient") fillExifOrientations(models, cfg.image_dir);
     const bool merge_metric = fixGauge(models, cfg, cfg.image_dir, mo.verbose, merge_gauge);
     recolorPoints(models, cfg);
     writeModels(models, fs::path(output), mo.verbose, merge_gauge);
-    // In place, the models that were absorbed must not stay behind as stale
-    // directories claiming to be reconstructions.
+    // 原地合并后删除被吸收模型的旧目录，避免将其误认作有效重建。
     if (cfg.in_place)
         for (const fs::path& d : dirs) {
             const std::string name = d.filename().string();
@@ -1165,15 +1093,9 @@ static int cmdMerge(int argc, char** argv) {
     return merge_metric ? 0 : 4;
 }
 
-// -----------------------------------------------------------------------
-// auto: one command from an image directory to a COLMAP sparse model
-// -----------------------------------------------------------------------
-//
-// The equivalent of COLMAP's `automatic_reconstructor`: pick sane settings from
-// two knobs (quality, data type), run extract -> match -> map in one process,
-// and lay the workspace out the way COLMAP does so existing tooling reads it.
-// The presets themselves live in SfmConfig.cpp's applyPresets, next to the
-// table they move, and report what they moved.
+// ---------------- 自动重建 ----------------
+// 按 quality 与 data type 选择预设，在单进程中执行 extract -> match -> map，并输出 COLMAP 兼容工作区。
+// 预设由 SfmConfig.cpp 的 applyPresets 定义并报告修改项。
 
 static int cmdAuto(int argc, char** argv) {
     std::vector<std::string> args(argv, argv + argc);
@@ -1195,11 +1117,7 @@ int spirula_sfm_main(int argc, char** argv) {
         printTopHelp(stderr);
         return 1;
     }
-    // Accept `--flag=value` as well as `--flag value`, everywhere. Only tokens
-    // that start with `--` are split, and only at their first `=`, so a value
-    // that itself contains one (`--camera-model cam0=opencv-fisheye`) is
-    // untouched. Every subcommand parses positionally, so this is the one place
-    // that has to know.
+    // 统一支持 --flag=value 与 --flag value；仅拆分以 -- 开头的参数的首个等号，保留 cam0=opencv-fisheye 等值内部的等号。
     std::vector<std::string> store;
     std::vector<char*> args;
     store.reserve((size_t)argc * 2);
@@ -1221,7 +1139,7 @@ int spirula_sfm_main(int argc, char** argv) {
 
     std::string cmd = argv[1];
     if (cmd == "--help" || cmd == "-h" || cmd == "help") {
-        // `spirula-sfm help <command>` is the same as `<command> --help`.
+        // spirula-sfm help <command> 等价于 <command> --help。
         if (argc > 2) {
             if (std::string(argv[2]) == "ba") { printBaHelp(stdout); return 0; }
             if (const CommandInfo* c = findCommand(argv[2])) { printCommandHelp(*c); return 0; }
@@ -1235,10 +1153,7 @@ int spirula_sfm_main(int argc, char** argv) {
         std::printf("%s %s\n", kProgram, SS_VERSION);
         return 0;
     }
-    // One catch for every subcommand. Setup failures throw rather than return
-    // -- a checkpoint that will not download, a matcher handed the wrong kind
-    // of descriptor -- and those messages are written to be read by the person
-    // who typed the command, not by a terminate handler.
+    // 集中捕获所有子命令的初始化异常，将下载失败、描述子类型错误等信息直接报告给用户。
     try {
         if (cmd == "auto") return cmdAuto(argc - 2, argv + 2);
         if (cmd == "extract") return cmdExtract(argc - 2, argv + 2);
@@ -1248,7 +1163,7 @@ int spirula_sfm_main(int argc, char** argv) {
         if (cmd == "ba") return cmdBa(argc - 2, argv + 2);
     } catch (const sfm::Cancelled&) {
         L::err(Tag::Run, M::run_cancelled);
-        return 130;   // the shell's convention for SIGINT, 128 + 2
+        return 130;   // 遵循 shell 的 SIGINT 退出码约定：128 + 2
     } catch (const std::exception& e) {
         std::fprintf(stderr, "%s %s: error: %s\n", kProgram, cmd.c_str(), e.what());
         return 1;

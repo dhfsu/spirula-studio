@@ -1,12 +1,4 @@
-// The sensors as priors (docs/notes/sensor-priors.md): the fixed-rotation
-// two-view and PnP estimators on scenes with equipment and outliers, then
-// the telemetry source on the synthetic walk -- calibrated from pair
-// rotations alone, its relative rotations, and the factors it states about
-// a posed model in a random gauge (up, rotations, inertial scale, GPS).
-//
-//   sfm_sensor_prior_test
-//
-// Prints FAIL lines and returns the count. Needs no GPU.
+// 纯主机传感器先验测试，覆盖相机附属设备和离群匹配下的固定旋转双视图/PnP，以及合成步行中的旋转、重力、惯性尺度和 GPS 因子。
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -41,7 +33,7 @@ static double angleDeg(const Vec3& a, const Vec3& b) {
     return std::acos(d) * 180.0 / M_PI;
 }
 
-// ---- two views with the rotation known ---------------------------------------
+// ---------------- 已知旋转的双视图 ----------------
 
 static void testKnownRotationTwoView() {
     std::mt19937 rng(3);
@@ -60,7 +52,7 @@ static void testKnownRotationTwoView() {
         b1.push_back(a);
         b2.push_back(b);
     }
-    // Equipment fixed to the camera: the same bearing in both frames.
+    // 固定于相机的设备在两帧中具有相同视线。
     for (int k = 0; k < n_equip; k++) {
         const Vec3 a = Vec3{0.8 * U(rng), 0.6 + 0.3 * U(rng), 1.0}.normalized();
         b1.push_back(a);
@@ -92,8 +84,7 @@ static void testKnownRotationTwoView() {
     check(junk_in <= 5, "known-rotation: junk rejected");
     check(g.ok && angleDeg(g.pose.t, t) < 1.0, "known-rotation: translation within 1 deg");
 
-    // The free estimate on the same pair, for the record: with 40% of the
-    // matches on the equipment it is what the prior exists to overrule.
+    // 40% 匹配来自设备时，自由估计可能错误，先验应推翻它。
     TwoViewOptions tv;
     tv.ransac.max_error = 0.003;
     const TwoViewGeometry f = estimateTwoViewBearing(b1, b2, tv);
@@ -103,7 +94,7 @@ static void testKnownRotationTwoView() {
     std::printf("  free estimate: config %s, %d inliers, %d of them equipment\n",
                 twoViewConfigName(f.config), f.num_inliers, f_equip);
 
-    // A panorama: no translation at all.
+    // 全景纯旋转，无平移。
     std::vector<Vec3> p1, p2;
     for (int k = 0; k < 200; k++) {
         const Vec3 a = Vec3{U(rng), U(rng), 1.5}.normalized();
@@ -141,7 +132,7 @@ static void testKnownRotationPnP() {
     check(r.success && r.num_inliers >= 0.9 * n_good, "known-rotation PnP: inliers");
     check(r.success && (r.pose.t - truth.t).norm() < 0.01, "known-rotation PnP: translation");
 
-    // The rig form: two lenses, the frame rotation given.
+    // 双镜头 rig，给定帧旋转。
     const Pose ext1{mat3Identity(), {0, 0, 0}};
     const Pose ext2{angleAxisToRotation({0, M_PI, 0}), {0.02, 0, -0.05}};
     std::vector<Vec3> X2, b2;
@@ -158,7 +149,7 @@ static void testKnownRotationPnP() {
     check(rr.success && (rr.rig_from_world.t - truth.t).norm() < 0.01, "known-rotation rig PnP");
 }
 
-// ---- the telemetry source on the synthetic walk ------------------------------
+// ---------------- 合成步行遥测源 ----------------
 
 static void testTelemetryPriors() {
     Scenario sc;
@@ -173,7 +164,7 @@ static void testTelemetryPriors() {
     M.scale = 0.37;
     M.R = angleAxisToRotation(Vec3{1.1, 0.4, -0.9});
     M.t = {2.0, -1.0, 0.5};
-    // Two frames a second, so the chains and the triples have something to hold.
+    // 每秒两帧，保证时间链和三帧组有足够数据。
     Reconstruction rec = synthesizeModel(sc, M, 2.0);
     std::vector<std::string> names;
     std::vector<uint32_t> cams;
@@ -183,7 +174,7 @@ static void testTelemetryPriors() {
         names.push_back(kv.second.name);
         cams.push_back(1);
     }
-    // Image ids are the database positions; the model's are 1-based.
+    // 数据库 ID 为数组位置，模型 ID 从 1 开始。
     std::map<uint32_t, uint32_t> pos;
     for (uint32_t k = 0; k < ids.size(); k++) pos[ids[k]] = k;
     SensorCapture cap;
@@ -193,7 +184,7 @@ static void testTelemetryPriors() {
     TelemetryPriors src({cap}, names, cams, po);
     check(src.timedImages() == names.size(), "every image timed");
 
-    // Calibrate from the pairs' own relative rotations, a little noisy.
+    // 从略带噪声的双视图相对旋转标定。
     std::mt19937 rng(4);
     std::normal_distribution<double> N(0, 1);
     std::vector<PairRotationObs> obs;
@@ -203,8 +194,7 @@ static void testTelemetryPriors() {
         PairRotationObs o;
         o.i = k;
         o.j = k + 1;
-        // A tenth of a degree, what a verified pair's essential matrix gives
-        // on a real capture; the offset search reads the mismatch at 20 ms.
+        // 旋转噪声十分之一度，接近真实验证对精度；时钟搜索评估 20 ms 偏移差异。
         const double s = 0.08 * M_PI / 180.0;
         o.R_ji = mul(angleAxisToRotation({s * N(rng), s * N(rng), s * N(rng)}), mul(b.R, transpose(a.R)));
         obs.push_back(o);
@@ -213,7 +203,7 @@ static void testTelemetryPriors() {
     check(src.groups().size() == 1 && src.groups()[0].ok, "calibrated from pairs");
     if (!src.groups().empty()) {
         const SensorGroupState& g = src.groups()[0];
-        // The sign of X is open before gravity: compare against both.
+        // 加入重力前 X 符号未定，两种符号均比较。
         const double e = std::min(angleDeg(g.X, R_ci), angleDeg(mat3Scale(g.X, -1.0), R_ci));
         std::printf("pair calibration: ok=%d pairs=%d sig_rot=%.2f deg, X within %.2f deg, "
                     "offset %.1f ms (found %d)\n", g.ok, g.pairs, g.fit.sig_rot_deg, e,
@@ -222,7 +212,7 @@ static void testTelemetryPriors() {
         check(src.timeOffsets()[0].found && std::fabs(src.timeOffsets()[0].offset - sc.clock_offset) < 0.006,
               "pair calibration: clock offset recovered");
     }
-    // Relative rotations against the poses.
+    // 相对旋转与模型位姿比较。
     double worst = 0;
     int n_rel = 0;
     for (uint32_t k = 0; k + 3 < ids.size(); k += 7) {
@@ -238,7 +228,7 @@ static void testTelemetryPriors() {
     check(n_rel > 20 && worst < 1.5, "relative rotations within 1.5 deg of the poses");
     check(src.neighbours(10).size() >= 4, "neighbours");
 
-    // The factors over the posed model.
+    // 对已定位模型生成先验因子。
     std::vector<PosedImage> imgs;
     for (uint32_t k = 0; k < ids.size(); k++) imgs.push_back({k, 1, rec.images.at(ids[k]).pose});
     const PosePriors pf = src.factors(imgs);
@@ -255,8 +245,7 @@ static void testTelemetryPriors() {
     check(pf.rotations.size() >= ids.size() - 2, "factors: a rotation per consecutive pair");
     check(st.scale_ok && std::fabs(st.scale / M.scale - 1.0) < 0.03, "factors: scale within 3%");
     check(st.gps_ok && st.gps >= 0.8 * (int)ids.size(), "factors: GPS positions");
-    // Every factor's residual at the true poses must be small: the model is
-    // the truth, so only the sensors' own noise and the fit's remain.
+    // 真值位姿下各因子残差应小，仅剩传感器及拟合噪声。
     double worst_up = 0, worst_rot = 0, worst_c = 0;
     auto camPose = [&](uint32_t k) { return rec.images.at(ids[k]).pose; };
     for (const PriorUp& u : pf.ups)
@@ -286,7 +275,7 @@ static void testTelemetryPriors() {
     check(gps_n > 0 && gps_rms < 4.0, "factors: gps residual");
     check(tri_n >= 10, "factors: triples");
 
-    // The same source through a renumbering.
+    // 经局部重编号包装的同一先验源。
     std::vector<uint32_t> to_global;
     for (uint32_t k = 20; k < 60; k++) to_global.push_back(k);
     RemappedPriorSource sub(src, to_global);

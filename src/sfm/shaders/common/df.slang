@@ -1,11 +1,6 @@
 #pragma once
-// Emulated double precision ("double-float" / compensated float pair).
-// A value is represented as hi + lo with |lo| <= 0.5 ulp(hi), giving ~49 bits
-// of significand using only fp32 hardware. Algorithms follow the QD library
-// (Hida, Li, Bailey). All arithmetic used inside differentiable code carries
-// custom backward derivatives so Slang autodiff works transparently.
-//
-// Requires fp32 fma and strict fp evaluation (do not compile with fast-math).
+// 双浮点模拟以 hi+lo 且 |lo|<=0.5 ulp(hi) 表示约 49 位有效精度，算法参考 QD 库。
+// 可微算术提供自定义反向导数；依赖 fp32 FMA 与严格浮点求值，禁止 fast-math。
 
 public struct DF : IDifferentiable {
     public typealias Differential = DF;
@@ -20,7 +15,7 @@ public struct DF : IDifferentiable {
     [Differentiable] public static Differential dadd(Differential a, Differential b) { return df_add(a, b); }
 };
 
-// ---------------- error-free transforms ----------------
+// ---------------- 无误差变换 ----------------
 
 DF df_two_sum(float a, float b) {
     float s = a + b;
@@ -29,7 +24,7 @@ DF df_two_sum(float a, float b) {
     return DF(s, err);
 }
 
-// requires |a| >= |b|
+// 要求 |a|>=|b|
 DF df_quick_two_sum(float a, float b) {
     float s = a + b;
     return DF(s, b - (s - a));
@@ -40,7 +35,7 @@ DF df_two_prod(float a, float b) {
     return DF(p, fma(a, b, -p));
 }
 
-// ---------------- core arithmetic ----------------
+// ---------------- 基本算术 ----------------
 
 [BackwardDerivative(df_add_bwd)]
 public DF df_add(DF a, DF b) {
@@ -101,7 +96,7 @@ void df_div_bwd(inout DifferentialPair<DF> a, inout DifferentialPair<DF> b, DF g
     b = diffPair(b.p, df_neg(df_mul(ga, df_mul(a.p, inv_b))));
 }
 
-// ---------------- elementary functions ----------------
+// ---------------- 初等函数 ----------------
 
 [BackwardDerivative(df_sqrt_bwd)]
 public DF df_sqrt(DF a) {
@@ -118,15 +113,11 @@ void df_sqrt_bwd(inout DifferentialPair<DF> a, DF g) {
     a = diffPair(a.p, df_div(df_mul_f(g, 0.5f), s));
 }
 
-// Polynomials are near-minimax (Chebyshev) fits on the reduced range rather
-// than Taylor series -- same interval accuracy with several fewer terms.
-// The high-order terms contribute < ~6e-9 of the result, far below one df
-// ulp after fp32 rounding, so the polynomial tail is evaluated in plain
-// fp32 and only the head terms use full DF Horner steps.
+// 约简区间采用近极小极大 Chebyshev 拟合，同精度比 Taylor 项数更少；高阶项贡献低于约 6e-9，可用普通 fp32，低阶项保留完整 DF Horner。
 
 static const float kDfInvLn2 = 1.4426950216293335f;
 static const DF kDfLn2 = { 0.6931471824645996f, -1.9046542121259336e-09f };
-// exp(r), |r| <= ln2/2: degree 10, max rel err 2.9e-16
+// exp(r)，|r|<=ln2/2，十次多项式，最大相对误差 2.9e-16
 static const DF kDfExpC[8] = {
     { 1.0f, -0.0f },
     { 1.0f, 6.7423483788263405e-15f },
@@ -161,8 +152,7 @@ void df_exp_bwd(inout DifferentialPair<DF> a, DF g) {
 
 static const float kDfTwoOverPi = 0.6366197466850281f;
 static const DF kDfPiO2 = { 1.5707963705062866f, -4.371138828673793e-08f };
-// sin(r)/r and cos(r) as polynomials in s = r^2 <= (pi/4)^2: degree 6,
-// max rel err 3.5e-18 / 6.7e-17
+// sin(r)/r 与 cos(r) 写为 s=r²<=(pi/4)² 的六次多项式，最大相对误差分别 3.5e-18、6.7e-17。
 static const DF kDfSinC[5] = {
     { 1.0f, -3.147176764917495e-18f },
     { -0.1666666716337204f, 4.9670543234014986e-09f },
@@ -222,7 +212,7 @@ void df_cos_bwd(inout DifferentialPair<DF> a, DF g) {
     a = diffPair(a.p, df_neg(df_mul(g, df_sin(a.p))));
 }
 
-// ---------------- operators & misc (overload builtins for DF) ----------------
+// ---------------- DF 运算符重载及辅助操作 ----------------
 
 [Differentiable] public DF operator +(DF a, DF b) { return df_add(a, b); }
 [Differentiable] public DF operator -(DF a, DF b) { return df_sub(a, b); }

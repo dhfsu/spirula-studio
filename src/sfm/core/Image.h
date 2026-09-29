@@ -1,13 +1,4 @@
-// Host-side image container and decode.
-//
-// Minimal by design: decode JPEG/PNG/etc. through the vendored stb_image (D5),
-// convert to single-channel float in [0,1] using Rec.601 luma weights (what
-// COLMAP's FreeImage grayscale path uses), and optionally downscale so the long
-// edge is <= max_image_size (COLMAP's default 3200). Everything downstream of
-// feature extraction works on this GrayImage.
-//
-// EXIF / focal-length priors are a separate concern (docs/notes/sfm-design.md D5); not
-// handled here yet.
+// 主机图像容器与解码，使用 stb_image 读取常见格式，以 Rec.601 权重转为 [0,1] 单通道 float，并可限制最长边。
 #pragma once
 
 #include <cmath>
@@ -22,33 +13,20 @@
 
 namespace sfm {
 
-// Single-channel image, row-major, values in [0,1].
-//
-// `rgb` is an *optional* companion buffer at the same (post-downscale) width and
-// height, 3 interleaved uint8 per pixel. It is empty unless the image was
-// decoded with color requested (loadGrayImage(..., want_color=true)); SIFT never
-// touches it -- it exists so `spirula-sfm extract` can sample a color at each keypoint
-// for the reconstruction's point cloud (src/sfm/README.md "Point colors").
+// 灰度按行存储，范围 [0,1]；可选 RGB 为同工作尺寸的每像素三字节交错缓冲，仅用于关键点颜色采样，不供 SIFT 使用。
 struct GrayImage {
     int width = 0;
     int height = 0;
-    // The source file's size, which differs from (width,height) when the loader
-    // downscaled to max_image_size. Features are extracted at (width,height)
-    // and scaled back to this before they are written (D46), so intrinsics
-    // describe the images on disk.
+    // 源文件尺寸可能不同于工作尺寸，特征写出前映回此坐标，使内参描述磁盘图像（D46）。
     int orig_width = 0;
     int orig_height = 0;
     std::vector<float> data;  // width*height
-    std::vector<uint8_t> rgb; // empty, or width*height*3 (interleaved RGB)
-    // Optional keypoint mask, at *its own* resolution (sfm/core/Mask.h): it is
-    // sampled in uv, so it neither has to match this image's decoded size nor
-    // the source file's. Empty unless the loader was given a mask path.
+    std::vector<uint8_t> rgb; // 空值或 width*height*3 字节的交错 RGB
+    // 可选掩码保留自身分辨率，按 UV 采样，无需匹配原图或工作图尺寸。
     Mask mask;
-    // What the file's EXIF said, if anything (sfm/core/Exif.h). Parsed here so
-    // the batch decode pool absorbs the cost, and because this is the last
-    // stage that touches the image file at all.
+    // 在解码池中解析 EXIF，吸收读取开销；此阶段之后不再接触原图文件。
     ExifData exif;
-    // The turn was applied but the tag also asked for a mirror, which was not.
+    // 已应用旋转，但标签要求的镜像被忽略。
     bool exif_mirror_dropped = false;
 
     float at(int x, int y) const { return data[(size_t)y * width + x]; }
@@ -56,9 +34,7 @@ struct GrayImage {
     bool hasColor() const { return rgb.size() == pixels() * 3; }
 };
 
-// Bilinearly sample the color at (x,y) in the same coordinate frame as the gray
-// data. Out-of-range coordinates clamp to the border. No-op (leaves gray) if the
-// image carries no color.
+// 在灰度同一坐标系双线性采样颜色，越界钳位；无颜色缓冲时保留灰度。
 inline void sampleColor(const GrayImage& img, float x, float y, uint8_t out[3]) {
     if (!img.hasColor()) { out[0] = out[1] = out[2] = 128; return; }
     int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
@@ -79,30 +55,25 @@ inline void sampleColor(const GrayImage& img, float x, float y, uint8_t out[3]) 
     }
 }
 
-// A mask that fails to decode comes back empty, never as an exception -- a bad
-// mask must not lose the image. `gamut` / `is_linear` describe the file; pixels
-// convert to sRGB on decode, which luma and the learned frontend assume.
+// 掩码解码失败返回空，不因此丢弃图像；gamut/is_linear 描述原文件，解码后统一转为 sRGB。
 GrayImage loadGrayImage(const std::string& path, int max_image_size = 3200,
                         bool want_color = false, const std::string& mask_path = "",
                         const std::string& gamut = "",
                         std::optional<bool> is_linear = std::nullopt,
                         bool flip_mask = false,
-                        // Turns the pixels and the mask, leaving exif.orientation
-                        // at 1; a tag's MIRROR half is dropped (docs/datasets.md).
+                        // 旋转像素和掩码并将 orientation 设为 1；忽略镜像部分。
                         bool apply_exif_orientation = false);
 
-// Read just the pixel dimensions from an image header (no full decode).
-// Returns false if the file is not a decodable image.
+// 仅从图像头读取宽高，不完整解码；格式不可解码时返回 false。
 bool imageSize(const std::string& path, int& width, int& height);
 
-// Bilinear resample to an exact target size. Used by the loader for
-// max_image_size clamping and available to callers (e.g. synthetic tests).
+// 双线性重采样到精确目标尺寸，供加载器尺寸限制与合成测试使用。
 inline GrayImage resizeGray(const GrayImage& src, int dw, int dh) {
     GrayImage out;
     out.width = dw;
     out.height = dh;
     out.data.resize((size_t)dw * dh);
-    // Map destination pixel centers back into source, clamp at the border.
+    // 将目标像素中心反向映射到源图，边界钳位。
     const float sx = src.width / (float)dw;
     const float sy = src.height / (float)dh;
     for (int y = 0; y < dh; y++) {
@@ -127,4 +98,4 @@ inline GrayImage resizeGray(const GrayImage& src, int dw, int dh) {
     return out;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

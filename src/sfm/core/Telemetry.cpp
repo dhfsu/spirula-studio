@@ -1,6 +1,4 @@
-// Telemetry.cpp -- see Telemetry.h.
-//
-// The ISO-BMFF walk reads telemetry metadata and never decodes video pictures.
+// 视频遥测解析实现，见 Telemetry.h；ISO-BMFF 遍历仅读取元数据，不解码视频帧。
 
 #include "sfm/core/Telemetry.h"
 
@@ -32,9 +30,7 @@ namespace {
 constexpr double kG = 9.80665;
 constexpr double kPi = 3.14159265358979323846;
 
-// ================
-// Byte sources
-// ================
+// ================ 字节来源 ================
 
 struct Source {
     virtual ~Source() = default;
@@ -113,9 +109,7 @@ std::string fourcc_str(uint32_t v) {
     return s;
 }
 
-// ================
-// ISO-BMFF
-// ================
+// ================ ISO-BMFF 容器 ================
 
 struct Box {
     uint32_t type = 0;
@@ -167,11 +161,11 @@ void each_box(const uint8_t* data, size_t size, const std::function<void(const B
 struct Sample {
     uint64_t offset = 0;
     uint32_t size = 0;
-    double t = 0;   // seconds, decode order
+    double t = 0;   // 秒，按解码顺序
 };
 
 struct Track {
-    uint32_t sample_type = 0;   // stsd entry fourcc
+    uint32_t sample_type = 0;   // stsd 条目的 fourcc 类型码
     uint32_t handler = 0;
     std::string handler_name;
     uint32_t timescale = 0;
@@ -191,7 +185,7 @@ struct Movie {
     VideoProjection projection;
     std::vector<Track> tracks;
     double durationSec() const { return timescale ? (double)duration / timescale : 0.0; }
-    // 1904-01-01 to 1970-01-01.
+    // 1904-01-01 到 1970-01-01 的时间差。
     double unixStart() const { return creation_1904 ? (double)creation_1904 - 2082844800.0 : 0.0; }
 };
 
@@ -209,7 +203,7 @@ bool parse_trak(const uint8_t* data, size_t size, Track& tk) {
         tk.handler = be32(b.payload + 8);
         const char* s = (const char*)b.payload + 24;
         size_t n = b.payload_size - 24;
-        // QuickTime writes a Pascal string, ISO a NUL-terminated one.
+        // QuickTime 使用 Pascal 字符串，ISO 使用 NUL 结尾字符串。
         if (n > 0 && (uint8_t)s[0] == n - 1) { s++; n--; }
         while (n > 0 && s[n - 1] == 0) n--;
         tk.handler_name.assign(s, n);
@@ -298,9 +292,7 @@ bool parse_trak(const uint8_t* data, size_t size, Track& tk) {
     return true;
 }
 
-// The two `udta` keys this needs: what a GoPro calls the projection, and that
-// projection's own numbers. Nested rather than scanned for, so four bytes
-// spelling PRJT inside somebody's payload cannot answer.
+// 按嵌套结构读取 GoPro 投影 PRJT 与参数 PMOD，不能扫描任意载荷中的同名字节。
 void gpmf_projection(const uint8_t* p, size_t n, int depth, VideoProjection& out) {
     for (size_t off = 0; off + 8 <= n;) {
         const uint32_t key = be32(p + off);
@@ -318,8 +310,7 @@ void gpmf_projection(const uint8_t* p, size_t n, int depth, VideoProjection& out
     }
 }
 
-// Scans the top-level boxes for moov, which may follow mdat, and stops at the
-// first thing that is not a box (an Insta360 trailer, say).
+// 扫描顶层盒查找可能位于 mdat 后的 moov，遇到非盒数据如 Insta360 尾部时停止。
 bool read_movie(const Source& src, Movie& mv, bool& is_mp4, std::string& error) {
     is_mp4 = false;
     uint8_t hdr[16];
@@ -371,13 +362,9 @@ bool read_movie(const Source& src, Movie& mv, bool& is_mp4, std::string& error) 
     return true;
 }
 
-// ================
-// Time helpers
-// ================
+// ================ 时间辅助函数 ================
 
-// Spreads the `count` readings of payload `i` from its own start to the
-// next payload's, the way gpmf-parser does; the last payload reuses the
-// previous spacing.
+// 将载荷 i 的 count 个读数均匀分布到下一载荷起点，最后一组沿用此前间隔，与 gpmf-parser 一致。
 void spread_times(const std::vector<double>& starts, const std::vector<size_t>& counts,
                   std::vector<double>& out) {
     out.clear();
@@ -392,9 +379,7 @@ void spread_times(const std::vector<double>& starts, const std::vector<size_t>& 
     }
 }
 
-// ================
-// GPMF (GoPro)
-// ================
+// ================ GoPro GPMF ================
 
 struct Klv {
     uint32_t key = 0;
@@ -416,7 +401,7 @@ bool klv_read(const uint8_t* p, size_t avail, Klv& k) {
     return 8 + k.len() <= avail;
 }
 
-// One STRM: the numbers a data key needs to be decoded.
+// 一个 STRM 中解码数据所需的数值参数。
 struct GpmfStream {
     bool has_stmp = false;
     uint64_t stmp = 0;
@@ -430,7 +415,7 @@ struct GpmfStream {
     bool has_data = false;
 };
 
-// Element width of one GPMF type letter; 0 for anything not a number.
+// GPMF 类型字母对应的元素宽度，非数值类型返回 0。
 size_t gpmf_width(char c) {
     switch (c) {
         case 'b': case 'B': return 1;
@@ -457,7 +442,7 @@ double gpmf_typed(char c, const uint8_t* p) {
     }
 }
 
-// "yymmddhhmmss.sss" -> unix seconds; 0 when malformed.
+// yymmddhhmmss.sss 转为 Unix 秒，格式错误返回 0。
 double gpsu_to_unix(const uint8_t* s, size_t n) {
     if (n < 12) return 0;
     auto two = [&](size_t o) { return (s[o] - '0') * 10 + (s[o + 1] - '0'); };
@@ -466,7 +451,7 @@ double gpsu_to_unix(const uint8_t* s, size_t n) {
     int hh = two(6), mm = two(8), ss = two(10);
     double frac = 0;
     if (n >= 16 && s[12] == '.') frac = (two(13) * 10 + (s[15] - '0')) / 1000.0;
-    // Days since the epoch, civil-from-days (Howard Hinnant).
+    // 相对纪元的天数，采用 Howard Hinnant 的日期算法。
     y -= m <= 2;
     const int era = (y >= 0 ? y : y - 399) / 400;
     const unsigned yoe = (unsigned)(y - era * 400);
@@ -477,15 +462,15 @@ double gpsu_to_unix(const uint8_t* s, size_t n) {
 }
 
 struct GpmfAccum {
-    // Per data key: payload start times (us), counts, and the decoded rows.
+    // 各数据键保存载荷起始微秒、样本数及解码后的行。
     std::vector<double> starts;
     std::vector<size_t> counts;
     std::vector<std::vector<double>> rows;
-    std::vector<uint8_t> fix;   // GPS only
+    std::vector<uint8_t> fix;   // 仅 GPS 使用
     std::vector<double> dop;
     std::vector<double> unix_time;
     std::string orin, unit;
-    double first_sample_t = 0;   // sample-table time of the first payload
+    double first_sample_t = 0;   // 首载荷在样本表中的时间
 };
 
 void gpmf_walk(const uint8_t* p, size_t n, GpmfStream* strm,
@@ -541,7 +526,7 @@ void gpmf_walk(const uint8_t* p, size_t n, GpmfStream* strm,
     }
 }
 
-// Decodes one STRM's data key into rows of doubles, scaled.
+// 将 STRM 的数据键解码并缩放为 double 行。
 bool gpmf_rows(const GpmfStream& s, std::vector<std::vector<double>>& rows) {
     const Klv& k = s.data;
     rows.clear();
@@ -573,8 +558,7 @@ bool gpmf_rows(const GpmfStream& s, std::vector<std::vector<double>>& rows) {
     return true;
 }
 
-// ORIN names each column's axis, lower case negated: "XzY" is x, -z, y.
-// Missing, it is the (z, x, y) the early GPMF spec documents for HERO5.
+// ORIN 指定各列坐标轴，小写表示取负，如 XzY 为 x,-z,y；缺失时按早期 HERO5 规范使用 (z,x,y)。
 void orin_apply(const std::string& orin, const std::vector<double>& row, TelemetryVec& v) {
     std::string o = orin.size() >= 3 ? orin.substr(0, 3) : "ZXY";
     double out[3] = {0, 0, 0};
@@ -601,8 +585,7 @@ bool read_gpmf(const Source& src, const Track& tk, Telemetry& out, std::string& 
             if (!gpmf_rows(s, rows) || rows.empty()) return;
             GpmfAccum& a = acc[s.data.key];
             if (a.starts.empty()) a.first_sample_t = sm.t;
-            // The payload's place on the video clock comes from the sample
-            // table; STMP only spaces the readings within it.
+            // 载荷在视频时钟中的位置来自样本表，STMP 仅确定其内部读数间隔。
             a.starts.push_back(s.has_stmp ? (double)s.stmp * 1e-6 : sm.t);
             a.counts.push_back(rows.size());
             if (a.orin.empty()) a.orin = s.orin;
@@ -622,8 +605,7 @@ bool read_gpmf(const Source& src, const Track& tk, Telemetry& out, std::string& 
     out.carrier = TelemetryCarrier::Gpmf;
     if (!device_name.empty()) out.camera = device_name;
 
-    // STMP runs on the camera clock, whose zero is not the first frame: shift
-    // each stream so its first payload lands where the sample table put it.
+    // STMP 的相机时钟起点不是首视频帧；平移各流，使首载荷对齐样本表时间。
     for (auto& kv : acc) {
         GpmfAccum& a = kv.second;
         if (a.starts.empty()) continue;
@@ -654,8 +636,7 @@ bool read_gpmf(const Source& src, const Track& tk, Telemetry& out, std::string& 
     vec_stream(fourcc("GYRO"), out.gyro, 1.0, true);
     vec_stream(fourcc("MAGN"), out.magnet, 1.0, true);
     vec_stream(fourcc("GRAV"), out.gravity, 1.0, false);
-    // GRAV is written as (X, Z, Y) of the ORIN frame: 3-4 deg from the
-    // averaged accelerometer on three MAX files once swapped, 60-97 deg before.
+    // GRAV 按 ORIN 坐标的 (X,Z,Y) 写入；三个 MAX 文件交换后与平均加速度差 3–4 度，交换前为 60–97 度。
     for (TelemetryVec& g : out.gravity) std::swap(g.y, g.z);
     if (!out.gravity.empty()) out.notes.push_back("GRAV columns swapped from (X, Z, Y) into the ORIN frame");
     if (auto it = acc.find(fourcc("ACCL")); it != acc.end() && !it->second.orin.empty())
@@ -720,9 +701,7 @@ bool read_gpmf(const Source& src, const Track& tk, Telemetry& out, std::string& 
     return true;
 }
 
-// ================
-// CAMM (Google camera motion metadata)
-// ================
+// ================ Google 相机运动元数据 CAMM ================
 
 bool read_camm(const Source& src, const Track& tk, Telemetry& out, std::string& error) {
     std::vector<uint8_t> buf;
@@ -795,15 +774,13 @@ bool read_camm(const Source& src, const Track& tk, Telemetry& out, std::string& 
     return true;
 }
 
-// ================
-// Protobuf wire format (DJI and Insta360 metadata)
-// ================
+// ================ DJI 与 Insta360 的 Protobuf 编码 ================
 
 struct PbField {
     uint32_t number = 0;
     uint32_t wire = 0;
     uint64_t varint = 0;
-    const uint8_t* data = nullptr;  // wire 2
+    const uint8_t* data = nullptr;  // Protobuf 线类型 2
     size_t len = 0;
     double f32() const { return wire == 5 && len >= 4 ? (double)lef32(data) : 0.0; }
     double f64() const { return wire == 1 && len >= 8 ? lef64(data) : 0.0; }
@@ -819,7 +796,7 @@ bool pb_varint(const uint8_t*& p, const uint8_t* end, uint64_t& v) {
     return false;
 }
 
-// Calls `fn` for each field; false when the bytes are not a message.
+// 对各字段调用 fn，字节流不是有效消息时返回 false。
 bool pb_each(const uint8_t* p, size_t n, const std::function<void(const PbField&)>& fn) {
     const uint8_t* end = p + n;
     while (p < end) {
@@ -865,17 +842,14 @@ std::string pb_string(const PbField* f) {
     return f && f->wire == 2 ? std::string((const char*)f->data, f->len) : std::string();
 }
 
-// ================
-// DJI djmd (dvtm protobuf)
-// ================
+// ================ DJI djmd，dvtm Protobuf ================
 
 struct DjiClip {
     std::string proto, product, serial, firmware;
     double sensor_fps = 0, imu_rate = 0, readout = 0, focal = 0;
 };
 
-// A PbField points into the buffer it was parsed from, so a sub-message's
-// field list has to outlive any pointer taken into it.
+// PbField 引用原始缓冲，子消息字段列表的生命周期必须覆盖从中取得的指针。
 void dji_clip(const std::vector<PbField>& clip, DjiClip& c) {
     const auto hdr = pb_sub(pb_find(clip, 1));
     c.proto = pb_string(pb_find(hdr, 1));
@@ -928,9 +902,7 @@ bool read_dji(const Source& src, const Track& tk, Telemetry& out, std::string& e
             }
         }
 
-        // oq101 (Osmo 360) and wa530 wrap the attitude in a cur/prev/next
-        // message; wm169 stores it bare. The bare form has field 1 as a
-        // varint timestamp, the wrapper has field 1 as a message.
+        // oq101/wa530 将姿态包装在 cur/prev/next 消息中，wm169 直接保存；直接形式的字段 1 为 varint 时间戳，包装形式为子消息。
         const auto imu = pb_sub(pb_find(frame, 3));
         const PbField* att = pb_find(imu, 2);
         auto attitude = pb_sub(att);
@@ -993,9 +965,7 @@ bool read_dji(const Source& src, const Track& tk, Telemetry& out, std::string& e
     return true;
 }
 
-// ================
-// Insta360 trailer
-// ================
+// ================ Insta360 尾部数据 ================
 
 constexpr const char* kInstaMagic = "8db42d694ccc418790edff439fe026bf";
 constexpr size_t kInstaHeader = 32 + 4 + 4 + 32;
@@ -1050,9 +1020,7 @@ bool read_insta360(const Source& src, const Movie* mv, Telemetry& out, std::stri
     const uint64_t extra_size = le32(hdr + 32);
     if (extra_size > src.size()) { error = "Insta360 trailer size exceeds the file"; return false; }
 
-    // Each record ends in [format u8][id u8][size u32]; the one nearest the
-    // header may be a table of (id, format, size, offset). Records past the
-    // thumbnail are padded apart, so a backwards walk alone lands in zeros.
+    // 记录尾部为 [format u8][id u8][size u32]，靠近头部者可能为索引表；缩略图后的记录间有填充，仅反向遍历会落入零区。
     struct Rec { uint8_t id, format; uint64_t offset, size; };
     std::vector<Rec> recs;
     const uint64_t extra_start = src.size() - extra_size;
@@ -1091,9 +1059,7 @@ bool read_insta360(const Source& src, const Movie* mv, Telemetry& out, std::stri
         insta_meta(buf.data(), buf.size(), meta);
     }
 
-    // Timestamps are relative to the first frame, as telemetry-parser (the
-    // reference for this layout) computes them; the raw-gyro variant stamps
-    // in microseconds and the float one in milliseconds.
+    // 时间戳按 telemetry-parser 的布局换算为相对首帧；原始陀螺版本用微秒，浮点版本用毫秒。
     const double fft = (double)meta.first_frame_ts / 1000.0;
     const double gyro_shift = meta.has_gyro_ts ? meta.gyro_ts / 1000.0 : 0.0;
     auto fix_time = [&](double raw_ms) {
@@ -1135,7 +1101,7 @@ bool read_insta360(const Source& src, const Movie* mv, Telemetry& out, std::stri
                 const uint8_t* p = buf.data() + i * item;
                 TelemetryGps g;
                 g.unix_time = (double)le64(p) + le16(p + 8) / 1000.0;
-                if (g.unix_time <= 0 || (p[10] != 'A' && p[10] != 'V')) continue;   // padding
+                if (g.unix_time <= 0 || (p[10] != 'A' && p[10] != 'V')) continue;   // 填充字节
                 g.fix = p[10] == 'A';
                 g.lat = std::fabs(lef64(p + 11)) * (p[19] == 'S' ? -1 : 1);
                 g.lon = std::fabs(lef64(p + 20)) * (p[28] == 'W' ? -1 : 1);
@@ -1156,9 +1122,7 @@ bool read_insta360(const Source& src, const Movie* mv, Telemetry& out, std::stri
     out.firmware = meta.firmware;
     if (meta.readout > 0) out.frame_readout = meta.readout / 1000.0;
 
-    // GPS carries wall-clock time only. The metadata's creation_time is a
-    // local-time YYYYMMDDHHMMSS number, so the movie header (UTC) is what
-    // places the video on that clock; on an X5 it matched the first fix.
+    // GPS 仅有实时时间，creation_time 为本地 YYYYMMDDHHMMSS，因此使用 UTC 视频头对齐时钟；X5 测量中与首定位一致。
     double start = mv ? mv->unixStart() : 0.0;
     if (start > 0 && !out.gps.empty()) {
         out.video_unix_start = start;
@@ -1172,9 +1136,7 @@ bool read_insta360(const Source& src, const Movie* mv, Telemetry& out, std::stri
     return true;
 }
 
-// ================
-// Driver
-// ================
+// ================ 解析调度 ================
 
 bool read_any(const Source& src, Telemetry& out, std::string& error) {
     out = Telemetry();
@@ -1204,9 +1166,7 @@ bool read_any(const Source& src, Telemetry& out, std::string& error) {
     return true;
 }
 
-// ================
-// Checks
-// ================
+// ================ 数据检查 ================
 
 template <class T>
 TelemetryStreamCheck stream_check(const std::vector<T>& v, const std::function<bool(const T&)>& finite) {
@@ -1256,8 +1216,7 @@ double angle_deg(const double a[3], const double b[3]) {
     return std::acos(c) * 180.0 / kPi;
 }
 
-// Box average over +-half_window seconds: the accelerometer's low-frequency
-// content is gravity, the rest is motion and vibration.
+// 在 ±half_window 秒做均值；低频加速度主要为重力，其余为运动与振动。
 std::vector<TelemetryVec> smooth_accel(const std::vector<TelemetryVec>& a, double half_window) {
     std::vector<TelemetryVec> out(a.size());
     size_t lo = 0, hi = 0;
@@ -1271,9 +1230,7 @@ std::vector<TelemetryVec> smooth_accel(const std::vector<TelemetryVec>& a, doubl
     return out;
 }
 
-// Median angle between the accelerometer rotated into the world by the
-// attitude and the mean of those vectors: near zero when the quaternion sense
-// is right and the camera moved gently.
+// 将加速度按姿态旋到世界后，计算各向量与均值的夹角中位数；四元数方向正确且运动平稳时接近零。
 double world_gravity_spread(const std::vector<TelemetryVec>& accel,
                             const std::vector<TelemetryQuat>& att, bool conj) {
     std::vector<std::array<double, 3>> w;
@@ -1311,11 +1268,9 @@ std::string fmt(const char* f, double a, double b = 0, double c = 0) {
     return s;
 }
 
-}  // namespace
+}  // 匿名命名空间
 
-// ================
-// Public entry points
-// ================
+// ================ 公共入口 ================
 
 bool telemetry_read(const std::string& path, Telemetry& out, std::string& error) {
     FileSource src;
@@ -1352,8 +1307,7 @@ bool gps_valid(const TelemetryGps& g) {
 }
 
 size_t telemetry_gps_filter(const Telemetry& t, std::vector<TelemetryGps>& kept) {
-    // Speed is measured from where a position was FIRST reported, since a
-    // 1 Hz receiver logged at 10 Hz repeats each fix nine times.
+    // 从定位首次报告的时刻计算速度；1 Hz 接收器以 10 Hz 记录时会重复同一定位九次。
     kept.clear();
     size_t outliers = 0;
     double seen_t = 0;
@@ -1404,8 +1358,7 @@ TelemetryCheck telemetry_check(const Telemetry& t) {
     covers(c.orientation, "orientation");
     covers(c.gravity, "gravity");
 
-    // Half a second of averaging leaves gravity and removes a bike's
-    // vibration; on the one MAX ride measured the raw norm median was 12.6.
+    // 半秒平均保留重力并削弱自行车振动；实测 MAX 骑行原始模长中位数为 12.6。
     const std::vector<TelemetryVec> accel_lp = smooth_accel(t.accel, 0.25);
     if (!t.accel.empty()) {
         std::vector<double> norms, dev;
@@ -1500,8 +1453,7 @@ TelemetryCheck telemetry_check(const Telemetry& t) {
             c.gps_longest_hold = std::max(c.gps_longest_hold, g.t - hold_start);
             if (g.speed > c.gps_speed_max) c.gps_speed_max = g.speed;
         }
-        // A stale X5 fix repeats its timestamp too, so the hold is also
-        // measured in log samples at the log's mean spacing.
+        // X5 的陈旧定位还会重复时间戳，因此按平均日志间隔和连续样本数估计保持时长。
         if (dur > 0) c.gps_longest_hold = std::max(c.gps_longest_hold, (double)longest_run * dur / (double)t.gps.size());
         c.gps_fix_fraction = (double)fixes / (double)t.gps.size();
         c.gps_frozen_fraction = t.gps.size() > 1 ? (double)frozen / (double)(t.gps.size() - 1) : 0.0;
@@ -1538,8 +1490,7 @@ TelemetryCheck telemetry_check(const Telemetry& t) {
                    std::fabs(c.accel_norm_median - kG) <= 0.2 * kG &&
                    c.accel.non_monotonic == 0 && c.accel.non_finite == 0 &&
                    (dur <= 0 || (c.accel.t_first <= 1.0 && c.accel.t_last >= dur - 1.0));
-    // One outage in a long walk is not a stale log: 74 s of no update inside
-    // an 18-minute campus walk still left 1.6 km of usable path.
+    // 长序列中单次中断不代表全段陈旧；18 分钟校园步行中 74 s 无更新，仍有 1.6 km 可用路径。
     const double hold_limit = std::max(30.0, 0.2 * dur);
     c.gps_usable = c.gps.count >= 3 && c.gps_fix_fraction >= 0.5 && c.gps_distinct >= 5 &&
                    c.gps_longest_hold <= hold_limit && c.gps_spread_m > 5.0;
@@ -1610,4 +1561,4 @@ std::string telemetry_report(const Telemetry& t, const TelemetryCheck& c) {
     return o.str();
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

@@ -1,8 +1,4 @@
-// Indexing a matches file the verification stage is still appending to.
-//
-// The GUI reads this file while the stage that writes it runs, so the two
-// cases that matter are a torn tail (a record the writer had not finished) and
-// the switch back to a finished matches.bin once the stage ends.
+// 测试验证阶段持续追加匹配文件时的索引，覆盖未写完尾部及结束后切换到完整 matches.bin。
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -46,7 +42,7 @@ static int cmdLiveMatchesTest(int, char**) {
         progress::live_pair(ends[i][0], ends[i][1], 2, &pairs[i][0].idx1,
                             &pairs[i][0].idx2, sizeof(FeatureMatch),
                             (uint32_t)pairs[i].size());
-    progress::flush();   // the writer flushes on a clock, not per pair
+    progress::flush();   // 写入器按时间刷新，不逐图像对刷新
 
     MatchesIndex idx;
     check(indexMatches(path, idx), "index a streaming file");
@@ -64,8 +60,7 @@ static int cmdLiveMatchesTest(int, char**) {
         check(same, "correspondences round trip");
     }
 
-    // Every truncation must yield a prefix of the same pairs, never an error
-    // and never a pair the writer had not finished.
+    // 任意截断均只返回完整记录前缀，不报错、不暴露未完成图像对。
     const uintmax_t full = std::filesystem::file_size(path);
     std::string bytes;
     {
@@ -81,7 +76,7 @@ static int cmdLiveMatchesTest(int, char**) {
             f.write(bytes.data(), (std::streamsize)cut);
         }
         MatchesIndex t;
-        if (!indexMatches(cut_path, t)) continue;   // header not there yet
+        if (!indexMatches(cut_path, t)) continue;   // 文件头尚未写出
         bool prefix = t.pairs.size() <= idx.pairs.size();
         for (size_t i = 0; prefix && i < t.pairs.size(); i++)
             prefix = t.pairs[i].image1 == idx.pairs[i].image1 &&
@@ -93,7 +88,7 @@ static int cmdLiveMatchesTest(int, char**) {
     }
     check(torn_ok > 0, "some truncations indexed at all");
 
-    // A finished file still reports its own count, not the sentinel.
+    // 完整文件应报告真实对数，而非流式哨兵。
     MatchesDatabase db;
     db.images = {{"a", 10}, {"b", 20}};
     db.pairs.push_back({0, 1, 2, matches(3, 400)});
@@ -103,7 +98,7 @@ static int cmdLiveMatchesTest(int, char**) {
     check(indexMatches(done, fin), "index a finished file");
     check(fin.pairs.size() == 1, "finished file indexes its pairs");
 
-    // A fixed-count file that IS truncated is still an error, not a prefix.
+    // 固定对数文件截断仍须报错，不能当作流式前缀。
     {
         std::ifstream f(done, std::ios::binary);
         std::string b((std::istreambuf_iterator<char>(f)),

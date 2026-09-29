@@ -1,12 +1,5 @@
-// Pipeline.cpp -- the stages of a run, and `auto`'s ordering of them.
-//
-// This is the half of the old sfm_main.cpp that is not argument parsing: what
-// a stage does, in what order, and what it reports. It lives here so the CLI
-// and an in-process front end drive one implementation rather than two
-// (docs/notes/sfm-in-process-plan.md).
-//
-// Every stage still reads and writes the same files, so any one of them can
-// still be replaced by COLMAP's equivalent to bisect a failure.
+// SfM 各阶段的实现与 auto 调度顺序；CLI 与进程内前端共用同一流水线。
+// 阶段均通过相同磁盘格式交互，可替换为 COLMAP 对应阶段以定位故障。
 
 #include "sfm/Pipeline.h"
 
@@ -79,17 +72,13 @@ bool isImageExt(const std::string& e) {
            s == ".ppm" || s == ".pgm" || s == ".exr";
 }
 
-// macOS AppleDouble sidecars (`._<name>`, written on exFAT / NTFS / SMB) keep
-// the original's extension, so `._00333.jpg` enumerates as an image and
-// `._00168.bin` stops the reconstruction on a magic the reader cannot place.
+// 忽略 macOS 在 exFAT/NTFS/SMB 上写入的 ._<name> AppleDouble 附属文件；它们沿用图像或 .bin 扩展名，但内容并非对应格式。
 bool isSidecar(const fs::path& p) {
     const std::string n = p.filename().string();
     return n.size() > 2 && n[0] == '.' && n[1] == '_';
 }
 
-// Does `root` hold an image outside `nested`? Reinterpreting `auto DATASET`
-// as `auto DATASET/images` is allowed only when it cannot lose one: otherwise
-// a capture of two folders loses half, under names the trainer cannot resolve.
+// 只有 root 在 nested 之外没有图像时才将 DATASET 自动解释为 DATASET/images，避免丢失其他文件夹中的输入。
 bool holdsImagesOutside(const fs::path& root, const fs::path& nested) {
     std::error_code walk, ec;
     for (auto it = fs::recursive_directory_iterator(
@@ -106,26 +95,21 @@ bool holdsImagesOutside(const fs::path& root, const fs::path& nested) {
     return false;
 }
 
-// Path of `p` relative to the directory it was enumerated from. NOT
-// fs::relative(): it resolves symlinks, so a directory of symlinked images
-// relativizes to "../.." and `extract` writes features outside -o.
+// 按枚举目录计算纯词法相对路径；fs::relative 会解析符号链接，可能得到 ../.. 并使特征写到输出目录之外。
 fs::path relativeTo(const fs::path& p, const fs::path& root) {
     fs::path r = root;
-    // "dir/" iterates to "dir/x.jpg" but has a trailing empty element, which
-    // lexically_relative would mismatch into "../x.jpg". Drop it.
+    // 移除 dir/ 末尾空分量，避免 lexically_relative 将 dir/x.jpg 错算成 ../x.jpg。
     if (!r.empty() && r.filename().empty()) r = r.parent_path();
     return p.lexically_relative(r);
 }
 
-// Wall-clock seconds since an arbitrary epoch, for the stage timings `auto`
-// reports.
+// 任意起点的实时时间秒数，用于 auto 阶段计时。
 double now() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Mean/median reprojection error over a reconstruction's observations. The one
-// number that says whether a model is sane; reported by both `map` and `auto`.
+// 统计重建观测的平均与中位重投影误差，供 map 与 auto 共同报告。
 void reprojStats(const Reconstruction& rec, const std::vector<FeatureSet>& feats,
                         double& mean, double& median, size_t& nobs) {
     std::vector<double> e;
@@ -151,9 +135,7 @@ void reprojStats(const Reconstruction& rec, const std::vector<FeatureSet>& feats
     median = e[e.size() / 2];
 }
 
-// Sample an RGB color at every keypoint from the (already decoded) source image
-// and store it in the feature set, so the point cloud can be colored without a
-// second decode pass. No-op if the image was decoded without color.
+// 从已解码源图为各关键点采样 RGB，避免点云着色时再次解码；没有颜色缓冲时跳过。
 void sampleFeatureColors(FeatureSet& fs, const GrayImage& img) {
     if (!img.hasColor()) return;
     fs.colors.resize((size_t)fs.count() * 3);
@@ -161,9 +143,7 @@ void sampleFeatureColors(FeatureSet& fs, const GrayImage& img) {
         sampleColor(img, fs.keypoints[i].x, fs.keypoints[i].y, &fs.colors[(size_t)i * 3]);
 }
 
-// Put a freshly extracted set into the source image's frame and attach what
-// EXIF said about the camera. Called once per image, after anything that
-// indexes the *decoded* image (colors, masks) is done.
+// 颜色、掩码等解码坐标操作完成后，将特征映射到原图坐标并附加 EXIF 相机信息。
 void finishFeatures(FeatureSet& fs, const GrayImage& img) {
     scaleKeypoints(fs, img.orig_width, img.orig_height);
     fs.exif_focal = exifFocalPx(img.exif, fs.width, fs.height);
@@ -171,8 +151,7 @@ void finishFeatures(FeatureSet& fs, const GrayImage& img) {
     fs.exif_orientation = (uint8_t)img.exif.orientation;
 }
 
-// Why a metric fit was refused, with the numbers, so one line is a complete
-// bug report.
+// 公制拟合拒绝原因及相关数值，便于仅凭一行日志诊断。
 std::string metricReason(const MetricFit& f) {
     switch (f.reason) {
         case MetricFail::Pairs:
@@ -338,13 +317,9 @@ void reportSensorGauge(size_t i, const SensorGaugeResult& r,
             L::num(r.tilt_sigma_deg, 2)});
 }
 
-// The gauge each model is written in: the video's sensors, else the attitude
-// the images record, then a metric reference, else the orient frame -- each
-// where it fits. False when a metric frame was asked for and missed.
+// 依次尝试视频传感器、图像姿态、公制参考和默认朝向，为各模型确定坐标规范；请求公制坐标却未拟合成功时返回 false。
 
-// ---------------------------------------------------------------------------
-// The sensors as priors (sfm/map/SensorPriors.h)
-// ---------------------------------------------------------------------------
+// ---------------- 传感器先验，见 sfm/map/SensorPriors.h ----------------
 
 std::vector<Camera> perImageCameras(const CameraSetup& cs, size_t num_images) {
     std::vector<Camera> percam(num_images);
@@ -374,8 +349,7 @@ std::unique_ptr<TelemetryPriors> makeSensorPriors(const SfmConfig& cfg,
 }
 
 
-// Relative rotations from two-view geometry on bearings, over the pairs the
-// source can calibrate on, then the source's own hand-eye fit.
+// 先用可标定图像对的单位视线双视图几何估计相对旋转，再执行传感器源的手眼拟合。
 void calibrateSensorPriorsFrom(TelemetryPriors& priors, const std::vector<FeatureSet>& feats,
                                const std::vector<std::pair<uint32_t, uint32_t>>& pairs,
                                const std::vector<std::vector<FeatureMatch>>& matches,
@@ -386,8 +360,7 @@ void calibrateSensorPriorsFrom(TelemetryPriors& priors, const std::vector<Featur
         if (priors.calibrationPair(pairs[p].first, pairs[p].second) &&
             (int)matches[p].size() >= std::max(30, tvopt.min_num_inliers))
             use.push_back(p);
-    // Spread over the capture rather than its first minute: the fit wants
-    // every axis turned, and 600 pairs are plenty for a tenth of a degree.
+    // 在整段采集中分散选取 600 对，覆盖各轴旋转，足以达到约十分之一度精度；仅采开头一段会缺少运动激励。
     const size_t kMax = 600;
     if (use.size() > kMax) {
         std::vector<size_t> thin;
@@ -410,8 +383,7 @@ void calibrateSensorPriorsFrom(TelemetryPriors& priors, const std::vector<Featur
             }
             TwoViewOptions tvo = tvopt;
             tvo.recover_pose = true;
-            // Verified inliers carry no outliers to reject; the homography
-            // test still has to say whether the pair has a translation.
+            // 已验证内点无需再次排除离群匹配，但仍须用单应性检查是否存在平移。
             const double sc = 0.5 * (feats[i].pixelScale() + feats[j].pixelScale());
             tvo.ransac.max_error = tvopt.ransac.max_error * sc /
                                    std::max(1.0, 0.5 * (cams[i].focal() + cams[j].focal()));
@@ -480,13 +452,10 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
     const bool gps = cfg.metric_gps != "none";
     const bool flat = cfg.metric_gps == "horizontal";
     const bool file = !cfg.metric_positions.empty();
-    // A portrait capture's up is 90 degrees off its images'; `apply` already
-    // turned the pixels, so only `orient` corrects anything. The tags arrive on
-    // the models; a caller that read them off disk calls fillExifOrientations.
+    // 竖拍的向上方向与图像相差 90 度；apply 已旋转像素，仅 orient 需修正姿态。磁盘模型由 fillExifOrientations 补齐标签。
     const bool exif_up = cfg.exif_orientation == "orient";
     const bool on_ground = cfg.level == "ground";
-    // The frame a model nothing measured is written in: upright on the
-    // cameras, then levelled on its ground where one is found.
+    // 没有测量约束的模型先按相机朝向立正，再按可检测到的地面调平。
     auto unmeasured = [&](size_t i, GroundFit& g) {
         const Sim3 T = uprightTransform(models[i], exif_up);
         g = on_ground ? groundTransform(models[i], true, T) : GroundFit{};
@@ -494,12 +463,10 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
     };
     std::vector<GroundFit> levelled(models.size());
 
-    // `gauge[i]` is the state, not just the record: `oriented` and `metric` say
-    // what a source has already settled, and every source below reads them
-    // before touching what an earlier one answered.
+    // gauge[i] 同时记录有效状态；后续来源须先检查 oriented/metric，不能覆盖先前来源已确定的结果。
     gauge.assign(models.size(), ModelGauge());
 
-    // ---- the video's own sensors -----------------------------------------
+    // ---------------- 视频自身的传感器 ----------------
     SensorCaptures own;
     if (!sensors) {
         own = loadSensorCaptures(cfg, verbose);
@@ -531,9 +498,8 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
         }
     }
 
-    // ---- the attitude each image records ---------------------------------
-    // A model the video's sensors levelled keeps their answer. `north` is what
-    // a horizontal fit's heading is compared against.
+    // ---------------- 图像记录的姿态 ----------------
+    // 已由视频传感器调平的模型保持原结果；north 用于检查水平拟合的航向。
     std::vector<char> north(models.size(), 0);
     const bool attitude = cfg.orient && cfg.exif_attitude != "none" && !imagedir.empty();
     for (size_t i = 0; i < models.size() && attitude; i++) {
@@ -567,7 +533,7 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
         north[i] = fit.north;
     }
 
-    // ---- an outside metric reference --------------------------------------
+    // ---------------- 外部公制参考 ----------------
     bool all = true;
     std::map<std::string, Vec3> positions;
     if (file) {
@@ -578,8 +544,7 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
         }
     }
     for (size_t i = 0; i < models.size() && all && (gps || file); i++) {
-        // A metric sensor frame settles the model; a second reference over it
-        // could only disagree with the one already applied.
+        // 已由传感器确定公制坐标时不再应用第二个参考，避免相互矛盾。
         if (gauge[i].metric) continue;
         MetricRef ref;
         if (file) {
@@ -593,18 +558,14 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
                    {(long long)gc.matched, (long long)(gc.matched + gc.no_gps),
                     (long long)gc.no_alt});
         }
-        // Horizontal mode takes the tilt from the caller's up axis, so its fit
-        // -- scale, heading and place -- runs in an upright frame. Where a
-        // sensor already levelled the model, that frame is the one it is in.
+        // 水平模式沿用调用方的向上方向，只拟合尺度、航向和位置；传感器已调平时直接使用当前坐标系。
         const Sim3 pre = flat && !gauge[i].oriented ? unmeasured(i, levelled[i]) : Sim3{};
         for (Vec3& c : ref.centres) c = transformPoint(pre, c);
         const MetricFit fit =
             fitMetricGauge(ref, cfg.metric_max_error,
                            flat ? MetricAxes::Horizontal : MetricAxes::Full,
                            cfg.metric_max_error_frac);
-        // A refused fit leaves the model in the frame it came in with -- the
-        // sensors', or the normalized one the fallback below writes. Applying
-        // the identity it returns would still claim the metre.
+        // 拟合被拒绝时保留输入坐标系；即使返回恒等变换，也不能据此宣称单位为米。
         if (!fit.ok) {
             all = false;
             L::warn(Tag::Orient, M::metric_failed, {(long long)i, metricReason(fit)});
@@ -614,8 +575,7 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
         gauge[i].metric = true;
         gauge[i].scale = file ? "positions" : "gps";
         gauge[i].scale_sigma = fit.scale_unc;
-        // Horizontal fits scale, heading and place only, so which way is up is
-        // still whatever `pre` left it as: the sensors, or the cameras.
+        // 水平拟合不改变倾斜，向上方向仍由 pre 中的传感器或相机结果决定。
         if (!flat) {
             gauge[i].oriented = true;
             gauge[i].up = file ? "positions" : "gps";
@@ -638,8 +598,7 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
         if (flat && north[i])
             L::err(Tag::Orient, M::attitude_vs_gps,
                    {L::num(std::atan2(fit.T.R[3], fit.T.R[0]) * 180.0 / M_PI, 2)});
-        // A drifting altitude offset is absorbed by the rotation as a tilt and
-        // leaves the RMS looking fine; these two numbers are what show it.
+        // 漂移的高度偏差可能被旋转吸收为倾斜而保持较低 RMS，这两个量用于揭示该问题。
         double e = 0, n = 0, u = 0;
         for (size_t k = 0; k < ref.centres.size(); k++) {
             if (!fit.inlier_mask[k]) continue;
@@ -655,9 +614,8 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
                 L::num(metricUpDisagreementDeg(models[i]), 2)});
     }
 
-    // ---- whatever no source settled ---------------------------------------
-    // The only place that falls back on the cameras' mean up axis, so a model
-    // something measured cannot be re-levelled by the guess it replaced.
+    // ---------------- 未被任何来源确定的规范 ----------------
+    // 仅在此处回退到相机平均向上轴，避免用猜测覆盖有效测量。
     std::vector<char> placed(models.size(), 0);
     if (cfg.orient)
         for (size_t i = 0; i < models.size(); i++) {
@@ -679,8 +637,7 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
             else if (verbose) L::err(Tag::Orient, M::orient_done, {model, L::num(T.scale, 4)});
         }
 
-    // A measured up keeps its tilt; only its height is free, unless a
-    // reference measured that too (a positions file, GPS altitude).
+    // 已测得向上方向时保持倾斜，仅允许调整高度；参考位置或 GPS 已测得高度时也保持高度。
     const bool height_measured = file || cfg.metric_gps == "full";
     if (cfg.orient && on_ground && !height_measured)
         for (size_t i = 0; i < models.size(); i++) {
@@ -694,9 +651,7 @@ bool fixGauge(std::vector<Reconstruction>& models, const SfmConfig& cfg,
     return true;
 }
 
-// An EXR carries its own colour space. Reading it needs no declaration -- the
-// decoder falls back to the file's own -- but --point-color and the reported
-// space both do, so adopt it before any stage runs.
+// EXR 解码可沿用文件色彩空间，但 point-color 与日志需要显式有效值，因此在运行任何阶段前读取并补齐。
 void adoptExrColorSpace(SfmConfig& cfg, const std::string& imagedir,
                         const std::set<std::string>& seen) {
     const bool take_gamut = !seen.count("image-gamut");
@@ -733,9 +688,7 @@ void reportFeatureCompaction(const FeatureCompactionStats& stats) {
             (long long)stats.correspondences});
 }
 
-// Point colours are sampled from images the loader converted to sRGB, which is
-// where "srgb" leaves them. "image" puts them back in the photographs' space,
-// which is where the trainer's point_color_* assume them by default.
+// 加载器以 sRGB 采样点颜色；srgb 保持原值，image 则转回照片空间，以匹配训练器 point_color_* 的默认约定。
 void recolorPoints(std::vector<Reconstruction>& models, const SfmConfig& cfg) {
     if (cfg.point_color_space != "image") return;
     if (colorspace::is_identity(cfg.image_gamut, cfg.image_is_linear)) return;
@@ -745,18 +698,15 @@ void recolorPoints(std::vector<Reconstruction>& models, const SfmConfig& cfg) {
                                           cfg.image_is_linear);
 }
 
-// A COLMAP camera *is* a frame size, and grouping buckets sizes within 2%
-// (CameraSetup.h), so give each size in a group its own camera before writing.
-// The parameters stay the group's: the images shared them through BA.
+// 相机分组允许尺寸在 2% 内变化，但 COLMAP 每个相机对应固定尺寸；写出前按尺寸拆分相机，同时保持 BA 中共享的参数。
 void splitCamerasBySize(std::vector<Reconstruction>& models,
                                const std::vector<FeatureSet>& feats) {
     uint32_t next = 0;
     for (const Reconstruction& rec : models)
         for (const auto& kv : rec.cameras) next = std::max(next, kv.first);
-    // One id space over all the models: they overlap by design (D41), and a
-    // merge keeps the destination's camera for an id both sides use.
+    // 各模型共用相机 ID 空间；模型可能重叠，合并时同 ID 沿用目标模型相机。
     std::map<std::pair<uint32_t, uint64_t>, uint32_t> key2id;
-    std::set<uint32_t> kept;  // groups that a first size took the id of
+    std::set<uint32_t> kept;  // 首个尺寸已占用其 ID 的分组
     for (Reconstruction& rec : models) {
         std::map<uint32_t, Camera> cams;
         for (auto& kv : rec.images) {
@@ -773,8 +723,7 @@ void splitCamerasBySize(std::vector<Reconstruction>& models,
                 im.camera_id, ((uint64_t)(uint32_t)w << 32) | (uint32_t)h};
             auto it = key2id.find(key);
             if (it == key2id.end())
-                // The group keeps its id for the first size written with it, so
-                // a capture of one frame size writes what it always did.
+                // 分组的首个写出尺寸沿用原 ID，使单一尺寸数据保持原编号。
                 it = key2id.emplace(
                     key, kept.insert(im.camera_id).second ? im.camera_id : ++next).first;
             if (!cams.count(it->second)) {
@@ -790,9 +739,7 @@ void splitCamerasBySize(std::vector<Reconstruction>& models,
     }
 }
 
-// gauge.txt beside the model: whether +Z is up and whether a unit is a metre.
-// Plain text and not hidden, because it is as much for the user reading the
-// folder as for the viewer that stops guessing an up axis when it is there.
+// 模型旁的 gauge.txt 明确记录 +Z 是否朝上、单位是否为米，供用户与查看器共同读取。
 void writeGauge(const fs::path& dir, const ModelGauge& g) {
     std::ofstream f(dir / "gauge.txt", std::ios::trunc);
     if (!f) return;
@@ -804,9 +751,7 @@ void writeGauge(const fs::path& dir, const ModelGauge& g) {
     if (g.scale_sigma > 0) f << "scale_sigma " << g.scale_sigma << "\n";
 }
 
-// rigs.txt beside a model that used one: each member's cam_from_rig as the
-// run settled it, in the model's own units -- what a later run could be
-// handed back as a manifest's `rotation` / `translation`.
+// rigs.txt 保存各成员最终的 cam_from_rig，平移使用模型单位，可用于后续清单的 rotation/translation。
 void writeRigs(const fs::path& dir, const Reconstruction& m, const RigTable* rigs) {
     if (!rigs || m.rigs.empty()) return;
     std::ofstream f(dir / "rigs.txt", std::ios::trunc);
@@ -883,9 +828,7 @@ RigTable readRigs(const fs::path& dir, Reconstruction& m) {
     return rigs;
 }
 
-// Every reconstruction as <dir>/0, <dir>/1, ... (D41) -- COLMAP's layout for a
-// view graph that is not connected. `sparse/0` has the most 3D points, so a
-// single-model dataset still writes exactly `sparse/0`.
+// 各重建按 COLMAP 布局写入 <dir>/0、1 等目录；0 的三维点最多，单模型也写入 sparse/0。
 void writeModels(const std::vector<Reconstruction>& models, const fs::path& dir,
                  bool verbose, const std::vector<ModelGauge>& gauge, const RigTable* rigs) {
     for (size_t i = 0; i < models.size(); i++) {
@@ -899,9 +842,7 @@ void writeModels(const std::vector<Reconstruction>& models, const fs::path& dir,
                    {(long long)i, (long long)models[i].numRegistered(),
                     (long long)models[i].points3D.size(), p.string()});
     }
-    // A re-run that produces fewer models than the last one left numbered
-    // directories behind, and `--resume` would read them back as if they were
-    // part of this reconstruction. Remove them.
+    // 重跑后模型变少时清除多余编号目录，避免 resume 将旧结果误当作本次重建。
     if (!fs::is_directory(dir)) return;
     for (const auto& e : fs::directory_iterator(dir)) {
         if (!e.is_directory()) continue;
@@ -917,9 +858,7 @@ void writeModels(const std::vector<Reconstruction>& models, const fs::path& dir,
     }
 }
 
-// Distinct images covered by any model. Not the sum of the model sizes: models
-// deliberately overlap by up to max_model_overlap images (D41), which is what a
-// merge step aligns on, so summing double-counts the joins.
+// 统计所有模型覆盖的不同图像；模型允许重叠以便对齐，直接累加会重复计算。
 size_t distinctRegistered(const std::vector<Reconstruction>& models) {
     std::set<uint32_t> ids;
     for (const Reconstruction& m : models)
@@ -928,8 +867,7 @@ size_t distinctRegistered(const std::vector<Reconstruction>& models) {
     return ids.size();
 }
 
-// One line per model beyond the first, so a fragmented capture is visible in
-// the summary rather than only in the directory listing.
+// 主模型之外每个模型各输出一行，使分散结果在摘要中可见。
 void printExtraModels(const std::vector<Reconstruction>& models,
                              const std::vector<FeatureSet>& feats) {
     for (size_t i = 1; i < models.size(); i++) {
@@ -942,16 +880,14 @@ void printExtraModels(const std::vector<Reconstruction>& models,
     }
 }
 
-// Registration per top-level image sub-folder: one folder per input, and an
-// input that contributed nothing is a dataset silently describing half of what
-// was handed over. Only printed for more than one folder.
+// 多输入文件夹时分别报告配准率，及时显露完全没有参与重建的输入。
 void printFolderCoverage(const std::vector<Reconstruction>& models,
                          const MatchesDatabase& db) {
     auto group_of = [](const std::string& name) {
         size_t slash = name.find('/');
         return slash == std::string::npos ? std::string(".") : name.substr(0, slash);
     };
-    std::map<std::string, std::pair<size_t, size_t>> per;  // folder -> {registered, total}
+    std::map<std::string, std::pair<size_t, size_t>> per;  // 文件夹 -> {已配准数量，总数}
     for (const auto& im : db.images) per[group_of(im.name)].second++;
     if (per.size() < 2) return;
     std::set<uint32_t> ids;
@@ -968,8 +904,7 @@ void printFolderCoverage(const std::vector<Reconstruction>& models,
         if (kv.second.first == 0) L::warn(Tag::Run, M::sum_folder_empty, {kv.first});
 }
 
-// Feature stems carry no extension; map every file under the images folder
-// from "<relative path without extension>" to its real name.
+// 将不含扩展名的相对特征路径映射回图像目录中的真实文件名。
 static std::map<std::string, std::string> imageStemMap(const std::string& imagedir) {
     std::map<std::string, std::string> stem2name;
     if (imagedir.empty()) return stem2name;
@@ -983,9 +918,7 @@ static std::map<std::string, std::string> imageStemMap(const std::string& imaged
     return stem2name;
 }
 
-// The unregistered list as a data file, when SS_UNREG_LOG names one: per
-// folder, every image no model took. Data only -- names need no translation;
-// full coverage writes nothing.
+// SS_UNREG_LOG 指定文件时，按文件夹列出未被任何模型接纳的图像；数据名称不翻译，全部覆盖时不写内容。
 static void writeUnregisteredList(const std::vector<Reconstruction>& models,
                                   const MatchesDatabase& db,
                                   const std::string& imagedir) {
@@ -1021,9 +954,7 @@ static void writeUnregisteredList(const std::vector<Reconstruction>& models,
 }
 
 
-// What became of the mapper's models: one line, because a capture that comes
-// back in several pieces is the case a user has to be able to reason about, and
-// the counts say whether that was the view graph's doing or a refused merge.
+// 用一行汇总模型装配结果，帮助区分原视图图分散与合并被拒绝。
 void printAssembly(const AssembleStats& ast, size_t models, Tag tag) {
     if (!ast.models_in) return;
     const ManagerStats& f = ast.finish;
@@ -1040,9 +971,7 @@ void printAssembly(const AssembleStats& ast, size_t models, Tag tag) {
             (long long)f.audited_out});
 }
 
-// Flat or bottom-up, per --mapper; flat is the default and what the
-// measurements are on. Either way the same schedule assembles the models (D63,
-// sfm/map/Assemble.h) -- there is no separate manage stage.
+// --mapper 选择 flat 或 bottom-up，默认及基准测量均使用 flat；两者共用 Assemble.h 的装配流程，不设独立管理阶段。
 RigTable buildRigs(const MatchesDatabase& db, const SfmConfig& cfg, bool verbose) {
     std::vector<std::string> names;
     names.reserve(db.images.size());
@@ -1103,22 +1032,18 @@ std::vector<Reconstruction> runMapper(Mapper& mapper, const MatchesDatabase& db,
         models = bottomUpReconstruct(mapper, db, feats, bo, cfg.manager, ao, bs);
         ast = bs.assemble;
     }
-    // The assembly passes move images between models, so the last snapshot the
-    // mapper took is not what came out. Leave the largest result on screen.
+    // 装配会改变模型中的图像，最后刷新最大的输出模型，避免显示过期快照。
     if (!models.empty()) sfm::progress::model(models.front(), /*force=*/true);
     return models;
 }
 
-// The finishing passes: one global bundle adjustment per model releasing what
-// the mapper held, then optionally another with every image on its own
-// intrinsics. src/sfm/README.md, "The finishing passes", has the reasoning.
+// 收尾阶段按模型释放固定参数执行全局 BA，可选再允许逐图像独立内参；原理见 src/sfm/README.md。
 std::vector<Reconstruction> finishModels(Mapper& mapper,
                                                 std::vector<Reconstruction> models,
                                                 const SfmConfig& cfg, bool verbose,
                                                 double& secs) {
     const double t0 = now();
-    // Nothing to release is a solve that ends where it started, and a line in
-    // the log saying it ran.
+    // 没有参数需要释放时跳过无效求解及其日志。
     if (cfg.final_principal_point ||
         (cfg.final_extra_params && !cfg.mapper.refine_extra_params)) {
         for (Reconstruction& m : models)
@@ -1147,9 +1072,7 @@ std::vector<Reconstruction> finishModels(Mapper& mapper,
     return models;
 }
 
-// Feature stems carry no extension; put the real filename back into every
-// model for COLMAP tooling. Walked once, not once per model -- a fragmented
-// capture can produce dozens (D41).
+// 统一扫描一次图像目录，将特征文件主干名恢复为带扩展名的图像名，避免对每个子模型重复遍历。
 void resolveImageNames(std::vector<Reconstruction>& models, const std::string& imagedir) {
     if (imagedir.empty()) return;
     const std::map<std::string, std::string> stem2name = imageStemMap(imagedir);
@@ -1160,9 +1083,7 @@ void resolveImageNames(std::vector<Reconstruction>& models, const std::string& i
         }
 }
 
-// Report the grouping decision, one line per camera. Worth printing in full:
-// a wrong --camera-mode is otherwise invisible until the intrinsics come out
-// strange, and a mixed-model capture is exactly where it goes wrong.
+// 逐相机报告分组决策，便于在内参异常前发现 camera-mode 设置错误。
 void printCameraSetup(Tag tag, const CameraSetup& cs,
                       const CameraSetupOptions& sopt, size_t nimages) {
     std::map<uint32_t, size_t> counts;
@@ -1177,8 +1098,7 @@ void printCameraSetup(Tag tag, const CameraSetup& cs,
     if (cs.exif_focal_images)
         L::err(tag, sopt.exif_focal ? M::match_exif_focals : M::match_exif_focals_ignored,
                {(long long)cs.exif_focal_images, (long long)nimages});
-    // Capped: --camera-mode image on an internet collection makes one camera
-    // per image, and a thousand lines of stderr helps nobody.
+    // 限制日志数量，避免逐图像相机模式对大型网络图片集输出数千行。
     const size_t kMaxLines = 8;
     size_t shown = 0;
     for (const auto& kv : cs.cameras) {
@@ -1197,9 +1117,7 @@ void printCameraSetup(Tag tag, const CameraSetup& cs,
 }
 
 
-// Warn once per distinct (mask, image) size pair that disagrees in *aspect*.
-// Differing size is fine -- masks are sampled in uv (D39) -- but a differing
-// aspect means a mask cut for another crop, stretched over the wrong content.
+// 每种不匹配的掩码、图像宽高比组合仅警告一次；尺寸可因 UV 采样而不同，宽高比不同则可能来自错误裁剪。
 void checkMaskShape(const std::string& mask_path, const Mask& m,
                     const std::pair<int, int>& img_dims) {
     static std::set<std::array<int, 4>> warned;
@@ -1213,13 +1131,9 @@ void checkMaskShape(const std::string& mask_path, const Mask& m,
              (long long)img_dims.first, (long long)img_dims.second});
 }
 
-// A mask that drops nearly every keypoint is more often inverted than meant:
-// ours is white = keep, some tools export the excluded region instead. A
-// warning, not a flip -- an object-centric capture masks away all but the
-// object, and only the user knows which they have.
+// 掩码排除几乎所有关键点时提示可能反向；约定白色保留，但以物体为中心的任务也可能正常排除大部分背景，因此只警告、不自动翻转。
 void warnIfMasksLookInverted(const ExtractStats& st) {
-    // Over the images this run extracted: a resumed one cannot know what a
-    // mask took out of a feature file somebody else wrote.
+    // 只统计本次实际提取的图像，复用文件无法恢复先前掩码排除数。
     const uint64_t before = st.features_new + st.masked_out;
     if (!st.masked_images || before == 0) return;
     const double dropped = (double)st.masked_out / (double)before;
@@ -1229,9 +1143,7 @@ void warnIfMasksLookInverted(const ExtractStats& st) {
 
 namespace {
 
-// The feature files as matching indexes them -- name, size and write time --
-// folded into one token, since its leftovers are indices into this set. The
-// write time is what sees a RE-extracted image: its size is the same budget.
+// 将特征文件的名称、大小与修改时间汇成签名；修改时间能识别尺寸未变的重新提取，保证缓存索引仍对应同一集合。
 std::string featureDirDigest(const fs::path& featdir) {
     std::vector<std::string> rows;
     std::error_code walk, ec;
@@ -1253,9 +1165,7 @@ std::string featureDirDigest(const fs::path& featdir) {
     return buf;
 }
 
-// Anything under `outdir` that is not one of `live`: matching reads every .bin
-// in the tree, and one left for an image this run no longer has joins it as a
-// phantom view.
+// 删除输出目录中不属于 live 的文件；匹配会读取全部 .bin，残留文件会形成幽灵视图。
 void sweepStaleFeatures(const fs::path& outdir, const std::set<fs::path>& live) {
     std::error_code walk, ec;
     std::vector<fs::path> dead;
@@ -1265,9 +1175,7 @@ void sweepStaleFeatures(const fs::path& outdir, const std::set<fs::path>& live) 
     for (const fs::path& p : dead) fs::remove(p, ec);
 }
 
-// Is `feat` a whole feature file that describes `img` as it stands now? An
-// mtime comparison, because a re-run that regenerated the frames or the masks
-// leaves everything else about the settings identical.
+// 检查特征完整性与修改时间，识别设置未变但图像或掩码已重新生成的情况。
 bool featuresAreCurrent(const fs::path& feat, const fs::path& img,
                         const std::string& mask, uint32_t& count) {
     std::error_code fe, ie, me;
@@ -1277,16 +1185,13 @@ bool featuresAreCurrent(const fs::path& feat, const fs::path& img,
     return peekFeatures(feat.string(), count);
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 int extractDirectory(const std::string& imagedir, const fs::path& outdir,
                      const SfmConfig& cfg, ExtractStats& stats, bool reuse) {
     const SiftOptions& opt = cfg.sift;
     const std::string& maskdir = cfg.mask_dir;
-    // Recursive: per-folder intrinsics (ppisp) keep images in images/<camera>/
-    // and the folder is the grouping key (D17). A mask directory nested inside
-    // is skipped -- masks are PNGs too, and would double the image count with
-    // garbage views.
+    // 递归读取图像以保留相机文件夹分组，跳过嵌套掩码目录，避免将 PNG 掩码误作图像。
     std::error_code skip_ec;
     const bool skip_masks = !maskdir.empty() && fs::is_directory(maskdir, skip_ec);
     std::vector<fs::path> found;
@@ -1306,8 +1211,7 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
     }
     std::sort(found.begin(), found.end());
 
-    // Probe every header once (the old comparator re-probed O(n log n) times),
-    // both to order the batch and to size the decoder's memory.
+    // 每个文件头只探测一次，供排序与解码内存预算共用，避免排序比较器重复探测。
     std::vector<fs::path> imgs;
     std::vector<std::pair<int, int>> dims;
     for (const fs::path& p : found) {
@@ -1326,7 +1230,7 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
         return 1;
     }
 
-    // Largest-first so the extractor allocates device buffers exactly once.
+    // 最大图像优先，使提取器只需一次分配最大设备缓冲。
     std::vector<size_t> order(imgs.size());
     for (size_t i = 0; i < order.size(); i++) order[i] = i;
     std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
@@ -1344,7 +1248,7 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
     ImageLoadOptions lopt;
     lopt.max_image_size = cfg.max_image_size;
     lopt.num_threads = cfg.decode_threads;
-    lopt.want_color = true;  // sample per-keypoint colors while the image is hot
+    lopt.want_color = true;  // 趁图像仍在内存中采样关键点颜色
     lopt.gamut = cfg.image_gamut;
     lopt.is_linear = cfg.image_is_linear;
     lopt.flip_mask = cfg.flip_mask;
@@ -1352,9 +1256,7 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
     if (cfg.decode_budget_mb > 0)
         lopt.memory_budget_bytes = (size_t)cfg.decode_budget_mb << 20;
 
-    // Resolved up front (D39), in `paths` order, so the decode pool can pick
-    // them up -- and so a mask directory matching nothing is reported before
-    // the GPU stage burns an hour on unmasked features.
+    // 按 paths 顺序预先解析掩码，供解码池使用，并在 GPU 提取前报告完全无匹配的掩码目录。
     MaskIndex masks(maskdir);
     if (!maskdir.empty() && !masks.valid())
         L::warn(Tag::Extract, M::extract_mask_dir_missing, {maskdir});
@@ -1382,8 +1284,7 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
                     {(long long)stats.unmasked_images, stats.first_unmasked});
     }
 
-    // Where each image's features belong, and what a previous run already put
-    // there. The total the bar counts is the capture, not the work left.
+    // 确定特征输出与可复用文件；进度总数表示全部输入图像，而非剩余工作量。
     const size_t n_all = paths.size();
     std::vector<fs::path> outs(n_all);
     std::set<fs::path> live;
@@ -1424,7 +1325,7 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
                    {(long long)stats.reused, (long long)n_all});
             for (size_t i = 0; i < todo.size(); i++) {
                 const size_t k = todo[i];
-                if (k == i) continue;   // self-move empties a std::string
+                if (k == i) continue;   // std::string 自移动可能清空自身
                 paths[i] = std::move(paths[k]);
                 sorted_dims[i] = sorted_dims[k];
                 outs[i] = std::move(outs[k]);
@@ -1471,15 +1372,13 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
                             {lopt.mask_paths[k],
                              fs::path(paths[k]).filename().string()});
                 } else {
-                    // img's own size, not the probed one: `apply` turned both.
+                    // 使用 img 实际尺寸，apply 可能已旋转图像，改变探测时的宽高。
                     checkMaskShape(lopt.mask_paths[k], img.mask,
                                    {img.orig_width, img.orig_height});
                     const uint32_t before = f.count();
                     dropped = applyMask(f, img.mask);
                     stats.masked_out += dropped;
-                    // An inverted mask, or one whose keep value is 0, masks
-                    // an image away entirely -- invisible until the model is
-                    // short of images. Warn once; the run continues.
+                    // 掩码反向或保留值为 0 可能完全清除图像特征；仅警告一次并继续运行。
                     if (before && dropped == before && !stats.warned_empty) {
                         stats.warned_empty = true;
                         L::warn(Tag::Extract, M::extract_mask_empty,
@@ -1488,9 +1387,7 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
                     }
                 }
             }
-            // Back to the source file's coordinates (D46), so cameras.bin
-            // describes the user's images and not the working copy. Everything
-            // reading a keypoint against the decoded image has already run.
+            // 所有基于解码图像的关键点操作结束后，恢复原图坐标，使 cameras.bin 描述用户原图而非工作副本（D46）。
             finishFeatures(f, img);
             fs::create_directories(outs[k].parent_path());
             writeFeatures(outs[k].string(), f);
@@ -1508,7 +1405,7 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
             ev.features = f.count();
             ev.masked = dropped;
             events::emit(ev);
-            // The picture the reel draws, from the copy already in hand.
+            // 用已有图像副本生成预览。
             if (progress::enabled()) {
                 fs::path stem = relativeTo(paths[k], imagedir);
                 stem.replace_extension();
@@ -1529,9 +1426,7 @@ int extractDirectory(const std::string& imagedir, const fs::path& outdir,
 
 int loadFeatureDir(const std::string& featdir, const SfmConfig& cfg, bool with_descriptors,
                    std::vector<FeatureSet>& feats, MatchesDatabase& db) {
-    // Recursively -- the tree mirrors the image tree -- sorted by name for
-    // stable indices. The image name is the relative path without ".bin",
-    // which is also COLMAP's convention for `images.bin` names.
+    // 递归读取与图像树对应的特征文件，按名称排序保证索引稳定；图像内部名称为移除 .bin 的相对路径。
     std::vector<fs::path> files;
     std::error_code walk, ec;
     for (auto it = fs::recursive_directory_iterator(featdir, walk);
@@ -1545,9 +1440,7 @@ int loadFeatureDir(const std::string& featdir, const SfmConfig& cfg, bool with_d
         return 1;
     }
 
-    // Read in parallel: this is a gigabyte of descriptors on a large capture,
-    // and it is pure per-file work with no shared state. Results land by index,
-    // so the image order is the sorted file order either way.
+    // 按文件并行读取大型描述子集合，各任务无共享状态且按固定索引写入，保持排序后的图像顺序。
     feats.assign(files.size(), FeatureSet());
     db.images.resize(files.size());
     events::stage_begin(Stage::Load, (int64_t)files.size());
@@ -1557,7 +1450,7 @@ int loadFeatureDir(const std::string& featdir, const SfmConfig& cfg, bool with_d
         nt = std::max(1, std::min<int>(nt, (int)files.size()));
         std::atomic<size_t> next{0}, done{0};
         std::mutex err_mtx;
-        std::string first_error;  // a bad file must still report itself, not terminate
+        std::string first_error;  // 坏文件须报告错误，不能直接终止进程
         std::vector<std::thread> pool;
         const size_t step = std::max<size_t>(1, files.size() / 200);
         for (int t = 0; t < nt; t++)
@@ -1602,8 +1495,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
     stats.images = n_images;
     std::vector<std::string> image_names(n_images);
     for (size_t i = 0; i < n_images; i++) image_names[i] = db.images[i].name;
-    // The grouping first: the sensors are keyed by camera group, and the GPS
-    // pairs below go into the list before it is written.
+    // 先确定相机分组，传感器以分组为键；GPS 图像对须在列表写出前加入。
     if (calib) {
         calib->cameras = buildCameras(db.images, feats, calib->setup);
         if (verbose) printCameraSetup(Tag::Match, calib->cameras, calib->setup, feats.size());
@@ -1613,21 +1505,16 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
     TelemetryPriors* priors = calib ? calib->priors.get() : nullptr;
 
     std::vector<std::pair<uint32_t, uint32_t>> pairs;
-    // Pair selection is minutes on a large capture and used to look like a
-    // frozen program between the two stages that have a bar; it reports through
-    // the same event stream everything else does.
+    // 大型数据的配对筛选可能耗时数分钟，通过统一事件流报告进度，避免表现为卡住。
     std::function<void(size_t, size_t)> sp = [&](size_t done, size_t total) {
         events::progress(Stage::Select, (int64_t)done, (int64_t)total);
         if (!verbose) return;
-        // Redrawn in place, so it carries the tag itself rather than
-        // going through L::err(), which always ends its line.
+        // 进度原地重绘，自行携带标签，不能调用总会结束当前行的 L::err()。
         fprintf(stderr, "\r%s%s", L::prefix(Tag::Match).c_str(),
                 spirula::i18n::format(M::match_pairs_scored,
                              {(long long)done, (long long)total}).c_str());
     };
-    // A pair list an interrupted run already chose. Selecting it again is a
-    // fraction of matching, but not a small one, and it has to produce the same
-    // list for the journal below to line up with it.
+    // 复用中断前选出的图像对，既节省筛选时间，也确保列表与匹配日志对齐。
     const bool reused_pairs =
         res && resume::readPairs(res->dir / "pairs.bin", res->signature, pairs);
     if (reused_pairs) {
@@ -1645,9 +1532,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
                    {(long long)pairs.size(), (long long)stats.scored,
                     popt.num_features, popt.num_neighbors,
                     format_duration(stats.select_seconds)});
-        // The shortlist keeps each image's top-k by a subsampled score, and a
-        // weak but real link just below the cut is gone for good; the file
-        // order still knows it.
+        // 子采样评分的 top-k 可能漏掉略低于阈值的真实弱连接，文件时序可补充这些关系。
         if (cfg.prefilter_sequential) {
             const size_t sel = pairs.size();
             const std::vector<std::pair<uint32_t, uint32_t>> win = sequentialPairs(
@@ -1663,11 +1548,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
                     ? generatePairs((uint32_t)n_images, mode)
                     : sequentialPairs((uint32_t)n_images, cfg.overlap, cfg.quadratic_overlap,
                                       folderRuns(image_names));
-        // Loop closure. A sequential chain has no link between the start and
-        // end of a walk that comes back on itself, so one weak step splits the
-        // reconstruction; the pair-selection shortlist supplies the missing
-        // links from image content, the way COLMAP's loop_detection does from a
-        // vocabulary tree. Exhaustive already has every pair.
+        // 闭环通过内容筛选补充时间窗口无法连接的首尾回访；否则链中一个弱连接即可拆散重建。穷举模式已包含所有图像对。
         if (mode == PairMode::Sequential && cfg.loop_closure && n_images > 2) {
             const size_t seq = pairs.size();
             stats.scored = n_images * (n_images - 1) / 2;
@@ -1687,11 +1568,9 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
                         format_duration(stats.select_seconds)});
         }
     }
-    // makes the mapper trust the sequence pairs,
-    // but seems to make things less robust for datasets that already have a lot of pairs, so it's disabled for now
+    // 让建图器优先信任序列对会降低已有大量匹配的数据集的稳健性，因此此设置保持禁用。
 #if 0
-    // A sequence's temporal window is matched whatever the mode chose: the
-    // mapper trusts those pairs first, so they have to exist (D79).
+    // 无论配对模式如何，都加入序列时间窗口，保证建图器优先信任的时序图像对存在（D79）。
     if (!reused_pairs && !cfg.sequences.empty()) {
         const size_t before = pairs.size();
         try {
@@ -1706,11 +1585,11 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
                        {(long long)(pairs.size() - before), (long long)before,
                         (long long)win.size()});
         } catch (const std::exception&) {
-            // A definition the names do not fit is the mapper's to report.
+            // 名称无法匹配定义时交给建图器报告。
         }
     }
 #endif
-    // Images the GPS puts near each other, whatever the shortlist thought.
+    // 补充 GPS 判定相近的图像对，不受候选列表限制。
     if (priors && cfg.sensor_pairs && !reused_pairs) {
         size_t positioned = 0;
         const std::vector<std::pair<uint32_t, uint32_t>> nearby = gpsProximityPairs(
@@ -1737,9 +1616,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
         L::err(Tag::Match, M::match_prefilter_params,
                {popt.num_features, popt.num_neighbors});
 
-    // What an interrupted verification already finished, and so the subset this
-    // run has left. Keyed on the image pair rather than on its position: the
-    // workers finish out of order, so the journal is not in the list's order.
+    // 复用中断前已完成的验证；工作线程乱序结束，因此日志按图像对而非列表位置索引。
     std::unordered_map<uint64_t, TwoViewMatches> done_kept;
     std::vector<uint64_t> done_keys;
     const fs::path journal_path = res ? res->dir / "matches.part" : fs::path();
@@ -1765,32 +1642,23 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
     auto matchFn = [&](size_t b, size_t e, std::vector<std::vector<FeatureMatch>>& mout) {
         matcher->matchBatch(feats, todo, b, e, mout);
     };
-    // Rate-limiting the printed line lives in the CLI's event sink, which is
-    // the only thing that prints it; verifyPairs emits the fraction either way.
+    // 仅 CLI 事件接收端限制打印频率；verifyPairs 始终发出实际完成比例。
     std::function<void(size_t, size_t)> progress;
 
     if (verify) {
-        // Verification runs on a worker pool fed by the (serial, GPU-bound)
-        // matcher -- it is the pipeline's dominant cost, see sfm/feature/Verification.h.
+        // 串行 GPU 匹配器向工作池提供验证任务，几何验证是主要开销，见 sfm/feature/Verification.h。
         VerificationOptions vopt;
         vopt.two_view = tvopt;
         vopt.num_threads = cfg.threads;
         vopt.match_batch_pairs = opt.batch_pairs;
 
-        // Calibrated verification (D45), for fisheye captures only: see
-        // VerifyCalibration. Everything else keeps the pixel path, where the
-        // pinhole assumption is exact and results are long settled.
+        // 鱼眼图像在标定后的单位视线上验证（D45）；普通针孔图像沿用像素坐标验证。
         BearingCache bc;
         std::vector<Camera> percam;
         VerifyPriorStats pstats;
         if (calib) {
             CameraSetup& cs = calib->cameras;
-            // Both focal searches want the same thing: putative matches for a
-            // sample of pairs, spread over the list (a prefix would sample one
-            // part of the capture, since pair lists are ordered). The fisheye
-            // one has to run before verification because the focal decides the
-            // bearings it verifies on; the rectilinear one could run after, but
-            // sharing this sample costs nothing and keeps one code path.
+            // 两种焦距搜索共用遍布列表的候选匹配样本，避免只采到一个区域；鱼眼必须先估焦距再验证，普通镜头也共用该路径。
             const bool want_rect = cs.anyGuessedRectilinear();
             std::vector<std::pair<uint32_t, uint32_t>> sample;
             std::vector<std::vector<FeatureMatch>> sm;
@@ -1822,17 +1690,12 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
                 std::vector<Camera> percam(feats.size());
                 for (size_t i = 0; i < feats.size(); i++) percam[i] = cs.cameras.at(cs.ids[i]);
                 double t_b = now();
-                // A mixed capture calibrates *everything*: its cross pairs have
-                // a fisheye on one side, and the pixel path cannot represent
-                // those at all. A wholly rectilinear capture keeps the pixel
-                // path, where the pinhole assumption is exact and results are
-                // long settled.
+                // 混合镜头数据的跨组匹配包含鱼眼，因此全部使用标定视线验证；纯直线投影数据沿用像素路径。
                 bc = precomputeBearings(feats, percam, /*wide_only=*/!cs.mixed(), cfg.threads);
                 vopt.bearings = &bc;
                 calib->used_bearings = true;
                 if (verbose) {
-                    // The focal list is identifiers and numbers, built here and
-                    // passed through the message as one argument.
+                    // 焦距列表仅含标识符与数值，作为单个消息参数传递。
                     std::string focals;
                     for (const auto& kv : cs.cameras) {
                         if (!focals.empty()) focals += ", ";
@@ -1845,9 +1708,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
                 }
             }
         }
-        // The gyro's word on every pair it covers: calibrated on a sample of
-        // time-adjacent pairs first, since the rotation prior needs the
-        // IMU-to-lens rotation and the putative matches are gone after this.
+        // 先用时间相邻图像对样本标定 IMU 到镜头的旋转，再向所有覆盖图像对提供陀螺先验；后续候选匹配将被释放。
         if (priors && cfg.sensor_verify && calib) {
             percam = perImageCameras(calib->cameras, feats.size());
             std::vector<std::pair<uint32_t, uint32_t>> sample;
@@ -1875,20 +1736,12 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
                 vopt.cameras = &percam;
             }
         }
-        // A focal either search measured was measured *on that group's own
-        // pairs*, which is what focal_known means: the mapper's per-image sweep
-        // has nothing to add to it and every reason to leave it alone. On a
-        // dual-fisheye rig the sweep was seen taking a group from the 552 px
-        // the two-view stage measured to 397 px on one image's 80 inliers, with
-        // the joint refinement then dragging it back to 517. It is deliberately
-        // *not* focal_given: the mapper's probe reconstruction still runs and
-        // bundle-adjusts the value, which measured better than the raw vote.
+        // 组内图像对估得的焦距标记为 focal_known，避免单图少量内点将可靠值拉偏；双鱼眼上曾出现 552 px 被 80 个内点拉到 397 px，再被联合优化拉回 517 px。
+        // 不标记 focal_given，仍允许试探重建与 BA 精化，效果优于直接采用原始投票。
         if (calib)
             for (uint32_t id : calib->cameras.focal_measured)
                 calib->cameras.focal_known.insert(id);
-        // Hand the setup on through the database (D47), so `spirula-sfm map` inherits
-        // the grouping and the focals this stage measured instead of
-        // re-deriving them from the inliers it is about to produce.
+        // 将相机分组与焦距写入匹配数据库，使 map 沿用测量结果，而非从已筛选内点重新估计（D47）。
         if (calib) storeCameraSetup(db, calib->cameras);
         if (verbose)
             L::err(Tag::Match, M::match_verifying, {(long long)verificationThreadCount(vopt)});
@@ -1904,9 +1757,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
             }
             sfm::progress::live_matches_begin(names, nfeat);
         }
-        // The pairs the journal carries are not re-verified, so nothing else
-        // will report them: without this the match map draws a resumed run's
-        // first half as "not reached yet" for the rest of the stage.
+        // 缓存日志中的图像对不会重新验证，必须主动报告进度，否则匹配图会一直将其显示为尚未处理。
         for (uint64_t key : done_keys) {
             const auto it = done_kept.find(key);
             sfm::progress::pair((uint32_t)(key >> 32), (uint32_t)key,
@@ -1919,8 +1770,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
         vopt.progress_done_base = pairs.size() - todo.size();
         vopt.progress_total = pairs.size();
         events::stage_begin(Stage::Match, (int64_t)pairs.size());
-        // Added, not assigned: the journal already counted what an earlier run
-        // offered the verifier, and verifyPairs writes its own total.
+        // 累加而非覆盖：日志已统计先前送入验证的匹配，verifyPairs 另写本次数量。
         uint64_t putative = 0;
         std::vector<TwoViewMatches> fresh =
             verifyPairs(feats, todo, matchFn, vopt, &putative, progress, &pstats);
@@ -1930,9 +1780,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
                    {(long long)pstats.pairs, (long long)pstats.kept, (long long)pstats.dropped,
                     (long long)pstats.rescued, (long long)pstats.disagreed,
                     (long long)pstats.contradicted});
-        // Back into the pair list's order, whichever run produced each entry:
-        // the mapper's seed ranking breaks ties on it, so a resumed run must
-        // hand it over in the order a single run would have.
+        // 恢复图像对列表顺序，保证恢复运行与完整运行的种子评分平局处理一致。
         if (done_kept.empty()) {
             db.pairs = std::move(fresh);
         } else {
@@ -1949,9 +1797,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
                     db.pairs.push_back(std::move(fresh[n->second]));
             }
         }
-        // Rig-mates, as a second pass over what verified: only a link the
-        // images confirmed is extended to the other lenses (on a PortalCam
-        // walk, three in four mates of unverified shortlist pairs failed).
+        // 仅将已验证连接扩展到 rig 的其他镜头；PortalCam 步行数据中，未验证候选对的伙伴匹配有四分之三失败。
         if (cfg.rig_pairs && !cfg.rigs.empty()) {
             std::vector<std::pair<uint32_t, uint32_t>> seeds, mates;
             try {
@@ -1961,7 +1807,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
                         seeds.emplace_back(t.image1, t.image2);
                 mates = rigMatePairs(rt, seeds, cfg.rig_pair_angle);
             } catch (const std::exception&) {
-                // A definition the names do not fit is the mapper's to report.
+                // 名称无法匹配定义时交给建图器报告。
             }
             mates.erase(std::remove_if(mates.begin(), mates.end(),
                                        [&](const std::pair<uint32_t, uint32_t>& q) {
@@ -1984,7 +1830,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
                 more = verifyPairs(feats, mates_todo, mateFn, vopt, &put2, progress, &pstats);
                 stats.putative += put2;
             }
-            // In the mates' order whichever run verified each, as above.
+            // 按伙伴列表顺序恢复结果，不受实际验证所属运行影响。
             std::unordered_map<uint64_t, size_t> at;
             for (size_t i = 0; i < more.size(); i++)
                 at[resume::pairKey(more[i].image1, more[i].image2)] = i;
@@ -2007,8 +1853,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
         sfm::progress::flush();
         events::stage_end(Stage::Match);
         for (const TwoViewMatches& tvm : db.pairs) stats.inliers += tvm.matches.size();
-        // Calibrated on the verified pairs when the sample could not do it
-        // (or was never asked for): the mapper wants the rotations too.
+        // 样本未完成标定时，改用已验证图像对；建图器同样需要这些旋转。
         if (priors && calib && !priors->anyRotation()) {
             if (percam.empty()) percam = perImageCameras(calib->cameras, feats.size());
             calibrateSensorPriorsFromDatabase(*priors, db, feats, percam, tvopt, cfg.threads,
@@ -2035,9 +1880,7 @@ int matchFeatureDir(const std::string& featdir, const SfmConfig& cfg, PairMode m
     stats.kept = db.pairs.size();
     return 0;
 }
-// ---------------------------------------------------------------------------
-// `auto`
-// ---------------------------------------------------------------------------
+// ---------------- 自动流水线 ----------------
 
 AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     AutoResult r;
@@ -2045,11 +1888,8 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     const std::string& _workspace = in.workspace;
     const bool verbose = !cfg.quiet;
 
-    // ---- where the images and masks are (D39/D40) ----
-    // The default layout is a dataset directory holding `images/` and `masks/`,
-    // which is Spirula Studio's and nerfstudio's. Pointing straight at an image
-    // directory still works: `masks` is then looked for as its sibling, so
-    // `spirula-sfm auto DATASET/images` and `spirula-sfm auto DATASET` behave the same.
+    // ---------------- 图像与掩码位置（D39/D40）----------------
+    // 默认数据集包含 images/ 与 masks/；直接指向图像目录时查找相邻 masks，在不存在其他图像的条件下两种输入形式等价。
     if (_imagedir.empty()) _imagedir = "images";
     if (!fs::is_directory(_imagedir)) {
         L::fail(Tag::Run, M::run_not_a_directory, {_imagedir});
@@ -2064,7 +1904,7 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     }
     if (!in.mask_dir_explicit) {
         fs::path p = fs::path(_imagedir);
-        if (!p.empty() && p.filename().empty()) p = p.parent_path();  // drop a trailing '/'
+        if (!p.empty() && p.filename().empty()) p = p.parent_path();  // 移除末尾的 /
         fs::path sibling = p.parent_path() / "masks";
         if (fs::is_directory(sibling)) cfg.mask_dir = sibling.string();
     }
@@ -2074,7 +1914,7 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     fs::create_directories(ws);
     const fs::path featdir = ws / "features";
     const fs::path matchpath = ws / "matches.bin";
-    // COLMAP's layout: sparse/<i> per reconstruction, sparse/0 the largest.
+    // COLMAP 布局：每个重建位于 sparse/<i>，0 为最大模型。
     const fs::path sparsedir = ws / "sparse";
 
     L::out(Tag::Run, M::run_header, {_imagedir, _workspace});
@@ -2084,22 +1924,19 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     L::out(Tag::Run, M::run_data_type, {cfg.data_type});
     L::out(Tag::Run, M::run_cameras, {cfg.camera_model, cfg.camera_mode});
     if (!cfg.mask_dir.empty()) L::out(Tag::Run, M::run_masks, {cfg.mask_dir});
-    // What the two knobs moved, so a surprising run is explainable from its own
-    // output rather than from reading the preset table.
+    // 报告质量与数据类型预设修改的选项，便于仅凭日志解释运行行为。
     for (const PresetChange& p : in.preset_changes)
         L::out(Tag::Run, M::run_preset_moved, {"--" + p.flag, p.to, p.from});
 
-    // ---- what an interrupted run left, and whether it is still ours ----
-    // The signature is stored BEFORE the stage rather than after it, so that a
-    // run interrupted half way through leaves files the next one may reuse.
+    // ---------------- 中断缓存及有效性 ----------------
+    // 阶段开始前写入签名，使执行中断后留下的文件仍可供下一次复用。
     const fs::path rdir = resume::dir(_workspace);
     const std::string extract_sig =
         stageSignature(cfg, CMD_EXTRACT) + "images=" + _imagedir + "\n";
     std::error_code rm_ec;
     bool reuse = cfg.reuse;
     if (!reuse || resume::recorded(rdir / "extract.sig") != extract_sig) {
-        // The pair list and the journal index the feature files, so they go
-        // wherever those go.
+        // 图像对列表与日志索引特征文件，必须与特征缓存同步失效。
         reuse = false;
         resume::clear(_workspace);
         fs::remove_all(featdir, rm_ec);
@@ -2107,7 +1944,7 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     }
     if (cfg.reuse) resume::store(rdir / "extract.sig", extract_sig);
 
-    // ---- 1. extract ----
+    // ---------------- 1. 特征提取 ----------------
     double t0 = now();
     ExtractStats est;
     if (int rc = extractDirectory(_imagedir, featdir, cfg, est, reuse)) {
@@ -2121,19 +1958,8 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     }
     warnIfMasksLookInverted(est);
 
-    // Pairing: what --pairs says, except that "auto" only knows the image count
-    // once extraction has run. Above COLMAP's exhaustive cutoff -- where COLMAP
-    // switches to vocabulary-tree retrieval -- we switch to GPU pair selection
-    // (sfm/feature/PairSelection.h, D35).
-    //
-    // The same cutoff retires the video preset's sequential pairing. A temporal
-    // window is a chain, and a capture long enough to be worth this many frames
-    // is long enough to come back on itself; pair selection finds those links
-    // from content, at a cost that is a fraction of matching. Measured on a
-    // 262-frame walk: sequential gave four models (144 / 74 / 19 / 12 images),
-    // pair selection one with 254. Below the cutoff the temporal prior is still
-    // the cheaper way to get the same pairs, and --loop-closure covers its blind
-    // spot. `--pairs sequential` explicitly still means sequential.
+    // auto 在提取后得知图像数，超过穷举阈值时改用 GPU 内容筛选；视频预设同样如此，显式 --pairs sequential 则保持时序。
+    // 262 帧步行数据中，时序模式得到 144/74/19/12 图像的四个模型，内容筛选得到一个 254 图像模型；阈值以下时序更便宜，loop-closure 补足回访连接。
     PairMode mode = cfg.pairMode();
     if ((mode == PairMode::Exhaustive || mode == PairMode::Sequential) &&
         est.images >= 100 && !in.explicit_flags.count("pairs")) {
@@ -2145,7 +1971,7 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
                 {(long long)est.images, (long long)(est.images * (est.images - 1) / 2)});
     }
 
-    // ---- 2. match + geometric verification ----
+    // ---------------- 2. 匹配与几何验证 ----------------
     t0 = now();
     std::vector<FeatureSet> feats;
     MatchesDatabase db;
@@ -2154,16 +1980,13 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     calib.setup = cfg.camera;
     const SensorCaptures sensors = loadSensorCaptures(cfg, verbose);
     calib.sensors = &sensors;
-    // What this stage's output depends on: its own settings, the extraction
-    // that produced its input, and the feature files themselves -- the pair
-    // lists and the journal are indices into a particular set of those.
+    // 缓存签名包含匹配配置、提取配置及特征文件集合，保证列表与日志索引仍有效。
     MatchResume mres;
     mres.dir = rdir;
     mres.signature = extract_sig + stageSignature(cfg, CMD_MATCH) +
                      "pairs-resolved=" + std::to_string((int)mode) + "\n" +
                      "features=" + featureDirDigest(featdir) + "\n";
-    // A finished matches.bin is the whole of this stage; the mapper wants
-    // keypoints and colours, so the descriptors are never read at all.
+    // 完整 matches.bin 可直接复用；建图只需关键点与颜色，无需读取描述子。
     bool reused_matches = false;
     if (cfg.reuse && fs::exists(matchpath, rm_ec) &&
         resume::recorded(rdir / "match.sig") == mres.signature) {
@@ -2203,22 +2026,16 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     double t_match = now() - t0;
     if (!reused_matches) {
         writeMatches(matchpath.string(), db);
-        // matches.bin says everything the journal and the pair list did, and
-        // the journal is the same size again.
+        // matches.bin 已包含日志与图像对列表的全部信息，移除同样庞大的中间日志。
         resume::forget(rdir / "matches.part");
         resume::forget(rdir / "pairs.bin");
         if (cfg.reuse) resume::store(rdir / "match.sig", mres.signature);
     }
-    // Nothing past this point reads a descriptor -- the mapper works on
-    // keypoints, the correspondence graph and the per-keypoint colors -- and on
-    // a large capture they are the biggest thing in the process: 8k features
-    // per image at 128 bytes is a gigabyte per thousand images, held for the
-    // whole of mapping for nothing.
+    // 后续仅使用关键点、对应图与颜色，立即释放描述子；每图 8k 个 128 字节特征时，每千张图约占 1 GB。
     for (FeatureSet& fs : feats) {
         std::vector<uint8_t>().swap(fs.descriptors);
     }
-    // After writeMatches, never before: the file on disk indexes the feature
-    // files, which keep every row.
+    // 必须在 writeMatches 之后压缩，磁盘匹配索引仍指向保留全部特征行的文件。
     if (cfg.compact_unused_features) {
         FeatureCompactionPlan plan = buildFeatureCompactionPlan(db);
         for (size_t i = 0; i < feats.size(); i++)
@@ -2228,12 +2045,8 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
         if (verbose) reportFeatureCompaction(plan.stats);
     }
 
-    // ---- 3. incremental mapping ----
-    // The grouping and the focals the two-view stage settled on carry straight
-    // into mapping: a focal it measured beats the geometric default the mapper
-    // would otherwise start the group from, and every group starting from a
-    // measurement is what stops small components inventing their own
-    // intrinsics (D45/D46).
+    // ---------------- 3. 增量建图 ----------------
+    // 沿用双视图阶段的相机分组与测量焦距，避免小连通分量从几何默认值出发拟合出相互不一致的内参（D45/D46）。
     MapperOptions& mapopt = cfg.mapper;
     const CameraSetup& cs = calib.cameras;
     mapopt.initial_cameras = cs.cameras;
@@ -2261,8 +2074,7 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     double t_map = now() - t0;
 
     {
-        // A global solve per model, and up to two more passes over them: minutes
-        // on a large capture, with the last image long since placed.
+        // 每个模型执行一次全局优化，最多再加两轮；大型数据中可耗时数分钟，需单独报告进度。
         events::stage_begin(Stage::Refine);
         double t_finish = 0;
         models = finishModels(mapper, std::move(models), cfg, verbose, t_finish);
@@ -2275,22 +2087,18 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     std::vector<ModelGauge> gauge;
     const bool auto_metric = fixGauge(models, cfg, _imagedir, verbose, gauge, &sensors);
     recolorPoints(models, cfg);
-    // The gauge is what a screen was missing: every snapshot before this one is
-    // in the seed pair's frame, so a run watched to the end left a tilted model
-    // on display until the user opened the written one.
+    // 规范对齐后刷新快照，避免屏幕仍显示种子坐标系下倾斜的模型。
     if (!gauge.empty()) progress::gauge(gauge[0].oriented, gauge[0].metric);
     if (!models.empty()) progress::model(models.front(), /*force=*/true);
-    // Before the split: the summary reports what was estimated, and the file's
-    // one camera per frame size is not that.
+    // 写出尺寸拆分前统计相机数，摘要应描述估计的分组，而非每种图像尺寸对应的输出相机。
     const size_t n_cameras = models.empty() ? 0 : models.front().cameras.size();
     splitCamerasBySize(models, feats);
     writeModels(models, sparsedir, verbose, gauge, &rigs);
 
-    // The mapper reports its own breakdown when `run()` returns; the passes
-    // that assemble its models accumulate into the same counters.
+    // run() 已报告建图计时，后续装配继续累加同一组计数器。
     g_map_prof.report(t_map, "map");
 
-    // ---- report ----
+    // ---------------- 结果报告 ----------------
     const Reconstruction& rec = models.front();
     double mean = 0, median = 0;
     size_t nobs = 0;
@@ -2301,8 +2109,7 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
            {format_duration(t_extract), (long long)est.images,
             (long long)est.features});
     if (est.masked_images) {
-        // Over what this run extracted, like the warning above: a reused
-        // feature file does not say what a mask took out of it.
+        // 仅统计本次实际提取部分，复用特征文件无法得知掩码排除数。
         const uint64_t before = est.features_new + est.masked_out;
         L::out(Tag::Run, M::sum_masks,
                {(long long)est.masked_images, (long long)est.images,
@@ -2327,8 +2134,7 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     L::out(Tag::Run, M::sum_model_error,
            {L::num(mean, 3), L::num(median, 3), (long long)nobs});
     if (models.size() > 1) {
-        // A fragmented capture: sparse/0 is the largest component, the rest are
-        // separate reconstructions with no known transform between them (D41).
+        // 分散重建中 sparse/0 为最大模型，其余模型之间没有已确定的坐标变换（D41）。
         L::out(Tag::Run, M::sum_components,
                {(long long)models.size(), (long long)distinctRegistered(models),
                 (long long)est.images});
@@ -2339,12 +2145,9 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
                 ? sparsedir.string() + "/{0.." + std::to_string(models.size() - 1) + "}"
                 : (sparsedir / "0").string()});
 
-    // Verdict, so a batch run can be scanned without reading every number.
-    // Thresholds are deliberately loose -- this flags "obviously broken", not
-    // "not as good as COLMAP".
+    // 结果阈值较宽松，用于快速识别明显失败，不表示已达到最优重建质量。
     const double frac = est.images ? (double)reg / est.images : 0.0;
-    // Everything the exit code says, said as data. A front end reads this
-    // instead of the status: 3 and 4 cannot both be reported, and this can.
+    // 通过结构化数据分别报告重建质量与公制状态，避免单个退出码无法同时表示 3 和 4。
     auto emitResult = [&](bool part) {
         r.registered = reg;
         r.images = est.images;
@@ -2375,9 +2178,7 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     const bool partial = frac < 0.5 || mean > 2.0;
     emitResult(partial);
     if (partial) L::out(Tag::Run, M::result_partial, {L::num(100 * frac, 0), L::num(mean, 2)});
-    // A sound model in the wrong gauge is still a sound model, so the metric
-    // verdict takes the exit status only when nothing about the reconstruction
-    // itself claims it -- but it is always printed, and the GUI reads the line.
+    // 重建质量优先决定退出状态；质量合格时才以公制规范结果决定退出码，两类结果始终输出供 GUI 读取。
     if (!auto_metric) L::out(Tag::Run, M::result_not_metric);
     if (!partial && auto_metric)
         L::out(Tag::Run, M::result_ok, {L::num(100 * frac, 0), L::num(mean, 2)});
@@ -2385,12 +2186,9 @@ AutoResult run_auto(SfmConfig& cfg, const AutoInputs& in) {
     return r;
 }
 
-// ---------------------------------------------------------------------------
-// RunContext
-// ---------------------------------------------------------------------------
+// ---------------- 运行上下文 ----------------
 
-// Restoring on destruction is what lets a front end run a second job, and what
-// keeps a thrown Cancelled from leaving the sinks pointing at a dead object.
+// 析构时恢复接收端，使前端可继续运行下一任务，并避免 Cancelled 异常留下悬空对象引用。
 RunContext::~RunContext() {
     slog::set_sink({});
     events::set_sink({});
@@ -2403,15 +2201,11 @@ void RunContext::set_events(events::Sink s) { events::set_sink(std::move(s)); }
 void RunContext::set_cancel(const std::atomic<bool>* flag) { cancel::set_token(flag); }
 void RunContext::set_progress_dir(const std::string& dir) { progress::set_dir(dir); }
 
-// ---------------------------------------------------------------------------
-// Reading a settings list
-// ---------------------------------------------------------------------------
+// ---------------- 读取设置列表 ----------------
 
 namespace {
 
-// --camera-model / --focal / --distortion: a bare value sets the dataset-wide
-// default (which is a table field), PREFIX=VALUE names one camera group
-// (which is not).
+// 相机模型、焦距与畸变的裸值设置全局默认，PREFIX=VALUE 设置单个相机分组。
 bool cameraOverrideArg(SfmConfig& cfg, OverrideKind kind, const std::string& v,
                        std::set<std::string>& seen, std::string& err) {
     const char* flag = kind == OverrideKind::Focal        ? "focal"
@@ -2424,7 +2218,7 @@ bool cameraOverrideArg(SfmConfig& cfg, OverrideKind kind, const std::string& v,
         err = std::string("bad --") + flag + " '" + v + "' (" + form + ")";
         return false;
     }
-    if (v.find('=') != std::string::npos) return true;  // per-group only
+    if (v.find('=') != std::string::npos) return true;  // 仅针对相机分组
     switch (kind) {
         case OverrideKind::Focal: cfg.focal = std::atof(v.c_str()); break;
         case OverrideKind::Distortion: cfg.distortion = v; break;
@@ -2450,10 +2244,10 @@ bool cameraOverrideName(const std::string& a, OverrideKind& kind) {
     return true;
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 std::string parse_auto_args(const std::vector<std::string>& args, AutoRequest& out) {
-    // setConfigField consumes argv the way main() gets it; this is that view.
+    // 将设置转换成 setConfigField 所需的 argv 视图。
     std::vector<char*> argv;
     argv.reserve(args.size());
     for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
@@ -2497,9 +2291,7 @@ std::string parse_auto_args(const std::vector<std::string>& args, AutoRequest& o
             out.progress_dir = args[(size_t)++i];
             continue;
         }
-        // Claimed, not merely cleared: manifest_apply fills in anything the
-        // command line did not claim, and a manifest naming a mask_dir would
-        // otherwise hand the masks back to a run that just refused them.
+        // 禁用掩码时还需标记该选项已显式设置，防止 manifest_apply 再用清单值补回掩码。
         if (a == "--no-masks") {
             cfg.mask_dir.clear();
             maskdir_explicit = true;
@@ -2529,8 +2321,7 @@ std::string parse_auto_args(const std::vector<std::string>& args, AutoRequest& o
     if (workspace.empty()) return "--output WORKSPACE is required";
     maskdir_explicit = maskdir_explicit || seen.count("masks") || seen.count("mask-dir");
 
-    // Presets first, the file next, the command line over both: applyPresets
-    // skips anything already claimed, and manifest_apply is told the same set.
+    // 优先级为显式命令行、清单文件、预设；各阶段共享已声明字段集合，避免覆盖高优先级值。
     std::vector<PresetChange> moved;
     if (std::string err = applyPresets(cfg, seen, moved); !err.empty()) return err;
     if (!manifest_path.empty()) {
@@ -2555,4 +2346,4 @@ std::string parse_auto_args(const std::vector<std::string>& args, AutoRequest& o
     return {};
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

@@ -1,12 +1,8 @@
 #pragma once
 
-// Gamut matrices and the sRGB transfer, shared by everything that has to move
-// pixels between a capture colour space and sRGB.
-// All SfM stages share one conversion path.
+// 色域矩阵与 sRGB 传递函数，供各 SfM 阶段统一转换采集色彩空间与 sRGB。
 
-//
-// Matrices are row-major 3x3, source primaries -> Rec.709, chromatically
-// adapted (white maps to white).
+// 矩阵为行主序 3×3，将源基色映射到 Rec.709，并进行白点适应，保持白色映射为白色。
 
 #include <algorithm>
 #include <array>
@@ -23,7 +19,7 @@ inline constexpr const char* kGamuts[] = {
     "Rec.709", "ACES2065-1", "ACEScg", "Rec.2020", "AdobeRGB", "DCI-P3",
 };
 
-// "" and "none" are Rec.709, i.e. the identity.
+// 空字符串与 none 均表示 Rec.709，即恒等变换。
 inline Mat3 gamut_to_rec709(const std::string& name) {
     if (name.empty() || name == "none" || name == "Rec.709")
         return {1,0,0, 0,1,0, 0,0,1};
@@ -62,7 +58,7 @@ inline Mat3 invert3x3(const Mat3& m) {
             (d*i - e*h)*s, (b*h - a*i)*s, (a*e - b*d)*s};
 }
 
-// 0.04045 is the branch point (= 12.92 * 0.0031308); 0.055 is the offset.
+// 0.04045 为分段点（= 12.92 * 0.0031308），0.055 为偏移。
 inline float srgb_to_linear(float x) {
     return x < 0.04045f ? x * (1.0f / 12.92f)
                         : std::pow((x + 0.055f) * (1.0f / 1.055f), 2.4f);
@@ -73,9 +69,7 @@ inline float linear_to_srgb(float x) {
                           : 1.055f * std::pow(std::max(x, 0.0f), 1.0f / 2.4f) - 0.055f;
 }
 
-// Output transfer: the curve from linear light to a display code value, and
-// orthogonal to whether the buffer is stored linear (the caller's is_linear).
-// Mirrors the kXfer* block in shaders/pixel_wise.slang; the two must agree.
+// 输出传递函数将线性光强映射到显示编码值，与调用方 is_linear 所描述的缓冲存储方式独立。
 enum class Transfer : int {
     Srgb = 0, SrgbClamped = 1, Aces = 2, Filmic = 3, Uncharted2 = 4,
 };
@@ -85,8 +79,7 @@ inline constexpr const char* kTransfers[] = {
 };
 inline constexpr int kNumTransfers = 5;
 
-// "" and "none" mean "not declared" -- the config's spelling for unset, which
-// the GUI and the CLI can both write. The caller supplies what that infers to.
+// 空字符串与 none 表示未声明；由调用方推断默认值。
 inline Transfer transfer_or(const std::string& name, Transfer fallback) {
     if (name.empty() || name == "none") return fallback;
     for (int i = 0; i < kNumTransfers; i++)
@@ -116,12 +109,12 @@ inline float tone_filmic(float x) {
     return (t * (6.2f * t + 0.5f)) / (t * (6.2f * t + 1.7f) + 0.06f);
 }
 
-// Positive root of a x^2 + b x + c, the branch every curve inverse takes.
+// 求 a x^2 + b x + c 的正根，各曲线求逆均使用此分支。
 inline float tone_quad_root(float a, float b, float c) {
     return (-b + std::sqrt(std::max(b * b - 4.0f * a * c, 0.0f))) / (2.0f * a);
 }
 
-// Scene-linear (Rec.709) -> display code value.
+// 场景线性值（Rec.709）-> 显示编码值。
 inline float tone_encode(float x, Transfer t) {
     switch (t) {
     case Transfer::Filmic:      return tone_filmic(x);
@@ -138,8 +131,7 @@ inline float tone_encode(float x, Transfer t) {
 inline float tone_decode(float d, Transfer t) {
     switch (t) {
     case Transfer::Filmic: {
-        // The curve only reaches 1.0 at infinity; cap the decode at the white
-        // point so display white lands on a finite scene value.
+        // 曲线仅在无穷远处达到 1.0；解码在白点处截断，使显示白色对应有限场景值。
         const float y = std::min(d, tone_filmic(kTransferWhite));
         return tone_quad_root(6.2f * (1.0f - y), 0.5f - 1.7f * y, -0.06f * y)
              + 0.004f;
@@ -157,8 +149,7 @@ inline float tone_decode(float d, Transfer t) {
     }
 }
 
-// One channel of a working-space value -> its display code value, and back.
-// The gamut matrix is the caller's; these are the transfer alone.
+// 工作空间单通道值与显示编码值的互换；仅处理传递函数，色域矩阵由调用方负责。
 inline float working_to_display(float w, Transfer t, bool is_linear) {
     return tone_encode(is_linear ? w : srgb_to_linear(w), t);
 }
@@ -174,16 +165,12 @@ inline void apply3x3(const Mat3& m, float v[3]) {
         v[r] = m[r*3+0]*t0 + m[r*3+1]*t1 + m[r*3+2]*t2;
 }
 
-// True when (gamut, is_linear) is already plain sRGB, so callers can skip the
-// per-pixel work entirely.
+// 判断 gamut 与 is_linear 是否已表示标准 sRGB，以跳过逐像素转换。
 inline bool is_identity(const std::string& gamut, bool is_linear) {
     return !is_linear && (gamut.empty() || gamut == "none" || gamut == "Rec.709");
 }
 
-// Interleaved 8-bit RGB, in place. `n` is the pixel count.
-//
-// Values outside the destination gamut clamp -- these buffers feed feature
-// extraction and 8-bit point colours, both of which are 0..255 by definition.
+// 原地处理交错排列的 8 位 RGB，n 为像素数；超出目标色域的值截断到 0..255，供特征提取与点云着色使用。
 inline void to_srgb_inplace(uint8_t* rgb, size_t n,
                             const std::string& gamut, bool is_linear) {
     if (is_identity(gamut, is_linear)) return;
@@ -202,7 +189,7 @@ inline void to_srgb_inplace(uint8_t* rgb, size_t n,
     }
 }
 
-// The inverse of to_srgb_inplace.
+// to_srgb_inplace 的逆变换。
 inline void from_srgb_inplace(uint8_t* rgb, size_t n,
                               const std::string& gamut, bool is_linear) {
     if (is_identity(gamut, is_linear)) return;
@@ -219,4 +206,4 @@ inline void from_srgb_inplace(uint8_t* rgb, size_t n,
     }
 }
 
-}  // namespace colorspace
+}  // 命名空间 colorspace

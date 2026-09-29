@@ -1,16 +1,11 @@
-// Rigid pose conversions shared by the mapper, BA, and COLMAP model IO.
-//
-// A pose is stored as (R, t) with the world->camera convention x_cam = R x + t
-// (geometry::Pose in sfm/geometry/Essential.h). This header adds the parameterization
-// conversions the rest of the pipeline needs:
-//   - quaternion (w,x,y,z), COLMAP's images.bin storage,
-//   - angle-axis, the BA solver's pose[0..2] (pose[3..5] = t).
+// 建图、BA 与 COLMAP 读写共用的刚体位姿转换；约定 x_cam = R x + t。
+// 磁盘四元数顺序为 (w,x,y,z)，BA 前三项为轴角，后三项为平移。
 #pragma once
 
 #include <array>
 #include <cmath>
 
-#include "sfm/geometry/Essential.h"  // Pose
+#include "sfm/geometry/Essential.h"  // 刚体位姿
 #include "sfm/geometry/LinAlg.h"
 
 namespace sfm {
@@ -47,9 +42,7 @@ inline Mat3 quaternionToRotation(const Quat& q) {
             2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)};
 }
 
-// Through the quaternion everywhere: the skew-part formula divides rounding
-// noise by sin(angle) within ~1e-6 rad of pi, which turned a .360 view's
-// exact 180-degree rotation into the identity.
+// 经四元数转换避免接近 pi 时除以 sin(angle) 放大舍入误差；直接反对称公式曾将 .360 的精确 180 度旋转误算为恒等。
 inline Vec3 rotationToAngleAxis(const Mat3& R) {
     Quat q = rotationToQuaternion(R);
     if (q[0] < 0)
@@ -70,9 +63,7 @@ inline Mat3 angleAxisToRotation(const Vec3& aa) {
             k.z * k.x * v - k.y * s, k.z * k.y * v + k.x * s, c + k.z * k.z * v};
 }
 
-// SO(3) exponential map and its Jacobians (Barfoot, "State Estimation for
-// Robotics", 7.1). Left: Exp(a + d) ~ Exp(Jl(a) d) Exp(a); right: ~ Exp(a)
-// Exp(Jr(a) d), Jr(a) = Jl(-a).
+// SO(3) 指数映射与雅可比，参照 Barfoot 第 7.1 节：Exp(a+d) ~ Exp(Jl(a)d)Exp(a) ~ Exp(a)Exp(Jr(a)d)，Jr(a)=Jl(-a)。
 inline Mat3 so3Exp(const Vec3& phi) { return angleAxisToRotation(phi); }
 inline Vec3 so3Log(const Mat3& R) { return rotationToAngleAxis(R); }
 
@@ -107,24 +98,20 @@ inline Mat3 so3LeftJacobianInv(const Vec3& phi) {
 }
 inline Mat3 so3RightJacobianInv(const Vec3& phi) { return so3LeftJacobianInv(phi * -1.0); }
 
-// Camera center in world coordinates: c = -R^T t.
+// 世界坐标系相机中心 c = -R^T t。
 inline Vec3 cameraCenter(const Pose& p) {
     Mat3 Rt = transpose(p.R);
     Vec3 c = mul(Rt, p.t);
     return {-c.x, -c.y, -c.z};
 }
 
-// Compose: (A then B) applied as x -> B(A(x)); returns world->cam2 given
-// world->cam1 (a) and cam1->cam2 (b).
+// 复合顺序为先 A 后 B，即 B(A(x))；输入世界到 cam1 与 cam1 到 cam2，返回世界到 cam2。
 inline Pose composePose(const Pose& b, const Pose& a) {
     return {mul(b.R, a.R), mul(b.R, a.t) + b.t};
 }
 
-// ---- similarity transforms ----
-//
-// X' = scale * R * X + t. This is exactly the gauge freedom of a monocular
-// reconstruction, and therefore the transform relating two reconstructions of
-// the same scene -- what model merging estimates (sfm/map/Merge.h, D43).
+// ---------------- 相似变换 ----------------
+// X' = scale * R * X + t 表示单目重建的规范自由度，也是同一场景不同重建之间的对齐变换（D43）。
 struct Sim3 {
     double scale = 1.0;
     Mat3 R = mat3Identity();
@@ -135,17 +122,14 @@ inline Vec3 transformPoint(const Sim3& T, const Vec3& X) {
     return mul(T.R, X) * T.scale + T.t;
 }
 
-// The same camera, expressed in the transformed world frame. With
-// X' = s R X + t and x_cam = R_c X + t_c, substituting X = R^T (X' - t) / s
-// gives x_cam' = (R_c R^T) X' + (s t_c - R_c R^T t), where x_cam' = s x_cam:
-// camera coordinates scale with the world, which projection ignores. The
-// rotation stays orthonormal, so the result is a proper Pose.
+// 世界变换 X'=s R X+t 后，同一相机变为 x_cam'=(R_c R^T)X'+(s t_c-R_c R^T t)，其中 x_cam'=s x_cam。
+// 相机坐标随世界缩放但不影响投影，旋转仍保持正交。
 inline Pose transformPose(const Sim3& T, const Pose& p) {
     Mat3 R = mul(p.R, transpose(T.R));
     return {R, p.t * T.scale - mul(R, T.t)};
 }
 
-// (A then B) applied as x -> B(A(x)), matching composePose's argument order.
+// 先 A 后 B，B(A(x))，与 composePose 的参数顺序一致。
 inline Sim3 composeSim3(const Sim3& b, const Sim3& a) {
     return {b.scale * a.scale, mul(b.R, a.R), mul(b.R, a.t) * b.scale + b.t};
 }
@@ -158,4 +142,4 @@ inline Sim3 invertSim3(const Sim3& T) {
     return inv;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

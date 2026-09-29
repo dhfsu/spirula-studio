@@ -21,9 +21,7 @@ namespace sfm {
 namespace {
 
 #if SS_HAVE_ALIKED || SS_HAVE_LOMA
-// LightGlue and LoMa run on the inference layer's process-wide device, so
-// their `device` field alone selects nothing; the run's resolved identity is
-// committed before either loads a checkpoint (see Extractor.cpp).
+// LightGlue 与 LoMa 使用推理层的进程级共享设备；device 字段不能单独选择设备，必须在加载权重前提交本次运行解析出的设备标识。
 inline void configureLearnedDevice(const std::string& selector) {
     if (!selector.empty()) nn::configure_device(selector);
 }
@@ -54,10 +52,7 @@ public:
 
         out.reserve(m.size());
         for (const aliked::Match& x : m) {
-            // FeatureMatch carries a *distance*, and everything downstream that
-            // reads it sorts ascending (the max_num_matches cap). LightGlue
-            // reports a confidence in (0, 1], so the distance is its
-            // complement -- a monotone map, which is all that ordering needs.
+            // FeatureMatch 存储按升序排序的距离，用于 max_num_matches 截断；将 LightGlue 的 (0, 1] 置信度取补值即可保持所需顺序。
             out.push_back({x.i, x.j, 1.0f - x.score});
         }
         if (match_.max_num_matches > 0 && out.size() > match_.max_num_matches) {
@@ -78,14 +73,8 @@ private:
                 "a specific frontend -- use --features aliked-n16rot or aliked-n32");
     }
 
-    // The keypoints LightGlue sees must be in the frame its `image_size` names.
-    // FeatureSet reports them in the SOURCE image's pixels (D46), and
-    // width/height are that same frame, so the two already agree -- but only
-    // because scaleKeypoints ran. Passing extract_width here instead would
-    // scale every keypoint by the downscale factor and quietly ruin the
-    // positional encoding.
-    // `xy` is filled with the packed [n, 2] the model wants: Keypoint carries
-    // five floats, so its x/y are strided, not an array of pairs.
+    // scaleKeypoints 已将关键点映射到原图像素坐标，与 width/height 一致；误传 extract_width 会使位置编码产生缩放错误。
+    // xy 必须打包为 [n, 2]；Keypoint 含五个浮点数，其 x/y 不能直接视作连续坐标对。
     static aliked::MatchInput view(const FeatureSet& f, std::vector<float>& xy) {
         xy.resize((size_t)f.count() * 2);
         for (uint32_t i = 0; i < f.count(); i++) {
@@ -111,9 +100,7 @@ private:
 
 #if SS_HAVE_LOMA
 
-// LoMa's matcher, behind the same interface as LightGlue's. It refuses a
-// descriptor of the wrong width: each variant was trained against one, so a
-// 128-D input to a 256-D matcher is a shape error, not a degraded result.
+// LoMa 与 LightGlue 共用匹配接口；每个版本只针对固定宽度训练，描述子宽度不符属于形状错误，必须拒绝。
 class LomaFeatureMatcher : public IFeatureMatcher {
 public:
     LomaFeatureMatcher(const MatchOptions& match, const std::string& model,
@@ -136,9 +123,7 @@ public:
         const std::vector<loma::Match> m = m_.match(view(a, ka), view(b, kb), mopt_);
 
         out.reserve(m.size());
-        // FeatureMatch carries a DISTANCE and everything downstream sorts it
-        // ascending; the matcher reports a confidence in (0, 1], so the
-        // distance is its complement -- monotone, which is all ordering needs.
+        // 下游按距离升序排序；将匹配器的 (0, 1] 置信度取补值，保持所需顺序。
         for (const loma::Match& x : m) out.push_back({x.i, x.j, 1.0f - x.score});
         if (match_.max_num_matches > 0 && out.size() > match_.max_num_matches) {
             std::partial_sort(out.begin(), out.begin() + match_.max_num_matches, out.end(),
@@ -163,9 +148,7 @@ private:
                 "-D; --features and --matcher name different variants");
     }
 
-    // Keypoints in the SOURCE image's pixels (D46), which is the frame
-    // width/height names -- true only because scaleKeypoints ran. Passing
-    // extract_width instead would scale every keypoint and ruin the encoding.
+    // scaleKeypoints 已将关键点映射到 width/height 所描述的原图像素坐标（D46）；误用 extract_width 会破坏位置编码。
     static loma::MatchInput view(const FeatureSet& f, std::vector<float>& xy) {
         xy.resize((size_t)f.count() * 2);
         for (uint32_t i = 0; i < f.count(); i++) {
@@ -188,7 +171,7 @@ private:
 
 #endif  // SS_HAVE_LOMA
 
-}  // namespace
+}  // 匿名命名空间
 
 bool isLearnedMatcher(const std::string& type) {
     return type == "lightglue" || isLomaType(type);
@@ -210,8 +193,7 @@ std::unique_ptr<IFeatureMatcher> createFeatureMatcher(const std::string& type,
     }
     if (isLomaType(type)) {
 #if SS_HAVE_LOMA
-        // --matcher names the variant, so an explicit --loma-matcher-model is
-        // only needed to point at a file on disk.
+        // --matcher 已指定版本；仅在使用本地文件时需要显式设置 --loma-matcher-model。
         const std::string model = loma_opt.model.empty() ? type : loma_opt.model;
         return std::make_unique<LomaFeatureMatcher>(match, model, loma_opt);
 #else
@@ -226,4 +208,4 @@ std::unique_ptr<IFeatureMatcher> createFeatureMatcher(const std::string& type,
                              "' (expected bruteforce, lightglue, loma-b or loma-b128)");
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

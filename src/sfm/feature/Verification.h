@@ -1,21 +1,5 @@
-// Geometric verification of a whole pair list (src/sfm/README.md).
-//
-// `estimateTwoView` verifies one pair; this drives it over every pair produced
-// by `sfm/feature/Pairing.h` and is where the parallelism lives: host RANSAC on
-// every putative pair is the largest single cost in the `match` stage (it was
-// 83-85% of it, and ~70% of end-to-end wall clock, when this pool was written;
-// it is a third to two thirds of the stage now that the other stages have been
-// worked on, and still the reason the stage is CPU-bound).
-//
-// Shape: the GPU matcher owns one VkContext and one queue, so descriptor matching
-// stays on the calling thread; it acts as the producer and a pool of worker
-// threads consumes the putative matches. That overlaps host RANSAC with GPU
-// matching *and* spreads it across cores, which the serial loop did neither of.
-//
-// Results are collected by pair index and returned in the pair list's order, so
-// the output does not depend on thread count or scheduling. `estimateTwoView`
-// is reentrant (no globals; its RNG is seeded per call from RansacOptions), so
-// each pair's geometry is likewise thread-count-independent.
+// GPU 匹配作为单线程生产者，主机工作池并行执行双视图 RANSAC，与匹配重叠；验证仍占匹配阶段约三分之一至三分之二。
+// 结果按固定图像对索引收集，估计器可重入且逐调用固定随机种子，因此线程数量与调度不改变输出顺序或几何。
 #pragma once
 
 #include <atomic>
@@ -47,19 +31,11 @@
 
 namespace sfm {
 
-// Unit bearings for every feature of every image, plus the cameras they were
-// produced with (D45). Verifying a fisheye pair on pixels asks a pinhole model
-// to explain rays it cannot represent; verifying it on bearings asks the
-// question the geometry actually answers. bearing() is a Newton inversion per
-// keypoint and each image takes part in dozens of pairs, so this is computed
-// once per image rather than once per pair -- which is the difference between
-// seconds and hours on a 2000-image capture.
-//
-// An empty per-image entry means "verify this image's pairs on pixels", so a
-// mixed dataset degrades per image rather than wholesale.
+// 缓存逐图像、逐关键点单位视线及生成时的相机，避免每图参与多对时重复 Newton 反解。
+// 鱼眼必须在视线上验证，不能用针孔像素解释宽角方向；空图像条目表示沿用像素路径。
 struct BearingCache {
-    std::vector<Camera> cameras;              // per image
-    std::vector<std::vector<Vec3>> bearings;  // per image, per feature
+    std::vector<Camera> cameras;              // 逐图像
+    std::vector<std::vector<Vec3>> bearings;  // 逐图像、逐特征
     bool has(uint32_t i) const { return i < bearings.size() && !bearings[i].empty(); }
     size_t bytes() const {
         size_t n = 0;
@@ -68,9 +44,7 @@ struct BearingCache {
     }
 };
 
-// `cams[i]` is image i's camera; entries whose model cannot see past 90 degrees
-// are skipped, because the pixel path is already exact for them and reproducing
-// it through bearings would only perturb long-settled results.
+// 为需要宽角表示的相机预计算视线，普通镜头保留已有精确像素路径。
 inline BearingCache precomputeBearings(const std::vector<FeatureSet>& feats,
                                        const std::vector<Camera>& cams,
                                        bool wide_only = true, int threads = 0) {
@@ -78,8 +52,7 @@ inline BearingCache precomputeBearings(const std::vector<FeatureSet>& feats,
     bc.cameras = cams;
     bc.bearings.resize(feats.size());
     const size_t n = std::min(feats.size(), cams.size());
-    // Millions of independent Newton inversions, one per keypoint; images are
-    // written to disjoint slots, so this is a straight fan-out.
+    // 逐图像写入独立槽位，并行计算数百万个关键点的 Newton 反解。
     const unsigned hc = std::thread::hardware_concurrency();
     int nt = threads > 0 ? threads : (hc > 0 ? (int)hc : 1);
     nt = std::max(1, std::min<int>(nt, (int)std::max<size_t>(n, 1)));
@@ -104,19 +77,8 @@ inline BearingCache precomputeBearings(const std::vector<FeatureSet>& feats,
     return bc;
 }
 
-// How many correspondences a focal hypothesis lets *some* epipolar geometry
-// explain, over `sample`. Only the epipolar half of two-view verification runs
-// (the homography answers a different question), on the matched features only,
-// so the whole search costs a couple of seconds rather than a full extra
-// verification pass.
-//
-// Two counts, because they are not equally informative. Near the optical axis
-// any plausible focal produces nearly the same ray, so central correspondences
-// agree with every hypothesis and flatten the curve; it is the periphery of a
-// fisheye frame -- where a wrong focal bends the ray by tens of degrees -- that
-// actually knows the answer. `peripheral` counts only inliers whose keypoints
-// are both beyond kPeripheralFrac of the half-diagonal in both images, and that
-// is what the search maximizes.
+// 仅对样本匹配运行极线估计，统计焦距假设能解释的内点；不运行回答不同问题的单应性检查。
+// 光轴附近视线对焦距不敏感，最终最大化两侧均位于半对角线 kPeripheralFrac 之外的周边内点数。
 struct FocalScore {
     int total = 0;
     int peripheral = 0;
@@ -184,14 +146,7 @@ inline FocalScore focalInliers(const std::vector<FeatureSet>& feats,
     return {total, periph};
 }
 
-// Search the focal length that makes the most peripheral correspondences agree
-// with *some* epipolar geometry. A too-long focal flattens the rays and a
-// too-short one splays them; either way no single epipolar geometry fits a
-// whole fisheye frame afterwards, so the peripheral inlier count peaks at the
-// truth. The grid is in half-diagonal field of view, the physically meaningful
-// axis: 55 deg (an ordinary lens) through 175 deg (well past any real fisheye,
-// so the true value is interior and the parabola below has something to work
-// with).
+// 在半对角视场 55–175 度网格搜索鱼眼焦距，最大化周边极线内点；过长压平、过短扩散视线，真实值应位于窗口内部。
 inline double bootstrapFocal(const std::vector<FeatureSet>& feats,
                              const std::vector<std::pair<uint32_t, uint32_t>>& sample,
                              const std::vector<std::vector<FeatureMatch>>& matches,
@@ -206,15 +161,13 @@ inline double bootstrapFocal(const std::vector<FeatureSet>& feats,
     std::vector<int> totals;
     for (int step = 0; step <= 24; step++) {
         double half_fov = (55.0 + step * 5.0) * M_PI / 180.0;
-        double f = 0.5 * diag / half_fov;  // equidistant: r = f * theta
+        double f = 0.5 * diag / half_fov;  // 等距投影：r = f * theta
         FocalScore sc = focalInliers(feats, sample, matches, cams, f, tvopt, threads);
         curve.push_back({f, sc.peripheral});
         totals.push_back(sc.total);
         if (sc.peripheral > best_n) { best_n = sc.peripheral; best_f = f; }
     }
-    // Parabolic interpolation through the peak and its neighbours, so the
-    // answer is not quantized to the grid (the mapper refines it anyway, but a
-    // better start is a better set of verified pairs).
+    // 在峰值与邻居间做抛物线插值，避免初始焦距受网格量化影响。
     for (size_t i = 1; i + 1 < curve.size(); i++) {
         if (curve[i].first != best_f) continue;
         double y0 = curve[i - 1].second, y1 = curve[i].second, y2 = curve[i + 1].second;
@@ -232,8 +185,7 @@ inline double bootstrapFocal(const std::vector<FeatureSet>& feats,
         slog::out(slog::Tag::Match, spirula::i18n::msg::sfm::focal_search,
                  {(long long)sample.size(), slog::num(best_f, 1),
                   (long long)((0.5 * diag / best_f) * 180.0 / M_PI)});
-        // The search curve itself is a debug histogram -- whoever reads it is
-        // calibrating the focal search, not waiting on a reconstruction.
+        // 搜索曲线作为开发调试直方图输出。
         std::string line = "[focal] curve (f:peripheral/total):";
         for (size_t i = 0; i < curve.size(); i++) {
             char buf[64];
@@ -246,19 +198,8 @@ inline double bootstrapFocal(const std::vector<FeatureSet>& feats,
     return best_f;
 }
 
-// Bootstrap a focal for every fisheye camera group that has no prior, from the
-// pairs whose two images are *both* in that group. One focal per group, not one
-// per dataset (D46): a rig carries two lenses, and a cross-group pair cannot
-// tell which of the two is wrong.
-//
-// Groups already in `given` (any --focal, or EXIF -- CameraSetup::focal_given)
-// are left alone, and so is every non-fisheye group: a wrong focal warps a pinhole
-// image's bearings by a fixed linear map, which leaves the epipolar relation
-// rank-2 and the inlier set unchanged, whereas a wrong *fisheye* focal warps
-// them nonlinearly and no epipolar geometry fits afterwards. That asymmetry is
-// the whole reason this search exists.
-//
-// `pairs[i]` has `matches[i]`; both come from the caller's sample.
+// 仅使用同组内图像对估计无给定先验的鱼眼焦距，避免跨组无法判断哪个镜头出错。
+// 普通针孔错误焦距仅线性变换视线，仍保持秩二极线关系，不能通过内点数量搜索；鱼眼非线性扭曲才提供此信号。
 inline void bootstrapGroupFocals(const std::vector<FeatureSet>& feats,
                                  const std::vector<uint32_t>& cam_ids,
                                  const std::vector<std::pair<uint32_t, uint32_t>>& pairs,
@@ -273,8 +214,7 @@ inline void bootstrapGroupFocals(const std::vector<FeatureSet>& feats,
         if (a >= cam_ids.size() || b >= cam_ids.size() || cam_ids[a] != cam_ids[b]) continue;
         by_group[cam_ids[a]].push_back(p);
     }
-    // focalInliers wants a camera per image; the group's camera stands in for
-    // every image of that group.
+    // 将组相机复制到逐图像视图，满足 focalInliers 的输入要求。
     std::vector<Camera> percam(feats.size());
     for (size_t i = 0; i < feats.size() && i < cam_ids.size(); i++) {
         auto it = cams.find(cam_ids[i]);
@@ -292,8 +232,7 @@ inline void bootstrapGroupFocals(const std::vector<FeatureSet>& feats,
                            id, g == by_group.end() ? 0 : g->second.size(), kv.second.focal());
             continue;
         }
-        // Spread the sample over the group's pairs; a prefix would sample one
-        // part of the capture, since pair lists are ordered.
+        // 样本遍布组内列表，避免排序前缀仅覆盖局部场景。
         std::vector<std::pair<uint32_t, uint32_t>> sp;
         std::vector<std::vector<FeatureMatch>> sm;
         const size_t stride = std::max<size_t>(1, g->second.size() / std::max<size_t>(1, max_sample));
@@ -312,70 +251,41 @@ inline void bootstrapGroupFocals(const std::vector<FeatureSet>& feats,
     }
 }
 
-// ---- focal from the fundamental matrix, for rectilinear groups (D53) ------
-//
-// A wrong focal leaves a *pinhole* pair's inlier count alone -- that is the
-// asymmetry bootstrapFocal above is built on, and the reason it only helps a
-// fisheye. It does not leave the pair's fundamental matrix alone. Two views
-// that share one K satisfy E = K^T F K, and an essential matrix has singular
-// values (s, s, 0): sweep f, watch the two leading singular values of K^T F K
-// converge, and the focal falls out of geometry the pipeline already computes.
-//
-// The criterion is sharp only when the motion says something. A pair whose
-// baseline points down the optical axis, or whose scene is a plane, is nearly
-// flat in f and its argmin is noise. So each pair votes with its own argmin,
-// votes are kept only when the minimum is a real dip, and the group takes the
-// median. Too few votes, or votes that disagree, and the geometric guess
-// stands -- an unmeasured focal is bad, a confidently wrong one is worse.
-//
-// This matters because the guess is 1.2x the long edge, i.e. a ~45 deg
-// diagonal field of view. A wide lens is off by 3x, and everything downstream
-// -- seed choice, PnP, the model's shape -- is built on it.
-//
-// Accuracy, measured against the focal a full reconstruction's bundle
-// adjustment settles on: within 1.5-6%, biased low, which is what a
-// centre-assumed principal point and near-degenerate motion do to any
-// estimator of this family. That is why the answer is a *starting point* the
-// mapper's probe still refines (MapperOptions::measured_focal_cameras) rather
-// than a prior, and why the search only claims a group whose votes agree.
+// ---------------- 普通镜头的基础矩阵焦距估计（D53）----------------
+// 共享内参满足 E=K^T F K，本质矩阵奇异值为 (s,s,0)；搜索使前两奇异值接近的焦距，仅接受曲线有明确谷值且组内一致的投票。
+// 沿光轴运动或平面场景退化时保留几何猜测；实测距最终 BA 焦距约 1.5–6%，略偏小，因此仅作可继续优化的初值，不当作固定先验。
 struct FocalVoteOptions {
-    double min_ratio = 0.25, max_ratio = 3.0;  // search window around the guess
-    int samples = 41;                          // log-spaced points in it
-    // A vote counts when the dip at the argmin is this much below the window's
-    // median asymmetry: a flat curve has nothing to say.
+    double min_ratio = 0.25, max_ratio = 3.0;  // 围绕初始焦距的搜索窗口
+    int samples = 41;                          // 窗口内对数均匀采样数
+    // 谷底需比窗口不对称度中位数低足够比例，平坦曲线不参与投票。
     double min_contrast = 0.35;
     int min_votes = 8;
-    // ... and the votes have to agree: median absolute deviation over median.
+    // 投票一致性：绝对偏差中位数除以中位数
     double max_spread = 0.25;
 };
 
 struct FocalVoteReport {
-    double focal = 0;     // 0 = no confident answer
+    double focal = 0;     // 0 表示没有可信估计
     int votes = 0, pairs = 0;
-    double spread = 1.0;  // MAD / median of the accepted votes
+    double spread = 1.0;  // 接受投票的 MAD/中位数
 };
 
-// |s1 - s2| / (s1 + s2) of K^T F K -- zero exactly when F is an essential
-// matrix for this K, and scale-free so it can be compared across focals.
+// K^T F K 的 |s1-s2|/(s1+s2)，为零时满足前两奇异值相等，无尺度量可跨焦距比较。
 inline double essentialAsymmetry(const Mat3& F, double f, double cx, double cy) {
-    // K = [[f,0,cx],[0,f,cy],[0,0,1]]; K^T F K written out.
+    // K=[[f,0,cx],[0,f,cy],[0,0,1]]，展开计算 K^T F K。
     Mat3 K = {f, 0, cx, 0, f, cy, 0, 0, 1};
     Svd3 s = svd3(mul(transpose(K), mul(F, K)));
     const double d = s.s.x + s.s.y;
     return d > 0 ? (s.s.x - s.s.y) / d : 1.0;
 }
 
-// The argmin of a sampled curve, refined by a parabola through the three
-// points around it, in the curve's own (log-focal) coordinate. Returns the
-// index offset; the caller converts. Without the parabola the answer is
-// quantized to the grid, which at 41 points over a factor of twelve is 6% --
-// the size of the error actually observed against bundle-adjusted focals.
+// 在对数焦距坐标中对谷底三点拟合抛物线，返回分数索引偏移；否则十二倍范围仅 41 点会产生约 6% 网格量化误差。
 inline bool refineMinimum(const std::vector<double>& v, int& best_i, double& frac) {
     best_i = -1;
     double best = 1e30;
     for (int i = 0; i < (int)v.size(); i++)
         if (v[i] < best) { best = v[i]; best_i = i; }
-    // An argmin pinned to an end of the window is an extrapolation, not a dip.
+    // 极小值位于窗口端点属于外推，不能视为可靠谷值。
     if (best_i <= 0 || best_i + 1 >= (int)v.size()) return false;
     const double y0 = v[best_i - 1], y1 = v[best_i], y2 = v[best_i + 1];
     const double den = y0 - 2 * y1 + y2;
@@ -387,9 +297,7 @@ inline bool refineMinimum(const std::vector<double>& v, int& best_i, double& fra
     return true;
 }
 
-// One pair's vote as a (fractional) index into the log-focal window, or -1 when
-// its curve is too flat to have an opinion. `F` is the pixel fundamental matrix
-// of the pair, `guess` the focal the window is centred on.
+// 由像素基础矩阵 F 得到单对在对数焦距窗口中的分数索引投票，曲线太平时返回 -1，guess 为窗口中心。
 inline double focalVote(const Mat3& F, double guess, double cx, double cy,
                         const FocalVoteOptions& o) {
     const double lo = std::log(guess * o.min_ratio), hi = std::log(guess * o.max_ratio);
@@ -408,8 +316,7 @@ inline double focalVote(const Mat3& F, double guess, double cx, double cy,
     return best_i + frac;
 }
 
-// Estimate one rectilinear group's focal from the pairs whose two images are
-// both in it. `pairs[i]` has `matches[i]`, as for bootstrapGroupFocals.
+// 使用同组普通镜头的图像对估计焦距，pairs 与 matches 一一对应。
 inline FocalVoteReport focalFromEpipolar(const std::vector<FeatureSet>& feats,
                                          const std::vector<std::pair<uint32_t, uint32_t>>& pairs,
                                          const std::vector<std::vector<FeatureMatch>>& matches,
@@ -460,9 +367,7 @@ inline FocalVoteReport focalFromEpipolar(const std::vector<FeatureSet>& feats,
 
     rep.votes = (int)votes.size();
     if (rep.votes < fo.min_votes) return rep;
-    // Median vote, and the median absolute deviation as the confidence. Both
-    // are computed on the grid index, which *is* the log focal, so the
-    // deviation is a relative spread with no further conversion.
+    // 在对数焦距网格索引上计算投票中位数与 MAD，偏差直接表示相对离散度。
     std::nth_element(votes.begin(), votes.begin() + votes.size() / 2, votes.end());
     const double med = votes[votes.size() / 2];
     std::vector<double> dev;
@@ -477,8 +382,7 @@ inline FocalVoteReport focalFromEpipolar(const std::vector<FeatureSet>& feats,
     return rep;
 }
 
-// Run the above for every rectilinear group that has no focal prior, and
-// record the ones that answered confidently in `measured`.
+// 为各无焦距先验的普通镜头组估计，将可信结果加入 measured。
 inline void bootstrapRectilinearFocals(const std::vector<FeatureSet>& feats,
                                        const std::vector<uint32_t>& cam_ids,
                                        const std::vector<std::pair<uint32_t, uint32_t>>& pairs,
@@ -529,43 +433,33 @@ inline void bootstrapRectilinearFocals(const std::vector<FeatureSet>& feats,
 
 struct VerificationOptions {
     TwoViewOptions two_view;
-    // When set, pairs whose two images both have bearings are verified on the
-    // sphere; `two_view.ransac.max_error` stays in pixels and is converted per
-    // pair with the two cameras' focal lengths.
+    // 两图均有视线时在球面验证；max_error 保持像素单位，再按各相机焦距换算。
     const BearingCache* bearings = nullptr;
-    // Worker threads for the RANSAC. 0 = hardware_concurrency, 1 = verify
-    // inline on the calling thread (no pool, no queue).
+    // RANSAC 线程数，0 使用全部核心，1 在调用线程直接验证。
     int num_threads = 0;
-    // Producer backpressure: the queue holds at most num_threads * this many
-    // pairs of putative matches, so a slow verifier cannot make the matcher
-    // buffer the whole dataset.
+    // 候选队列上限为线程数乘此系数，防止慢验证器使匹配器缓存全部数据。
     int queue_depth_per_thread = 4;
-    // Pairs requested from the matcher per call. Must match the matcher's own
-    // batch size to get the benefit; see MatchOptions::batch_pairs.
+    // 每次请求的匹配图像对数，应与匹配器批量一致以摊薄提交开销。
     int match_batch_pairs = 64;
-    // Where every finished pair is recorded so an interrupted run need not
-    // verify it again (sfm/core/Resume.h). Null writes nothing.
+    // 保存完成验证的恢复日志，空指针不写入。
     resume::MatchJournal* journal = nullptr;
-    // Where this call sits in a larger list: a resumed run is handed only the
-    // pairs its journal has not got, and the bar still counts the whole stage.
+    // 本调用在整个任务列表中的偏移，使恢复运行只处理缺失图像对但进度仍按完整阶段统计。
     size_t progress_done_base = 0;
-    size_t progress_total = 0;   // 0 = pairs.size()
-    // A pair whose rotation a sensor knows is also verified with it fixed and
-    // keeps that inlier set when it explains `prior_agree` of the free
-    // estimate's. Needs `cameras`, one per image, for the bearings.
+    size_t progress_total = 0;   // 0 使用 pairs.size()
+    // 有旋转先验时还执行固定旋转验证，解释自由估计内点的 prior_agree 比例时采用先验结果，需逐图像 cameras。
     const PriorSource* priors = nullptr;
     const std::vector<Camera>* cameras = nullptr;
     double prior_agree = 0.7;
 };
 
-// What the rotation prior did over one verifyPairs call.
+// 本次验证的旋转先验统计。
 struct VerifyPriorStats {
-    std::atomic<uint64_t> pairs{0};      // pairs a prior covered
-    std::atomic<uint64_t> kept{0};       // ... verified on the prior's inlier set
-    std::atomic<uint64_t> disagreed{0};  // ... where the prior explained too little
-    std::atomic<uint64_t> dropped{0};    // matches the free estimate kept and the prior rejected
-    std::atomic<uint64_t> rescued{0};    // pairs only the prior could verify
-    std::atomic<uint64_t> contradicted{0};  // pairs dropped: turned far from the gyro, nothing held
+    std::atomic<uint64_t> pairs{0};      // 先验覆盖的图像对数
+    std::atomic<uint64_t> kept{0};       // 采用先验内点集通过验证的对数
+    std::atomic<uint64_t> disagreed{0};  // 先验解释不足的对数
+    std::atomic<uint64_t> dropped{0};    // 自由估计保留而先验拒绝的匹配数
+    std::atomic<uint64_t> rescued{0};    // 仅凭先验才能通过验证的对数
+    std::atomic<uint64_t> contradicted{0};  // 旋转远离陀螺且缺少支持而丢弃的对数
 };
 
 inline int verificationThreadCount(const VerificationOptions& opt) {
@@ -574,19 +468,8 @@ inline int verificationThreadCount(const VerificationOptions& opt) {
     return hc > 0 ? (int)hc : 1;
 }
 
-// Match and verify every pair. `matchFn(begin, end, out)` fills `out` with the
-// putative matches for pairs[begin..end) in order, and is only ever called on
-// the calling thread (GPU matchers are not thread-safe). Batching is the
-// matcher's business, not ours -- it lets a GPU matcher amortize uploads and
-// fence round trips over many pairs (D22) -- so we hand it a run and push the
-// results into the queue one at a time, keeping the backpressure per pair.
-// `progress(done, total)` is optional and also called only on the calling
-// thread.
-//
-// Returned entries keep the pair list's order and only cover pairs that
-// survived: fewer putatives than `min_num_inliers`, or a degenerate/undefined
-// two-view config, drops the pair entirely. `putative_out` accumulates the
-// pre-verification match count.
+// 匹配与进度回调仅在调用线程执行，工作池逐对验证并施加背压；GPU 批量由匹配器负责。
+// 返回结果保持输入对顺序，只含满足最少内点和有效几何的图像对，putative_out 累计验证前匹配数。
 inline std::vector<TwoViewMatches> verifyPairs(
     const std::vector<FeatureSet>& feats,
     const std::vector<std::pair<uint32_t, uint32_t>>& pairs,
@@ -598,35 +481,29 @@ inline std::vector<TwoViewMatches> verifyPairs(
     const int nthreads = verificationThreadCount(opt);
     const TwoViewOptions& tv = opt.two_view;
     const bool priors = opt.priors && opt.cameras && opt.cameras->size() >= feats.size();
-    // SS_SFM_PRIOR_DUMP=1: one line per pair the prior covered, with the free
-    // estimate's own rotation for comparison.
+    // SS_SFM_PRIOR_DUMP=1 逐对输出先验与自由估计旋转，供比较诊断。
     const bool prior_dump = priors && spirula::env("SFM_PRIOR_DUMP") != nullptr;
     auto bearingOf = [&](uint32_t img, uint32_t k) {
         if (opt.bearings && opt.bearings->has(img)) return opt.bearings->bearings[img][k];
         return (*opt.cameras)[img].bearing({feats[img].keypoints[k].x, feats[img].keypoints[k].y});
     };
 
-    // Per-pair slot, filled by whichever worker takes the job.
+    // 每对独立结果槽，由领取任务的线程填写。
     std::vector<TwoViewMatches> results(pairs.size());
     std::vector<char> kept(pairs.size(), 0);
     uint64_t putative = 0;
 
-    // Verify one pair in place, returning the inliers it kept; the only work a
-    // worker does.
+    // 单个工作任务原地验证一对并返回保留内点。
     auto verifyBody = [&](size_t p, std::vector<FeatureMatch>& m,
                           uint32_t i, uint32_t j) -> uint32_t {
-        if ((int)m.size() < tv.min_num_inliers) return 0;  // below the inlier floor
-        // The threshold is in extraction pixels; each image converts it to its
-        // own (D47). They differ whenever the extractor downscaled one image
-        // more than the other, which a mixed-resolution capture does routinely.
+        if ((int)m.size() < tv.min_num_inliers) return 0;  // 少于内点下限
+        // 阈值以提取像素定义，按各图缩放比例分别换到源像素（D47）。
         const double sc = 0.5 * (feats[i].pixelScale() + feats[j].pixelScale());
         TwoViewGeometry g;
         Mat3 R_prior;
         double prior_sigma = 0;
         if (priors && opt.priors->relativeRotation(i, j, R_prior, prior_sigma)) {
-            // Both estimates: the free one is the fallback and the yardstick,
-            // the fixed-rotation one is what a wrong copy or the camera's own
-            // equipment cannot pass.
+            // 自由估计提供基准和回退，固定旋转先验可排除重复场景或相机自身设备造成的伪匹配。
             std::vector<Vec3> b1(m.size()), b2(m.size());
             for (size_t k = 0; k < m.size(); k++) {
                 b1[k] = bearingOf(i, m[k].idx1);
@@ -648,9 +525,7 @@ inline std::vector<TwoViewMatches> verifyPairs(
                                          g.config == TwoViewConfig::Undefined
                                      ? 0
                                      : g.num_inliers;
-            // A free geometry turned far from the gyro's rotation that the
-            // held estimate cannot reproduce is a match to a place the camera
-            // did not turn towards: the pair is dropped.
+            // 自由几何旋转明显偏离陀螺且固定估计无法重现时，说明匹配指向相机未朝向的位置，丢弃该对。
             double free_deg = -1;
             if (g.has_pose) {
                 const Mat3 D = mul(g.pose.R, transpose(R_prior));
@@ -693,7 +568,7 @@ inline std::vector<TwoViewMatches> verifyPairs(
             }
             TwoViewOptions tvb = tv;
             double f = 0.5 * (bc.cameras[i].focal() + bc.cameras[j].focal());
-            tvb.ransac.max_error = tv.ransac.max_error * sc / std::max(1.0, f);  // px -> rad
+            tvb.ransac.max_error = tv.ransac.max_error * sc / std::max(1.0, f);  // 像素 -> 弧度
             g = estimateTwoViewBearing(b1, b2, tvb);
         } else {
             std::vector<Vec2> q1(m.size()), q2(m.size());
@@ -704,7 +579,7 @@ inline std::vector<TwoViewMatches> verifyPairs(
                 q2[k] = {b.x, b.y};
             }
             TwoViewOptions tvp = tv;
-            tvp.ransac.max_error = tv.ransac.max_error * sc;  // extraction px -> source px
+            tvp.ransac.max_error = tv.ransac.max_error * sc;  // 提取像素 -> 源图像素
             g = estimateTwoView(q1, q2, tvp);
         }
         if (g.config == TwoViewConfig::Degenerate || g.config == TwoViewConfig::Undefined) return 0;
@@ -721,10 +596,7 @@ inline std::vector<TwoViewMatches> verifyPairs(
 
     auto verifyOne = [&](size_t p, std::vector<FeatureMatch>& m) {
         const uint32_t i = pairs[p].first, j = pairs[p].second;
-        // Every pair, kept or not: a screen watching the matrix cannot tell a
-        // pair that failed from one nothing has reached yet unless both are
-        // reported. A no-op without --progress-dir, and called from the
-        // workers, which is what the lock inside it is for.
+        // 成功和失败图像对均报告，使预览能区分验证失败与尚未处理；进度模块内部锁支持工作线程调用。
         const uint32_t inl = verifyBody(p, m, i, j);
         progress::pair(i, j, inl);
         if (inl) {
@@ -737,9 +609,7 @@ inline std::vector<TwoViewMatches> verifyPairs(
                                     &kept[0].idx1, &kept[0].idx2,
                                     sizeof(FeatureMatch), (uint32_t)kept.size());
         } else if (opt.journal) {
-            // A pair that failed is recorded too: without it a resumed run
-            // cannot tell one nothing reached from one already answered, and
-            // the pairs that fail are the expensive half.
+            // 失败对也写入恢复日志，避免下次重复验证，失败对往往更昂贵。
             opt.journal->record(i, j, 0, (uint32_t)m.size(), nullptr, nullptr, 4, 0);
         }
         Event e;
@@ -751,14 +621,11 @@ inline std::vector<TwoViewMatches> verifyPairs(
         events::emit(e);
     };
 
-    // How many pairs to ask the matcher for at once. Independent of the worker
-    // count: it only bounds how far the GPU may run ahead of the verifiers.
+    // 匹配批量独立于工作线程数，只限制 GPU 相对验证器可领先的程度。
     const size_t batch = std::max<size_t>(1, (size_t)opt.match_batch_pairs);
     std::vector<std::vector<FeatureMatch>> batch_out;
 
-    // The stage's fraction, at most a few hundred steps over the whole of it.
-    // Per pair it is a global lock the workers are already contending for, and
-    // a screen cannot show 700k of anything.
+    // 整阶段只报告数百次进度，避免逐对争用全局锁，屏幕也无法展示数十万个独立更新。
     const size_t step = std::max<size_t>(1, pairs.size() / 400);
     const size_t ptotal = opt.progress_total ? opt.progress_total : pairs.size();
     auto tick = [&](size_t p) {
@@ -791,9 +658,7 @@ inline std::vector<TwoViewMatches> verifyPairs(
         bool done_producing = false;
         const size_t max_queued = (size_t)nthreads * std::max(1, opt.queue_depth_per_thread);
 
-        // Any throw -- a worker's, or the matcher's on a lost device -- must reach
-        // the caller only after every worker is joined: unwinding past a
-        // joinable std::thread terminates the process.
+        // 匹配器或工作线程抛异常后必须先汇合所有线程，再向调用方传播，避免 std::thread 析构触发终止。
         std::exception_ptr error;
         std::atomic<bool> failed{false};
         auto fail = [&](std::exception_ptr e) {
@@ -811,12 +676,12 @@ inline std::vector<TwoViewMatches> verifyPairs(
                     {
                         std::unique_lock<std::mutex> lk(mtx);
                         cv_job.wait(lk, [&] { return !queue.empty() || done_producing; });
-                        if (queue.empty()) return;  // drained and the producer is finished
+                        if (queue.empty()) return;  // 队列已清空且生产者已结束
                         job = std::move(queue.front());
                         queue.pop();
                     }
                     cv_space.notify_one();
-                    if (failed) continue;  // keep draining so the producer never blocks
+                    if (failed) continue;  // 继续清空队列，避免生产者阻塞
                     try {
                         verifyOne(job.index, job.matches);
                     } catch (...) {
@@ -856,7 +721,7 @@ inline std::vector<TwoViewMatches> verifyPairs(
         for (std::thread& w : workers) w.join();
         if (error) std::rethrow_exception(error);
     }
-    cancel::check();   // safe now: every worker has been joined
+    cancel::check();   // 所有工作线程已汇合，可以安全传播异常
 
     if (putative_out) *putative_out = putative;
 
@@ -866,4 +731,4 @@ inline std::vector<TwoViewMatches> verifyPairs(
     return out;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

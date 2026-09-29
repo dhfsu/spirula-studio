@@ -1,9 +1,6 @@
 #pragma once
-// IMU pre-integration (Forster et al., "On-manifold preintegration", 2017):
-// the rotation, velocity and position increments between two instants in the
-// IMU frame of the first, with first-order bias Jacobians so a later bias
-// estimate corrects them without touching the samples again. Integration is
-// midpoint-rule over a right-handed sample sequence.
+// IMU 流形预积分，参考 Forster 等（2017）；在首时刻 IMU 坐标系累积旋转、速度与位置，并保存一阶偏置雅可比，后续无需重新积分样本。
+// 对右手系样本采用中点积分。
 
 #include <cmath>
 #include <vector>
@@ -16,10 +13,10 @@ namespace sfm {
 struct ImuSample {
     double t = 0;
     Vec3 w;   // rad/s
-    Vec3 a;   // m/s^2, specific force (gravity included)
+    Vec3 a;   // m/s^2，比力，包含重力
 };
 
-// Continuous-time noise densities. MEMS defaults from the X5 and MAX at rest.
+// 连续时间噪声密度，MEMS 默认值来自静止 X5 与 MAX 的测量。
 struct ImuNoise {
     double gyro = 2e-3;    // rad/s/sqrt(Hz)
     double accel = 2e-2;   // m/s^2/sqrt(Hz)
@@ -39,9 +36,9 @@ inline Mat3 mat3Scale(const Mat3& A, double s) {
 struct Preintegration {
     double dt = 0;
     Mat3 dR = mat3Identity();   // R_i(t0) <- i(t1)
-    Vec3 dv, dp;                // in the IMU frame at t0, gravity included
+    Vec3 dv, dp;                // t0 时刻 IMU 坐标系，包含重力
     Mat3 dR_dbg{}, dv_dbg{}, dv_dba{}, dp_dbg{}, dp_dba{};
-    double var_r = 0, var_v = 0, var_p = 0;   // isotropic, rad^2 m^2/s^2 m^2
+    double var_r = 0, var_v = 0, var_p = 0;   // 各向同性方差，单位依次为 rad^2、m^2/s^2、m^2
     size_t samples = 0;
 
     bool ok() const { return samples >= 2 && dt > 0; }
@@ -54,8 +51,7 @@ struct Preintegration {
     }
 };
 
-// `s` is time-sorted and spans [t0, t1] after the caller's interpolation of
-// the end points; biases are subtracted here.
+// s 已按时间排序，调用方插值端点后覆盖 [t0,t1]；偏置在此扣除。
 inline Preintegration preintegrate(const std::vector<ImuSample>& s, const Vec3& bg,
                                    const Vec3& ba, const ImuNoise& noise) {
     Preintegration P;
@@ -92,11 +88,10 @@ inline Preintegration preintegrate(const std::vector<ImuSample>& s, const Vec3& 
     return P;
 }
 
-// A fused attitude in place of a gyro: `R` at each sample is R_i(t0) <- i(t),
-// so there is no gyro bias and the Jacobians against one stay zero.
+// 用融合姿态替代陀螺积分，每样本 R 为 R_i(t0) <- i(t)，没有陀螺偏置，相应雅可比保持零。
 struct AttitudeSample {
     double t = 0;
-    Vec3 a;   // m/s^2, specific force
+    Vec3 a;   // m/s^2，比力
     Mat3 R = mat3Identity();
 };
 
@@ -127,4 +122,4 @@ inline Preintegration preintegrateAttitude(const std::vector<AttitudeSample>& s,
     return P;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

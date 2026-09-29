@@ -1,7 +1,4 @@
-// GPU SIFT, the brute-force matcher, batch decode and the camera
-// models: the checks that need a device.
-//
-// Prints PASS/FAIL and returns 0/1. See docs/testing.md.
+// 需要设备的 SIFT、暴力匹配、并行解码与相机模型测试，输出 PASS/FAIL。
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -45,7 +42,7 @@ static GrayImage syntheticScene(int w, int h) {
                 float d2 = (x - b.cx) * (x - b.cx) + (y - b.cy) * (y - b.cy);
                 v -= 0.8f * std::exp(-d2 / (2 * b.r * b.r));
             }
-            // a little high-frequency texture so the descriptor has structure
+            // 加入少量高频纹理，使描述子包含结构
             if (x > w * 3 / 4) v += 0.05f * std::sin(x * 0.7f) * std::cos(y * 0.6f);
             img.data[(size_t)y * w + x] = std::min(1.0f, std::max(0.0f, v));
         }
@@ -54,7 +51,7 @@ static GrayImage syntheticScene(int w, int h) {
 
 int cmdSelftest(int argc, char** argv) {
     SiftOptions opt;
-    opt.max_num_features = 0;  // keep all -> fully determined result set
+    opt.max_num_features = 0;  // 保留全部特征以确定完整结果集
     opt.verbose = false;
     for (int i = 0; i < argc; i++) {
         std::string a = argv[i];
@@ -67,11 +64,11 @@ int cmdSelftest(int argc, char** argv) {
 
     int fails = 0;
 
-    // 1) plausibility: found a reasonable number of features
+    // 1）检测数量合理性
     printf("selftest: extracted %u features from 256x256 synthetic scene\n", a.count());
     if (a.count() < 10) { printf("  FAIL: too few features\n"); fails++; }
 
-    // 2) blob localization: each blob center has a keypoint nearby
+    // 2）每个斑点中心附近应有关键点
     struct C { float x, y; };
     std::vector<C> centers = {{64, 64}, {180, 70}, {200, 190}, {128, 128}};
     int hit = 0;
@@ -84,7 +81,7 @@ int cmdSelftest(int argc, char** argv) {
     printf("  blob localization: %d/%zu centers within 4px\n", hit, centers.size());
     if (hit < (int)centers.size() - 1) { printf("  FAIL: blob localization\n"); fails++; }
 
-    // 3) descriptor sanity: unit-ish, quantized, non-degenerate
+    // 3）描述子须合理归一化、量化且非退化
     bool descOk = a.count() > 0;
     for (uint32_t i = 0; i < a.count() && descOk; i++) {
         int nz = 0;
@@ -94,14 +91,12 @@ int cmdSelftest(int argc, char** argv) {
             if (q) nz++;
             ss += (double)q * q;
         }
-        if (nz == 0) descOk = false;  // all-zero descriptor
+        if (nz == 0) descOk = false;  // 全零描述子
     }
     printf("  descriptor sanity: %s\n", descOk ? "ok" : "BAD");
     if (!descOk) fails++;
 
-    // 4) determinism. The extractor now emits a canonical order (D16), so two
-    // runs must agree element-for-element *without* sorting -- keypoints and
-    // descriptors both, since everything downstream keys off feature indices.
+    // 4）确定性：不额外排序，两次关键点与描述子须逐项一致，下游依赖稳定特征索引（D16）。
     FeatureSet b = ext.extract(img);
     bool det = a.count() == b.count() && a.descriptors == b.descriptors;
     for (uint32_t i = 0; det && i < a.count(); i++) {
@@ -116,13 +111,13 @@ int cmdSelftest(int argc, char** argv) {
            det ? "ok" : "BAD", a.count(), b.count());
     if (!det) fails++;
 
-    // 5) GPU top-K by scale: cap keeps the largest-scale features
+    // 5）GPU 尺度 top-K 应保留大尺度特征
     {
         SiftOptions kopt = opt;
         kopt.max_num_features = 200;
         SiftExtractor extK(kopt);
         FeatureSet c = extK.extract(img);
-        // K-th largest scale in the uncapped set; capped set must all clear it.
+        // 截断结果的尺度须不低于完整集合第 K 大尺度。
         std::vector<float> scales;
         for (const Keypoint& k : a.keypoints) scales.push_back(k.scale);
         std::sort(scales.begin(), scales.end(), std::greater<float>());
@@ -130,16 +125,14 @@ int cmdSelftest(int argc, char** argv) {
         bool topk = c.count() <= 200 && c.count() > 0;
         float minKept = 1e9f;
         for (const Keypoint& k : c.keypoints) minKept = std::min(minKept, k.scale);
-        // allow a hair of slack for the histogram bin boundary
+        // 允许直方图桶边界的极小余量
         if (a.count() > 200 && minKept < kth * 0.98f) topk = false;
         printf("  top-K (cap 200): kept %u, min scale %.3f vs 200th-largest %.3f -> %s\n",
                c.count(), minKept, kth, topk ? "ok" : "BAD");
         if (!topk) fails++;
     }
 
-    // 6) features.bin round-trip, including v2 per-keypoint colors. Give `a` a
-    // synthetic color ramp so the color section is exercised (the synthetic
-    // scene is decoded without an image, so it has none of its own).
+    // 6）特征文件往返，含 v2 颜色；为合成特征添加颜色渐变以覆盖颜色段。
     FeatureSet ac = a;
     ac.colors.resize((size_t)ac.count() * 3);
     for (uint32_t i = 0; i < ac.count(); i++) {
@@ -147,9 +140,9 @@ int cmdSelftest(int argc, char** argv) {
         ac.colors[3 * i + 1] = (uint8_t)((i * 3) & 0xff);
         ac.colors[3 * i + 2] = (uint8_t)((i * 7) & 0xff);
     }
-    ac.exif_focal = 3637.05;                    // the v3 section (D46)
+    ac.exif_focal = 3637.05;                    // v3 EXIF 附加段（D46）
     ac.exif_camera = "Canon-EOS 5D-24.000000-5616x3744";
-    ac.extract_width = ac.width / 2;            // the v4 section (D47)
+    ac.extract_width = ac.width / 2;            // v4 提取尺度附加段（D47）
     ac.extract_height = ac.height / 2;
     std::string tmp = "/tmp/spirula_sfm_selftest_features.bin";
     writeFeatures(tmp, ac);
@@ -164,8 +157,7 @@ int cmdSelftest(int argc, char** argv) {
     printf("  features.bin round-trip (+colors): %s\n", rt ? "ok" : "BAD");
     if (!rt) fails++;
 
-    // 6b) color sampling: a keypoint over a known solid-color region reads back
-    // that color. Build a 3-channel image and sample it through sampleColor.
+    // 6b）已知纯色区域的关键点采样应返回该颜色。
     {
         GrayImage ci;
         ci.width = 8; ci.height = 8;
@@ -175,23 +167,16 @@ int cmdSelftest(int argc, char** argv) {
         uint8_t c[3];
         sampleColor(ci, 3.5f, 4.5f, c);
         bool cok = c[0] == 10 && c[1] == 200 && c[2] == 90;
-        // out-of-range clamps to the border, still the solid color
+        // 越界钳位到边缘，仍为同一纯色
         sampleColor(ci, -5.0f, 100.0f, c);
         cok = cok && c[0] == 10 && c[1] == 200 && c[2] == 90;
         printf("  color sampling: %s\n", cok ? "ok" : "BAD");
         if (!cok) fails++;
     }
 
-    // 6d) keypoints come back in the *source* image's coordinates even when the
-    // extractor worked on a downscaled copy (D46). The synthetic scene's blob
-    // centers are absolute ground truth, so this checks the convention against
-    // something other than itself: extract at half resolution, scale back, and
-    // the keypoints must land on the same blobs as the full-resolution run.
+    // 6d）缩小图提取后恢复源坐标，关键点应对应与全分辨率相同的真值斑点（D46）。
     {
-        // The "source" image is the 256 px scene at 2x, so every blob center is
-        // at exactly twice its known coordinates; the loader hands SIFT the
-        // 256 px version, which is where blob localization is already verified
-        // above. Scaling that result back must put it on the 2x centers.
+        // 源图为 256 px 场景的两倍，加载器使用原 256 px 工作图，恢复坐标应落到双倍斑点中心。
         GrayImage half = syntheticScene(256, 256);
         FeatureSet hf = ext.extract(half);
         scaleKeypoints(hf, 512, 512);
@@ -202,17 +187,14 @@ int cmdSelftest(int argc, char** argv) {
                 best = std::min(best, (double)std::hypot(k.x - 2 * c.x, k.y - 2 * c.y));
             worst = std::max(worst, best);
         }
-        // 4 px at 256 is the tolerance the localization check above uses; twice
-        // that here. A wrong convention is off by a factor of two or by half
-        // the image, not by pixels.
+        // 工作图允许 4 px 定位误差，源图相应加倍；错误坐标约定会造成倍率或半图级误差。
         bool sok = hf.width == 512 && hf.height == 512 && worst < 8.0;
         printf("  keypoints scaled to source resolution: %dx%d, blob error %.2f px -> %s\n",
                hf.width, hf.height, worst, sok ? "ok" : "BAD");
         if (!sok) fails++;
     }
 
-    // 6e) EXIF (D46): a hand-built TIFF block exercises both focal rules, and
-    // the identity string is what --exif-groups groups on.
+    // 6e）手工 TIFF 覆盖两种 EXIF 焦距规则及相机身份分组（D46）。
     {
         std::vector<uint8_t> t;
         auto pu16 = [&](uint16_t v) { t.push_back(v & 0xff); t.push_back((uint8_t)(v >> 8)); };
@@ -227,15 +209,15 @@ int cmdSelftest(int argc, char** argv) {
         pu16(42);
         pu32(8);
         pu16(3);                              // IFD0
-        entry(0x010F, 2, 6, kMake);           // Make
-        entry(0x0110, 2, 8, kModel);          // Model
-        entry(0x8769, 4, 1, kExif);           // Exif sub-IFD
+        entry(0x010F, 2, 6, kMake);           // 制造商标签
+        entry(0x0110, 2, 8, kModel);          // 相机型号标签
+        entry(0x8769, 4, 1, kExif);           // EXIF 子 IFD 指针
         pu32(0);
-        pu16(4);                              // Exif IFD
-        entry(0x920A, 5, 1, kFocal);          // FocalLength = 24 mm
-        entry(0xA20E, 5, 1, kRes);            // FocalPlaneXResolution
-        entry(0xA210, 3, 1, 2);               // ...in inches
-        entry(0xA002, 4, 1, 5616);            // PixelXDimension
+        pu16(4);                              // EXIF IFD
+        entry(0x920A, 5, 1, kFocal);          // FocalLength=24 mm
+        entry(0xA20E, 5, 1, kRes);            // 焦平面横向分辨率标签
+        entry(0xA210, 3, 1, 2);               // 分辨率单位为英寸
+        entry(0xA002, 4, 1, 5616);            // 像素宽度标签
         pu32(0);
         const char* mk = "Canon\0";
         const char* md = "EOS 5D\0";
@@ -244,30 +226,26 @@ int cmdSelftest(int argc, char** argv) {
         t.insert(t.end(), md, md + 7);
         t.resize(kFocal, 0);
         pu32(24); pu32(1);                    // 24/1 mm
-        pu32(38492117u); pu32(10000u);        // 3849.2118 px/inch
+        pu32(38492117u); pu32(10000u);        // 3849.2118 像素/英寸
         ExifData e = parseExifTiff(t.data(), t.size());
-        // 24 mm at 3849.2118 px/inch = 151.5437 px/mm -> 3637.0 px.
+        // 24 mm × 3849.2118 像素/英寸 = 24 × 151.5437 像素/毫米，焦距约 3637.0 px。
         double f = exifFocalPx(e, 5616, 3744);
         bool eok = e.valid && e.make == "Canon" && e.model == "EOS 5D" &&
                    std::fabs(e.focal_mm - 24.0) < 1e-9 && std::fabs(f - 3637.05) < 1.0;
-        // A file resized after capture keeps its EXIF: the resolution is
-        // rescaled by the dimension ratio, so the focal follows the pixels.
+        // 缩放后的文件保留 EXIF 时，按实际尺寸比例修正焦平面分辨率，使像素焦距同步缩放。
         eok = eok && std::fabs(exifFocalPx(e, 2808, 1872) - 0.5 * f) < 1.0;
-        // Rule 1 (35 mm equivalent) wins when present.
+        // 存在等效 35 mm 焦距时优先采用规则 1。
         ExifData e35 = e;
         e35.focal_35mm = 24;
         double f35 = exifFocalPx(e35, 5616, 3744);
         eok = eok && std::fabs(f35 - 24.0 / 43.27 * std::hypot(5616.0, 3744.0)) < 1e-6;
-        // The identity is the camera body and the frame size; the focal is
-        // compared with a tolerance instead of by string equality (D48).
+        // 身份只含机身和尺寸，焦距按容差而非字符串精确相等判断（D48）。
         std::string key = exifCameraKey(e, 5616, 3744);
         eok = eok && key == "Canon-EOS 5D-5616x3744";
         ExifData e25 = e;
         e25.focal_mm = 25;
         eok = eok && exifCameraKey(e25, 5616, 3744) == key;
-        // EXIF's whole-millimetre quantization (24 vs 25 mm, 4% apart) is one
-        // lens setting; a real zoom range is many. No image without a focal may
-        // ever land in a measured cluster.
+        // 24/25 mm 的约 4% 量化差应视为同一设置，真实变焦另分组，无焦距图像不能进入测量簇。
         {
             std::vector<double> f = {3637, 3800, 0, 5391, 5500, 59903, 0, 3700};
             std::vector<int> lab = detail::exifFocalClusters(f, 0.10);
@@ -275,11 +253,11 @@ int cmdSelftest(int argc, char** argv) {
                   lab[3] == lab[4] &&                              // 5391/5500
                   lab[0] != lab[3] && lab[3] != lab[5] &&
                   lab[2] == -1 && lab[6] == -1;
-            // A tolerance under the quantization step splits the fixed lens.
+            // 容差低于量化步长时会错误拆分固定镜头。
             std::vector<int> tight = detail::exifFocalClusters(f, 0.01);
             eok = eok && tight[0] != tight[1];
         }
-        // Truncation must not read past the buffer or invent a focal.
+        // 截断输入不能越界或凭空生成焦距。
         for (size_t cut = 1; cut < t.size(); cut += 7) {
             ExifData tr = parseExifTiff(t.data(), cut);
             double ft = exifFocalPx(tr, 5616, 3744);
@@ -290,8 +268,7 @@ int cmdSelftest(int argc, char** argv) {
         if (!eok) fails++;
     }
 
-    // 6f) camera grouping (D46): --camera-mode splits, and a PREFIX=VALUE
-    // override splits further and marks that group's focal as a prior.
+    // 6f）camera-mode 基础分组后，PREFIX=VALUE 应进一步拆分并标记组焦距先验（D46）。
     {
         std::vector<ImageEntry> imgs = {{"cam/0", 0},  {"cam/1", 0},  {"cam0/0", 0},
                                         {"cam0/1", 0}, {"cam1/0", 0}, {"cam1/1", 0}};
@@ -300,7 +277,7 @@ int cmdSelftest(int argc, char** argv) {
             fsv[i].width = i < 2 ? 720 : 960;
             fsv[i].height = i < 2 ? 540 : 960;
         }
-        fsv[0].exif_focal = fsv[1].exif_focal = 700;  // only the pinhole has EXIF
+        fsv[0].exif_focal = fsv[1].exif_focal = 700;  // 仅针孔图像包含 EXIF
         CameraSetupOptions so;
         so.mode = CameraMode::Folder;
         so.model = CamModel::OpenCV;
@@ -314,16 +291,14 @@ int cmdSelftest(int argc, char** argv) {
         const Camera& f0 = cs.cameras.at(cs.ids[2]);
         const Camera& f1 = cs.cameras.at(cs.ids[4]);
         gok = gok && pin.model == CamModel::OpenCV && f0.isFisheye() && f1.isFisheye();
-        gok = gok && std::fabs(pin.focal() - 700) < 1e-9 &&      // EXIF
-                     std::fabs(f0.focal() - 520) < 1e-9;         // explicit
-        // cam1 was given a model but no focal: the geometric fisheye guess.
+        gok = gok && std::fabs(pin.focal() - 700) < 1e-9 &&      // EXIF 来源
+                     std::fabs(f0.focal() - 520) < 1e-9;         // 显式焦距
+        // cam1 仅指定模型，焦距仍采用鱼眼几何猜测。
         gok = gok && std::fabs(f1.focal() - std::hypot(960.0, 960.0) / M_PI) < 1e-6;
         gok = gok && cs.focal_known.count(cs.ids[0]) && cs.focal_known.count(cs.ids[2]) &&
               !cs.focal_known.count(cs.ids[4]);
         gok = gok && cs.mixed() && cs.anyWide();
-        // --distortion, dataset-wide and per group, in each model's own BA
-        // order: k1,k2,p1,p2 for opencv and k1,k2,p1,p2,k3,k4,sx1,sy1 for the
-        // thin prism, so the same list means different fields per group (D72).
+        // 全局和组畸变列表按各模型 BA 顺序解释，opencv 为 k1,k2,p1,p2，薄棱镜还含 k3,k4,sx1,sy1（D72）。
         CameraSetupOptions sod = so;
         parseDistortion("-0.11,0.02,0.001,-0.002", sod.extra);
         parseCameraOverride("cam1=-0.4,0.09,0,0,0.01", OverrideKind::Distortion, sod.overrides);
@@ -334,19 +309,17 @@ int cmdSelftest(int argc, char** argv) {
               dpin.p2 == -0.002 && dpin.k3 == 0;
         gok = gok && dfar.k1 == -0.4 && dfar.k2 == 0.09 && dfar.p1 == 0 && dfar.p2 == 0 &&
               dfar.k3 == 0.01 && dfar.k4 == 0 && dfar.sx1 == 0 && dfar.sy1 == 0;
-        // A trailing comma, a stray token, an empty list: all malformed.
+        // 尾逗号、杂字符和空列表均须拒绝。
         std::vector<double> junk;
         gok = gok && !parseDistortion("0.1,", junk) && !parseDistortion("0.1,x", junk) &&
               !parseDistortion("", junk);
-        // --no-exif-focal leaves the pinhole at COLMAP's 1.2*max(w,h) guess.
+        // 禁用 EXIF 焦距后，针孔使用 1.2*max(w,h) 猜测。
         CameraSetupOptions so2 = so;
         so2.exif_focal = false;
         CameraSetup cs2 = buildCameras(imgs, fsv, so2);
         gok = gok && std::fabs(cs2.cameras.at(cs2.ids[0]).focal() - 1.2 * 720) < 1e-9 &&
               !cs2.focal_known.count(cs2.ids[0]);
-        // EXIF grouping (D48), on by default: two images that would share a
-        // group split when their EXIF focals are a zoom apart, and do not when
-        // they differ only by EXIF's millimetre rounding.
+        // 默认 EXIF 分组应区分真实变焦，容忍整毫米舍入差（D48）。
         {
             std::vector<ImageEntry> zi = {{"a", 0}, {"b", 0}, {"c", 0}};
             std::vector<FeatureSet> zf(3);
@@ -355,9 +328,9 @@ int cmdSelftest(int argc, char** argv) {
                 f.height = 5184;
                 f.exif_camera = "Panasonic-DC-G9-3888x5184";
             }
-            zf[0].exif_focal = 14976;   // 50 mm
-            zf[1].exif_focal = 15300;   // same setting, rounded differently
-            zf[2].exif_focal = 59903;   // 200 mm
+            zf[0].exif_focal = 14976;   // 50 mm 焦距
+            zf[1].exif_focal = 15300;   // 相同镜头设置的不同舍入记录
+            zf[2].exif_focal = 59903;   // 200 mm 焦距
             CameraSetupOptions zo;
             zo.mode = CameraMode::Folder;
             CameraSetup zs = buildCameras(zi, zf, zo);
@@ -366,10 +339,7 @@ int cmdSelftest(int argc, char** argv) {
             zo.exif_groups = false;
             gok = gok && buildCameras(zi, zf, zo).count() == 1;
         }
-        // Photo-collection detection (D48): many distinct frame sizes relative
-        // to the image count means per-image intrinsics, and --camera-mode pins
-        // it either way. The 2% bucket has to absorb a preprocessed capture's
-        // jitter, and neither floor may fire on a small single-camera set.
+        // 不同尺寸占比高时识别为照片集合，显式 camera-mode 则固定模式；2% 桶须吸收预处理抖动，少量单相机集不能误触发。
         {
             auto make = [](const std::vector<std::pair<int, int>>& dims) {
                 std::vector<FeatureSet> v(dims.size());
@@ -382,12 +352,9 @@ int cmdSelftest(int argc, char** argv) {
             std::vector<std::pair<int, int>> capture, jittered, collection, tiny;
             for (int i = 0; i < 60; i++) {
                 capture.push_back({4032, 3024});
-                // +-1% per image: one physical camera, sizes touched by a
-                // preprocessing step.
+                // 每图 ±1% 尺寸变化，模拟同一相机的预处理裁剪。
                 jittered.push_back({4032 + (i % 5) * 8, 3024 + (i % 5) * 6});
-                // 5% apart *relatively*, so the 2% bucket separates all 60 at
-                // every size (an additive step would start merging once 2% of
-                // the width overtook it).
+                // 按相对 5% 递增尺寸，使 2% 桶在各尺度都能分开六十组。
                 collection.push_back({(int)(700 * std::pow(1.05, i)),
                                       (int)(500 * std::pow(1.05, i))});
             }
@@ -396,16 +363,16 @@ int cmdSelftest(int argc, char** argv) {
             gok = gok && !looksLikePhotoCollection(make(capture), &nb) && nb == 1;
             gok = gok && !looksLikePhotoCollection(make(jittered), &nb) && nb == 1;
             gok = gok && looksLikePhotoCollection(make(collection), &nb) && nb == 60;
-            gok = gok && !looksLikePhotoCollection(make(tiny), &nb);  // too few images
+            gok = gok && !looksLikePhotoCollection(make(tiny), &nb);  // 图像数量不足
             std::vector<ImageEntry> ci(60, {"x", 0});
             for (int i = 0; i < 60; i++) ci[i].name = "img" + std::to_string(i);
             CameraSetupOptions co;
             CameraSetup ccs = buildCameras(ci, make(collection), co);
             gok = gok && ccs.mode_switched && ccs.mode_used == CameraMode::Image &&
                   ccs.count() == 60;
-            co.mode_explicit = true;   // --camera-mode folder was given
+            co.mode_explicit = true;   // 显式指定 camera-mode=folder
             CameraSetup pcs = buildCameras(ci, make(collection), co);
-            gok = gok && !pcs.mode_switched && pcs.count() == 60;  // 60 resolutions anyway
+            gok = gok && !pcs.mode_switched && pcs.count() == 60;  // 仍有六十种尺寸
             CameraSetup kcs = buildCameras(std::vector<ImageEntry>(60, {"y", 0}),
                                            make(jittered), CameraSetupOptions{});
             gok = gok && !kcs.mode_switched && kcs.count() == 1;
@@ -415,8 +382,7 @@ int cmdSelftest(int argc, char** argv) {
         if (!gok) fails++;
     }
 
-    // 6c) camera models (D29): project/unproject are inverses, and RADIAL+OPENCV
-    // survive a COLMAP cameras.bin round-trip with the right model ids/params.
+    // 6c）投影与反投影互逆，RADIAL/OPENCV 的 COLMAP 读写保留模型 ID 和参数（D29）。
     {
         Camera cam;
         cam.model = CamModel::OpenCV;
@@ -436,8 +402,7 @@ int cmdSelftest(int argc, char** argv) {
                projok ? "ok" : "BAD");
         if (!projok) fails++;
 
-        // FULL_OPENCV adds the rational denominator (k4,k5,k6); the fixed-point
-        // undistortion must invert that form too.
+        // FULL_OPENCV 的有理分母也须被固定点去畸变正确反解。
         {
             Camera fc = cam;
             fc.model = CamModel::FullOpenCV;
@@ -456,24 +421,20 @@ int cmdSelftest(int argc, char** argv) {
             if (!rok) fails++;
         }
 
-        // Both fisheye models: project(ray) then bearing() must recover the ray,
-        // INCLUDING rays past 90 deg (z<0), which the pinhole family cannot
-        // represent -- the whole point of D31's bearings + D29-C/D34.
+        // 两类鱼眼的 project->bearing 须恢复包括 z<0 的超过 90 度视线。
         {
             Camera feKB;
             feKB.model = CamModel::OpenCVFisheye;
             feKB.width = feKB.height = 1920; feKB.fx = feKB.fy = 560; feKB.cx = feKB.cy = 960;
-            // Positive coefficients keep theta_d(theta) strictly increasing, so
-            // the lens is invertible across the whole FOV (a real >180 deg lens
-            // is monotonic within its design FOV; arbitrary-sign coeffs can fold).
+            // 正径向系数保持 theta_d(theta) 严格单调，使全视场可逆；任意符号系数可能产生折返。
             feKB.k1 = 0.05; feKB.k2 = 0.01; feKB.k3 = 0.002; feKB.k4 = 0.0005;
             Camera feTP = feKB;
-            feTP.model = CamModel::ThinPrismFisheye;   // + tangential + prism
+            feTP.model = CamModel::ThinPrismFisheye;   // 加切向与薄棱镜项
             feTP.p1 = 0.001; feTP.p2 = -0.0008; feTP.sx1 = 0.002; feTP.sy1 = -0.0015;
             for (auto* pcam : {&feKB, &feTP}) {
                 double maxAng = 0;
                 int wide = 0;
-                for (double th = 5; th <= 130; th += 5)    // up to 130 deg -> >180 FOV
+                for (double th = 5; th <= 130; th += 5)    // 离轴至 130 度，覆盖大于 180 度视场
                     for (double phi = 0; phi < 360; phi += 45) {
                         double t = th * M_PI / 180, ph2 = phi * M_PI / 180;
                         Vec3 ray = {std::sin(t)*std::cos(ph2), std::sin(t)*std::sin(ph2), std::cos(t)};
@@ -491,12 +452,7 @@ int cmdSelftest(int argc, char** argv) {
             }
         }
 
-        // Equirectangular (D49): every direction on the sphere must survive
-        // project -> bearing, including straight back (theta = 180 deg), which
-        // no perspective model can even represent. And the projection must be
-        // COLMAP's EQUIRECTANGULAR to the pixel: x = (theta/2pi + 1/2) w,
-        // y = (1/2 - phi/pi) h, with theta from +z toward +x and phi the
-        // elevation above the equator (-y is up).
+        // 等距柱状投影覆盖整球及正后方，像素公式为 x=(theta/2pi+1/2)w，y=(1/2-phi/pi)h，角度约定与 COLMAP 一致（D49）。
         {
             const int W = 5760, H = 2880;
             Camera eq = Camera::defaultFor(8, W, H, 0, CamModel::Equirect);
@@ -513,20 +469,16 @@ int cmdSelftest(int argc, char** argv) {
                     maxAng = std::max(maxAng,
                                       std::acos(std::max(-1.0, std::min(1.0, b.dot(ray)))) *
                                           180.0 / M_PI);
-                    // COLMAP's formula, written out independently
+                    // 独立展开 COLMAP 投影公式作为参考
                     double az = std::atan2(ray.x, ray.z);
                     double el = std::atan2(-ray.y, std::hypot(ray.x, ray.z));
                     Vec2 ref = {(az / (2 * M_PI) + 0.5) * W, (0.5 - el / M_PI) * H};
                     maxPx = std::max(maxPx, std::hypot(px.x - ref.x, px.y - ref.y));
                 }
-            // Wrap-around: a pixel column past the right edge is the same ray as
-            // the matching column past the left, so the model is seamless.
+            // 横向周期回绕后必须为同一射线，保证全景接缝连续。
             Vec3 l = eq.bearing({-3.0, H * 0.5}), r = eq.bearing({W - 3.0, H * 0.5});
             double seam = std::acos(std::max(-1.0, std::min(1.0, l.dot(r)))) * 180.0 / M_PI;
-            // The angle floor is acos's, not the model's: acos(1-eps) ~ sqrt(2
-            // eps), so a bit-exact round-trip still reads ~1e-6 deg in double.
-            // The pixel comparison against COLMAP's formula has no such loss and
-            // is held to 1e-9.
+            // acos(1-eps)≈sqrt(2eps) 使双精度角误差底约 1e-6 度，像素公式比较无此损失，要求 1e-9。
             bool eqok = maxAng < 1e-4 && maxPx < 1e-9 && back > 0 && std::fabs(seam) < 1e-9;
             printf("  equirect project/bearing round-trip (full sphere, %d behind): "
                    "%.2e deg, vs COLMAP %.2e px, seam %.2e deg -> %s\n",
@@ -534,9 +486,7 @@ int cmdSelftest(int argc, char** argv) {
             if (!eqok) fails++;
         }
 
-        // COLMAP round-trip for all four models: each camera's fields must
-        // survive write->read (model id + every parameter). Also exercises the
-        // centralized pack/unpack (D30).
+        // 全部模型的 COLMAP 读写保留 ID 和各参数，同时验证统一打包实现（D30）。
         Reconstruction rc;
         Camera sp = Camera::defaultFor(1, 800, 600, 700.0, CamModel::SimplePinhole);
         Camera ph = Camera::defaultFor(2, 1024, 768, 900.0, CamModel::Pinhole);
@@ -585,10 +535,7 @@ int cmdSelftest(int argc, char** argv) {
         printf("  COLMAP camera IO round-trip (all 8 models): %s\n", iook ? "ok" : "BAD");
         if (!iook) fails++;
 
-        // The *BA* layout is a different permutation (principal point last, so
-        // holding it is a prefix -- D50), and only bundle adjustment exercises
-        // it. Round-trip every model through it, and check that the two params
-        // BA holds really are the trailing ones.
+        // BA 布局将主点移到尾部，各模型单独往返，并检查固定参数确实为末尾两项（D50）。
         {
             bool ba_ok = true;
             for (const auto& kv : rc.cameras) {
@@ -608,9 +555,9 @@ int cmdSelftest(int argc, char** argv) {
                 const int n = camNumParams(c.model);
                 const int nf = camNumFreeParams(c.model);
                 if (c.model == CamModel::Equirect) {
-                    if (nf != 0) ba_ok = false;          // nothing to refine at all
+                    if (nf != 0) ba_ok = false;          // 没有任何可优化参数
                 } else {
-                    if (nf != n - 2) ba_ok = false;      // ... everything but (cx,cy)
+                    if (nf != n - 2) ba_ok = false;      // 除 cx/cy 外均可优化
                     if (!(eq(d[n - 2], c.cx) && eq(d[n - 1], c.cy))) ba_ok = false;
                 }
             }
@@ -619,8 +566,7 @@ int cmdSelftest(int argc, char** argv) {
             if (!ba_ok) fails++;
         }
 
-        // FULL_OPENCV must be emitted as COLMAP model 6 with all 12 params in
-        // COLMAP's order (fx,fy,cx,cy,k1,k2,p1,p2,k3,k4,k5,k6).
+        // FULL_OPENCV 必须写为模型 6，十二参数顺序为 fx,fy,cx,cy,k1,k2,p1,p2,k3,k4,k5,k6。
         {
             std::ifstream cf(cdir + "/cameras.bin", std::ios::binary);
             bool full_ok = false, eq_ok = false;
@@ -637,7 +583,7 @@ int cmdSelftest(int argc, char** argv) {
                     full_ok = np == 12 && ps[4] == -0.11 && ps[5] == 0.02 && ps[6] == 0.001 &&
                               ps[7] == -0.0005 && ps[8] == 0.004 && ps[9] == 0.021 &&
                               ps[10] == -0.003 && ps[11] == 0.0006;
-                if (mdl == 17)  // EQUIRECTANGULAR: params are exactly (w, h)
+                if (mdl == 17)  // EQUIRECTANGULAR 参数严格为 (w,h)
                     eq_ok = np == 2 && ps[0] == (double)cw && ps[1] == (double)ch &&
                             cw == 5760 && ch == 2880;
             }
@@ -648,9 +594,7 @@ int cmdSelftest(int argc, char** argv) {
         }
     }
 
-    // 7b) The matcher at 256-D. Synthetic float descriptors, because the two
-    // widths are separate SPIR-V blobs and only the 128 one is on any other
-    // path here; the reference is the same distance computed on the host.
+    // 7b）256 维浮点描述子匹配，单独覆盖该宽度 SPIR-V，主机用相同距离作为参考。
     {
         auto make = [](uint32_t n, uint32_t seed) {
             FeatureSet f;
@@ -673,16 +617,14 @@ int cmdSelftest(int argc, char** argv) {
                     d[(size_t)i * 256 + c] = v;
                     sq += (double)v * v;
                 }
-                // Unit norm, as the matcher's cosine threshold assumes.
+                // 余弦阈值要求单位范数。
                 const float inv = (float)(1.0 / std::sqrt(sq));
                 for (int c = 0; c < 256; c++) d[(size_t)i * 256 + c] *= inv;
             }
             return f;
         };
         FeatureSet fa = make(300, 12345u);
-        // B is A perturbed, not independent noise: 256 random unit vectors are
-        // all nearly orthogonal, so an independent B produces a handful of
-        // matches and exercises almost none of the reduction.
+        // B 为 A 的扰动而非独立噪声，避免高维随机向量近正交导致几乎无匹配，无法充分测试归约。
         FeatureSet fb = fa;
         fb.keypoints.resize(280);
         fb.descriptors.resize((size_t)280 * 256 * sizeof(float));
@@ -710,8 +652,7 @@ int cmdSelftest(int argc, char** argv) {
         BruteForceMatcher m256(mo);
         const std::vector<FeatureMatch> gm = m256.match(fa, fb);
 
-        // Host reference over the SAME quantization the uploader applies, so
-        // this checks the kernel and not the rounding.
+        // 主机参考使用上传器相同量化，隔离内核逻辑与舍入差异。
         auto quant = [](float v) {
             const float q = v * (127.0f / 0.4f) + 128.0f;
             return (int)std::lround(std::min(255.0f, std::max(0.0f, q)));
@@ -759,7 +700,7 @@ int cmdSelftest(int argc, char** argv) {
         if (!ok) fails++;
     }
 
-    // 7) brute-force matcher: self-match should be (near-)identity with dist 0
+    // 7）自匹配应近似恒等且距离为零
     {
         MatchOptions mo;
         mo.device = opt.device;
@@ -779,12 +720,11 @@ int cmdSelftest(int argc, char** argv) {
                100.0f * frac, mok ? "ok" : "BAD");
         if (!mok) fails++;
 
-        // matches.bin round-trip
+        // 匹配文件读写往返
         MatchesDatabase db;
         db.images = {{"a", a.count()}, {"a", a.count()}};
         db.pairs = {{0, 1, 0, ms}};
-        // The camera setup verification used travels with the matches (D47),
-        // including the measurement scale, which cameras.bin cannot carry.
+        // 匹配数据库须保存验证使用的相机配置及 cameras.bin 不保存的测量尺度（D47）。
         Camera vc = Camera::defaultFor(1, 4000, 3000, 2600, CamModel::OpenCVFisheye);
         vc.pixel_scale = 1.6;
         vc.k1 = -0.03;
@@ -813,8 +753,7 @@ int cmdSelftest(int argc, char** argv) {
         printf("  matches.bin round-trip (+verification cameras): %s\n", mrt ? "ok" : "BAD");
         if (!mrt) fails++;
 
-        // The thresholds those cameras convert (D47): a pixel threshold is
-        // given in extraction pixels and lands in the camera's own.
+        // 验证提取像素阈值正确换算到相机源像素（D47）。
         {
             FeatureSet fs;
             fs.width = 4000; fs.height = 3000;
@@ -824,11 +763,11 @@ int cmdSelftest(int argc, char** argv) {
             c.pixel_scale = fs.pixelScale();
             tok = tok && std::fabs(c.errPx(4.0) - 6.4) < 1e-12 &&
                   std::fabs(c.errRad(4.0) - 6.4 / 2600) < 1e-15;
-            // A camera the extractor did not downscale is unaffected.
+            // 未缩小的图像不受换算影响。
             Camera c1 = c;
             c1.pixel_scale = 1.0;
             tok = tok && std::fabs(c1.errPx(4.0) - 4.0) < 1e-12;
-            // ... and buildCameras picks the scale up from the features.
+            // buildCameras 须从特征恢复该尺度。
             std::vector<ImageEntry> ie = {{"a/0", 0}, {"a/1", 0}};
             std::vector<FeatureSet> fv = {fs, fs};
             CameraSetup bcs = buildCameras(ie, fv, CameraSetupOptions{});
@@ -839,9 +778,7 @@ int cmdSelftest(int argc, char** argv) {
             if (!tok) fails++;
         }
 
-        // 8) parallel verification must not change the result. Six copies of the
-        // same feature set give 15 pairs of real RANSAC work to spread over the
-        // pool; serial and parallel output must agree pair-for-pair.
+        // 8）六份同特征产生十五对真实验证任务，串行与并行结果须逐对相同。
         std::vector<FeatureSet> vf(6, a);
         auto vpairs = generatePairs((uint32_t)vf.size(), PairMode::Exhaustive);
         auto vmatch = [&](size_t b, size_t e, std::vector<std::vector<FeatureMatch>>& mo) {
@@ -868,10 +805,7 @@ int cmdSelftest(int argc, char** argv) {
         if (!vok) fails++;
     }
 
-    // 8b) GPU pair selection (pair_selection.hpp): two disjoint groups of
-    // duplicate images must select exactly the within-group pairs -- identical
-    // random descriptors score ~K, unrelated random descriptors die on the
-    // ratio test + cross-check -- and the selection must be deterministic.
+    // 8b）GPU 图像对筛选对两组互不相关的重复图像仅保留组内边，结果须确定。
     {
         std::mt19937 rng(1234);
         auto randomSet = [&](uint32_t count) {
@@ -891,7 +825,7 @@ int cmdSelftest(int argc, char** argv) {
         std::vector<FeatureSet> pf = {r1, r1, r2, r2, r1};
         PairSelectionOptions po;
         po.device = opt.device;
-        po.num_features = 256;  // exercises the top-scale gather (512 -> 256)
+        po.num_features = 256;  // 覆盖按尺度从 512 收集到 256 特征
         po.num_neighbors = 4;
         auto sel = prefilterPairs(pf, po);
         auto sel2 = prefilterPairs(pf, po);
@@ -903,10 +837,9 @@ int cmdSelftest(int argc, char** argv) {
         if (!pok) fails++;
     }
 
-    // 9) parallel image decode: in-order delivery, right content, bounded window.
+    // 9）并行解码须按序交付、内容正确且窗口有界。
     {
-        // Tiny PGMs (stb reads P5) whose single row encodes the image index, so
-        // delivery order and content are both checkable without a PNG writer.
+        // 用单行编码图像索引的微型 PGM，直接验证交付顺序和内容，无需 PNG 写入器。
         fs::path dir = fs::temp_directory_path() / "spirula_sfm_selftest_imgs";
         fs::remove_all(dir);
         fs::create_directories(dir);
@@ -914,7 +847,7 @@ int cmdSelftest(int argc, char** argv) {
         std::vector<std::string> paths;
         std::vector<std::pair<int, int>> dims;
         for (int i = 0; i < N; i++) {
-            // Decreasing width, so index order is also largest-first.
+            // 宽度递减，使索引顺序同时为最大图优先。
             int w = 64 - i, h = 4;
             char buf[64];
             snprintf(buf, sizeof buf, "img%03d.pgm", i);
@@ -928,9 +861,9 @@ int cmdSelftest(int argc, char** argv) {
             dims.emplace_back(w, h);
         }
         ImageLoadOptions lo;
-        lo.max_image_size = 0;  // no downscale; keep the check about ordering
+        lo.max_image_size = 0;  // 不缩放，仅测试顺序
         lo.num_threads = 8;
-        lo.memory_budget_bytes = 1 << 20;  // deliberately tiny
+        lo.memory_budget_bytes = 1 << 20;  // 刻意使用很小预算
         ImageLoadPlan pl = planImageLoad(dims, lo);
         std::vector<size_t> seen;
         bool content_ok = true;
@@ -950,7 +883,7 @@ int cmdSelftest(int argc, char** argv) {
                (order_ok && content_ok && plan_ok) ? "ok" : "BAD");
         if (!order_ok || !content_ok || !plan_ok) fails++;
 
-        // A missing file must be reported and skipped, not abort the batch.
+        // 缺文件应报告并跳过，不能终止整批。
         std::vector<std::string> withBad = paths;
         withBad.insert(withBad.begin() + 5, (dir / "does_not_exist.pgm").string());
         size_t errs = 0, got = 0;
@@ -962,9 +895,7 @@ int cmdSelftest(int argc, char** argv) {
                skip_ok ? "ok" : "BAD");
         if (!skip_ok) fails++;
 
-        // A consumer that throws has to reach the caller. Unwinding past the
-        // still-joinable decode threads instead calls terminate, which on MSVC
-        // exits 0xC0000409 with the real error never printed.
+        // 消费者异常须在线程全部汇合后传播，避免析构可 join 线程导致 MSVC 直接以 0xC0000409 退出而丢失错误。
         bool threw = false;
         ImageLoadPlan pl3 = planImageLoad(dims, lo);
         try {

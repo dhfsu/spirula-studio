@@ -1,20 +1,8 @@
 #pragma once
 
-// What a reconstruction says while it runs.
-//
-// `spirula sfm` is a subcommand of this program, not a foreign tool, so its
-// output is ours to write and ours to translate -- see src/sfm/core/Log.h for
-// the mechanism (a localized, equal-width [tag] in front of every line) and
-// for what deliberately stays English.
-//
-// Conventions, on top of the two in src/i18n/README.md:
-//   * Numbers, paths, file names, camera-model names and flag spellings are
-//     ARGUMENTS, never part of the translated text. A flag is an identifier;
-//     `--max-image-size` is the same in every language.
-//   * Count labels, not counted nouns ("Images: 5", not "5 images"), so no
-//     language needs a plural rule for a progress line.
-//   * The tags are what the log's left column is made of, so keep every one of
-//     them SHORT -- the column is as wide as the widest tag in the language.
+// 重建运行日志文案，标签机制见 src/sfm/core/Log.h。
+// 数值、路径、文件名、相机模型及选项名通过参数传入并保留标识符；数量采用标签形式，避免复数变化。
+// 阶段标签尽量简短，同一语言的日志列宽由最长标签决定。
 
 #include "i18n/BeginCatalog.h"
 
@@ -23,11 +11,8 @@ namespace i18n {
 namespace msg {
 namespace sfm {
 
-// ===========================================================================
-// Stage tags -- the [bracketed] column. Short, and no longer than they need
-// to be: two Han characters is four columns, and that sets the column width
-// for the whole log in that language.
-// ===========================================================================
+// ================ 阶段标签 ================
+// 标签尽量简短；两个汉字占四列，并决定该语言整份日志的标签列宽。
 
 SS_MSG(tag_run,
     EN("run"),      JA("実行"),      ZH_HANS("运行"),   ZH_HANT("執行"),
@@ -71,7 +56,7 @@ SS_MSG(tag_device,
     PT("aparelho"), IT("unità"),    NL("apparaat"),   RU("GPU"),
     TR("aygıt"));
 
-// The word in front of a warning or an error, inside the tagged line.
+// 带标签日志中警告或错误前的提示词。
 SS_MSG(word_warning,
     EN("WARNING:"),      JA("警告:"),        ZH_HANS("警告:"),    ZH_HANT("警告:"),
     KO("경고:"),          DE("WARNUNG:"),    FR("AVERTISSEMENT :"), ES("AVISO:"),
@@ -85,9 +70,7 @@ SS_MSG(word_error,
     TR("HATA:"));
 
 
-// ===========================================================================
-// The run: what it was asked to do
-// ===========================================================================
+// ================ 运行请求 ================
 
 SS_MSG(run_header,
     EN("{0} -> {1}"),
@@ -149,8 +132,7 @@ SS_MSG(run_cameras,
     RU("Объектив: {0}   Группировка камер: {1}"),
     TR("Objektif: {0}   Kamera gruplaması: {1}"));
 
-// The images are EXRs and the transfer was left to them; {0} is the gamut in
-// force. Everything here converts to sRGB before it looks at a pixel.
+// EXR 使用文件声明的传递函数，{0} 为有效色域；像素处理前统一转换为 sRGB。
 SS_MSG(run_exr_color,
     EN("EXR input read as linear {0}"),
     JA("EXR 入力を線形 {0} として読み込みます"),
@@ -295,9 +277,7 @@ SS_MSG(device_using,
     TR("{0} kullanılıyor"));
 
 
-// ===========================================================================
-// Extraction
-// ===========================================================================
+// ================ 特征提取 ================
 
 SS_MSG(extract_plan,
     EN("Images: {0}   Decoding threads: {1}   Window: {2}   Peak memory: about {3} MB"),
@@ -566,7 +546,7 @@ SS_MSG(extract_mask_aspect,
        "içeriğin üzerine gerileceği anlamına gelir. Bu boyut çifti için sonraki uyarılar "
        "gösterilmez."));
 
-// {0} is an image file name.
+// {0} 为图像文件名。
 SS_MSG(extract_exif_mirror_dropped,
     EN("{0} and others ask to be mirrored as well as turned. Only the turn is "
        "applied: no camera pose fits a mirrored picture, so the reconstruction "
@@ -688,9 +668,7 @@ SS_MSG(extract_masks_look_inverted,
        "nesnenin çekimi değilse maskeler büyük olasılıkla ters -- bu işlem hattı, COLMAP gibi, "
        "BEYAZ olanı tutar. Denetlemek için --no-masks ile yeniden çalıştırın."));
 
-// ===========================================================================
-// Matching and the camera grouping it settles
-// ===========================================================================
+// ================ 匹配与相机分组 ================
 
 SS_MSG(match_plan,
     EN("Images: {0}   Pairs: {1}   Pairing: {2}"),
@@ -1031,9 +1009,7 @@ SS_MSG(focal_search,
     TR("{0} çift üzerinde odak araması: {1} px (yarı köşegen görüş alanı {2} derece)"));
 
 
-// ===========================================================================
-// Mapping
-// ===========================================================================
+// ================ 重建 ================
 
 SS_MSG(map_feature_compaction,
     EN("Unused-feature compaction: features {0} -> {1}; removed {2} ({3}%); images {4}; "
@@ -1579,9 +1555,7 @@ SS_MSG(map_finishing,
        "elenen {4}, denetimle onarılan {5}, denetimle elenen {6}"));
 
 
-// ===========================================================================
-// The gauge fix, and the summary
-// ===========================================================================
+// ================ 坐标规范与摘要 ================
 
 SS_MSG(orient_done,
     EN("Model {0}: levelled and centred on the cameras, scaled by {1}"),
@@ -1912,9 +1886,7 @@ SS_MSG(result_failed,
     RU("РЕЗУЛЬТАТ: неудача — ничего не восстановлено."),
     TR("SONUÇ: başarısız -- hiçbir şey yeniden oluşturulamadı."));
 
-// How cameras were grouped. The VALUE is a flag spelling and stays as it is
-// (`--camera-mode folder`); what is translated is the sentence that says what
-// it means, since that is the part somebody reads to check the choice.
+// 相机分组的选项值保留原文，如 --camera-mode folder；翻译解释其含义的句子。
 SS_MSG(camera_mode_folder,
     EN("folder (one camera per sub-folder, split by resolution)"),
     JA("folder（サブフォルダごとに1台、解像度でさらに分割）"),
@@ -1960,8 +1932,7 @@ SS_MSG(camera_mode_single,
     RU("single (по одной камере на каждое разрешение, допуск 2%)"),
     TR("single (her ayrı çözünürlük için bir kamera, %2 tolerans)"));
 
-// The detector's own per-image counts. Short, because there is one set of them
-// per image and they sit under the extraction progress line.
+// 每张图像的检测统计，位于提取进度下方，需保持简短。
 SS_MSG(sift_raw,
     EN("Octaves: {0}   Raw keypoints: {1}"),
     JA("オクターブ: {0}   生の特徴点: {1}"),
@@ -2046,13 +2017,8 @@ SS_MSG(sift_saturated_oriented,
     TR("Yönlendirilmiş anahtar nokta listesi doldu ({0} bulundu, {1} yer var)."));
 
 
-// ===========================================================================
-// The rest of what a run prints
-// ===========================================================================
-// These were the last lines still writing their own printf. They come from the
-// stages `auto` runs itself (feature reading, pair selection, verification) and
-// from the standalone subcommands, which a person bisecting a failed capture
-// runs one at a time.
+// ================ 其他运行输出 ================
+// 包含特征读取、图像对选择、验证及独立子命令输出，供分阶段排查使用。
 
 SS_MSG(match_pairs_scored,
     EN("pairs scored: {0}/{1}"),
@@ -2196,7 +2162,7 @@ SS_MSG(match_prefilter_params,
     RU("отбор пар -- лучших признаков: {0}, соседей: {1}"),
     TR("çift seçimi -- en iyi öznitelik: {0}, komşu: {1}"));
 
-// The matcher's name is an identifier (`lightglue`), so it stays as it is.
+// lightglue 等匹配器名称为标识符，保留原文。
 SS_MSG(match_matcher_name,
     EN("matcher: {0}"),
     JA("マッチャー: {0}"),
@@ -2227,8 +2193,7 @@ SS_MSG(focal_epipolar_search,
     RU("эпиполярный поиск фокуса: {0}"),
     TR("epipolar odak arayışı: {0}"));
 
-// {2} is a list the caller built ("cam 0: 520.4, cam 1: 519.8"): identifiers
-// and numbers, so it is passed through as it is.
+// {2} 为调用方生成的标识符与数值列表，如 cam 0: 520.4, cam 1: 519.8，原样输出。
 SS_MSG(match_bearings,
     EN("calibrated verification on bearings ({0}, {1} MB); focal lengths: {2}"),
     JA("方位ベクトルでの校正済み検証（{0}、{1} MB）、焦点距離: {2}"),
@@ -2975,9 +2940,7 @@ SS_MSG(metric_positions_bad,
     RU("Не удаётся прочитать файл позиций {0}: {1}"),
     TR("Konum dosyası {0} okunamıyor: {1}"));
 
-// ===========================================================================
-// The sensor gauge (map/SensorGauge.h)
-// ===========================================================================
+// ================ 传感器坐标规范，见 map/SensorGauge.h ================
 
 SS_MSG(sensor_file,
     EN("Telemetry from {0} ({1}): gyro {2} Hz, accelerometer {3} Hz, attitude {4} Hz, "
@@ -3501,9 +3464,7 @@ SS_MSG(sensor_untimed,
     RU("Модель {0}: {1} из {2} зарегистрированных кадров не сопоставились ни с какой телеметрией"),
     TR("Model {0}: kayıtlı {2} görüntüden {1} tanesi hiçbir telemetriyle eşleşmedi"));
 
-// ===========================================================================
-// The recorded camera attitude (map/AttitudeGauge.h)
-// ===========================================================================
+// ================ 相机记录的姿态，见 map/AttitudeGauge.h ================
 
 SS_MSG(attitude_up,
     EN("Model {0}: up from the camera attitude {1}/{2} images record; they agree to {3} deg, "
@@ -3858,9 +3819,9 @@ SS_MSG(match_sequence_added,
     RU("окна последовательностей добавили пар: {0}, к выбранным парам: {1} (пар в окнах: {2})"),
     TR("dizi pencereleri çift ekledi: {0}, seçilmiş çiftlere ek olarak: {1} (pencere çifti: {2})"));
 
-}  // namespace sfm
-}  // namespace msg
-}  // namespace i18n
-}  // namespace spirula
+}  // 命名空间 sfm
+}  // 命名空间 msg
+}  // 命名空间 i18n
+}  // 命名空间 spirula
 
 #include "i18n/EndCatalog.h"

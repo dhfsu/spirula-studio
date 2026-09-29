@@ -1,10 +1,4 @@
-// Feature matches and their flat-file interchange format.
-//
-// A match is a pair of feature indices into two images' FeatureSets. A
-// MatchesDatabase collects the two-view match lists for a whole dataset (the
-// input to phase-3 verification and the phase-4 correspondence graph). Like
-// features.bin this is our own format (D4), self-describing and trivial to
-// parse; it is not COLMAP's SQLite database.
+// 特征匹配及独立二进制格式；每条匹配记录两图像的特征索引，数据库汇集整个数据集的双视图对应。
 #pragma once
 
 #include <cstdint>
@@ -18,53 +12,41 @@
 
 namespace sfm {
 
-// One putative correspondence: feature idx1 in image1 <-> idx2 in image2.
+// 候选对应：图像 image1 的 idx1 <-> 图像 image2 的 idx2。
 struct FeatureMatch {
     uint32_t idx1 = 0, idx2 = 0;
-    float distance = 0;   // L2 descriptor distance (not persisted)
+    float distance = 0;   // 描述子 L2 距离，不持久化
 };
 
-// All matches between one ordered image pair. When geometric verification has
-// run, `matches` holds only the inliers and `config` is the two-view config
-// (0 = not verified / raw; otherwise the sfm/geometry/TwoView.h TwoViewConfig).
+// 有序图像对的匹配；验证后仅保存内点，config 为 TwoViewConfig，0 表示原始未验证数据。
 struct TwoViewMatches {
-    uint32_t image1 = 0, image2 = 0;      // indices into MatchesDatabase::images
-    int32_t config = 0;                   // 0 = unverified
+    uint32_t image1 = 0, image2 = 0;      // MatchesDatabase::images 的索引
+    int32_t config = 0;                   // 0 表示未验证
     std::vector<FeatureMatch> matches;
 };
 
-// One image's identity in the match database.
+// 匹配数据库中的图像身份。
 struct ImageEntry {
-    std::string name;         // feature-file stem (== image name)
+    std::string name;         // 特征文件主干路径，即内部图像名
     uint32_t num_features = 0;
 };
 
 struct MatchesDatabase {
     std::vector<ImageEntry> images;
     std::vector<TwoViewMatches> pairs;
-    // The camera setup verification actually used (D47): which images share
-    // intrinsics, what those intrinsics were, and whether the focal was a prior
-    // or a guess. Recorded so the mapper does not have to reconstruct it -- its
-    // only other option is to re-search the focal on the *verified inliers*,
-    // which are biased towards whatever focal produced them. Empty in a file
-    // written before this, or by `--no-verify`.
-    std::vector<Camera> cameras;         // one per distinct camera id
-    std::vector<uint32_t> camera_ids;    // per image, parallel to `images`
-    std::vector<uint8_t> focal_prior;    // parallel to `cameras`; 1 = not a guess
-    // 1 where THIS stage measured the focal rather than being told it. Kept
-    // apart from `focal_prior` because the mapper treats the two differently:
-    // it re-refines a measured focal and leaves a given one alone (D45).
+    // 保存验证使用的相机分组、内参与焦距来源，避免建图从受验证选择偏置的内点重新估计；旧文件或未验证输出可为空（D47）。
+    std::vector<Camera> cameras;         // 每个相机 ID 一项
+    std::vector<uint32_t> camera_ids;    // 与 images 一一对应
+    std::vector<uint8_t> focal_prior;    // 与 cameras 对应，1 表示非猜测
+    // focal_measured 区分本阶段测量与外部先验，使建图继续优化测量值而保留给定值（D45）。
     std::vector<uint8_t> focal_measured;
     bool hasCameras() const {
         return !cameras.empty() && camera_ids.size() == images.size();
     }
 };
 
-// ---------------------------------------------------------------------------
-// matches.bin -- "VKMT", u32 version=4; the layout is writeMatches below, and
-// an older file reads back as what it carried: v2 stops after the pairs and has
-// no cameras, v3 has cameras but no per-camera `focal_measured` byte.
-// ---------------------------------------------------------------------------
+// ---------------- 匹配文件格式 ----------------
+// 魔数 VKMT，u32 版本 4；v2 在匹配后结束，无相机记录，v3 有相机但没有逐相机 focal_measured 字节。
 
 inline void writeMatches(const std::string& path, const MatchesDatabase& db) {
     std::ofstream f(path, std::ios::binary);
@@ -192,7 +174,7 @@ inline MatchesDatabase readMatches(const std::string& path) {
             f.read((char*)measured.data(), (std::streamsize)ncam);
             if (f.gcount() == (std::streamsize)ncam) db.focal_measured = std::move(measured);
         }
-        if (!db.hasCameras()) {   // truncated section: no cameras, not bad ones
+        if (!db.hasCameras()) {   // 附加段截断时视为无相机，不发布不完整参数
             db.cameras.clear();
             db.camera_ids.clear();
             db.focal_prior.clear();
@@ -202,21 +184,16 @@ inline MatchesDatabase readMatches(const std::string& path) {
     return db;
 }
 
-// ---- one pair at a time -------------------------------------------------
-//
-// The pair table without the matches themselves, for a reader that wants to
-// draw one pair out of a file whose match arrays are most of a gigabyte. The
-// GUI's match map is the caller: it needs every pair's size to draw, and one
-// pair's contents only when the cursor is over it.
+// ---------------- 逐图像对读取 ----------------
+// 仅索引匹配表与数量，交互查看某一图像对时才读取其内容，避免整份大型匹配数组进入内存。
 
-// A pair count of this means "pairs until the end of the file": the writer was
-// still appending when the file was made (sfm/core/Progress.h, live_matches.bin).
+// 此对数标记表示持续读取到文件尾，用于仍在追加的 live_matches.bin。
 inline constexpr uint32_t kStreamingPairs = 0xFFFFFFFFu;
 
 struct MatchesIndex {
     struct Entry {
         uint32_t image1 = 0, image2 = 0, count = 0;
-        uint64_t offset = 0;      // first idx1 of this pair's array
+        uint64_t offset = 0;      // 本图像对首个 idx1 的文件位置
     };
     std::vector<ImageEntry> images;
     std::vector<Entry> pairs;
@@ -225,9 +202,7 @@ struct MatchesIndex {
 inline bool indexMatches(const std::string& path, MatchesIndex& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
-    // A file still being written hands back nonsense counts, and this one is
-    // read while a run is going. The smallest a pair can be on disk is 16
-    // bytes, so the file's own size is what bounds them.
+    // 运行中读取的计数可能尚未完整，每图像对至少 16 字节，以文件大小限制可接受数量。
     f.seekg(0, std::ios::end);
     const uint64_t bytes = (uint64_t)f.tellg();
     f.seekg(0);
@@ -259,13 +234,10 @@ inline bool indexMatches(const std::string& path, MatchesIndex& out) {
         f.read((char*)&e.image2, 4);
         f.read((char*)&config, 4);
         f.read((char*)&e.count, 4);
-        // Streaming stops at the tail the writer has not finished; a fixed
-        // count that runs out is a truncated file and stays an error.
+        // 流式文件遇到尚未写完的尾部则停止；固定计数文件缺数据仍报截断错误。
         if (!f) return streaming ? (out = std::move(idx), true) : false;
         e.offset = (uint64_t)f.tellg();
-        // seekg past the end does not fail until something is read, so the
-        // bound is checked here for both shapes: a short streaming file is a
-        // tail the writer has not finished, a short fixed one is truncated.
+        // seekg 越过文件尾不会立即失败，因此显式检查边界；流式文件允许未完成尾部，固定文件视为损坏。
         if (e.offset + (uint64_t)e.count * 8 > bytes)
             return streaming ? (out = std::move(idx), true) : false;
         idx.pairs.push_back(e);
@@ -293,4 +265,4 @@ inline bool readPairMatches(const std::string& path,
     return true;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

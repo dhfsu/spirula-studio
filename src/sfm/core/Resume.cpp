@@ -1,4 +1,4 @@
-// Resume.cpp -- see Resume.h.
+// 断点恢复实现，参见 Resume.h。
 
 #include "sfm/core/Resume.h"
 
@@ -12,9 +12,7 @@ namespace resume {
 
 namespace {
 
-// What a kill may cost: whichever of the two comes first. The size bound keeps
-// a fast capture from flushing per pair; the clock keeps a slow one -- a
-// learned matcher is seconds per pair -- from holding an hour in memory.
+// 按大小或时间任一阈值刷新；快任务避免逐对写盘，慢学习匹配避免长时间成果只留在内存。
 constexpr size_t kFlushBytes = 4u << 20;
 constexpr double kFlushSeconds = 5.0;
 
@@ -31,7 +29,7 @@ bool read_u32(std::istream& f, uint32_t& v) {
     return f.gcount() == 4;
 }
 
-// The signature block every file here opens with: u32 length, then the text.
+// 签名块统一为 u32 文本长度加签名文本。
 void put_signature(std::string& b, const std::string& sig) {
     put_u32(b, (uint32_t)sig.size());
     b += sig;
@@ -51,7 +49,7 @@ bool magic_is(std::istream& f, const char* want) {
     return f.gcount() == 4 && std::memcmp(m, want, 4) == 0;
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 fs::path dir(const std::string& workspace) { return fs::path(workspace) / kDir; }
 
@@ -80,9 +78,7 @@ void clear(const std::string& workspace) {
     fs::remove_all(dir(workspace), ec);
 }
 
-// ---------------------------------------------------------------------------
-// The pair list
-// ---------------------------------------------------------------------------
+// ---------------- 图像对列表 ----------------
 
 bool readPairs(const fs::path& file, const std::string& signature,
                std::vector<std::pair<uint32_t, uint32_t>>& pairs) {
@@ -111,9 +107,7 @@ void writePairs(const fs::path& file, const std::string& signature,
     f.write((const char*)pairs.data(), (std::streamsize)pairs.size() * 8);
 }
 
-// ---------------------------------------------------------------------------
-// The verification journal
-// ---------------------------------------------------------------------------
+// ---------------- 验证日志 ----------------
 
 bool MatchJournal::open(const fs::path& file, const std::string& signature,
                         bool append) {
@@ -138,7 +132,7 @@ void MatchJournal::record(uint32_t a, uint32_t b, int32_t config, uint32_t putat
                           const uint32_t* idx1, const uint32_t* idx2,
                           size_t stride, uint32_t count) {
     if (!_armed) return;
-    // Packed before the lock: this runs on every verification worker.
+    // 验证线程在加锁前完成打包。
     std::string rec;
     rec.reserve(20 + (size_t)count * 8);
     put_u32(rec, a);
@@ -196,8 +190,7 @@ bool readJournal(const fs::path& file, const std::string& signature,
         if (!read_u32(f, a) || !read_u32(f, b)) break;
         f.read((char*)&config, 4);
         if (f.gcount() != 4 || !read_u32(f, offered) || !read_u32(f, count)) break;
-        // A count the file cannot hold is the tail the writer never flushed,
-        // not a corrupt record: stop, keep what came before.
+        // 文件装不下所声明记录时视为尚未刷新的尾部，停止读取并保留此前完整记录。
         if (a >= nimg || b >= nimg || count > images[a].num_features) break;
         TwoViewMatches tvm;
         tvm.image1 = a;
@@ -222,5 +215,5 @@ bool readJournal(const fs::path& file, const std::string& signature,
     return true;
 }
 
-}  // namespace resume
-}  // namespace sfm
+}  // 命名空间 resume
+}  // 命名空间 sfm

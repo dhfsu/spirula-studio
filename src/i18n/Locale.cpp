@@ -1,4 +1,4 @@
-// Locale.cpp -- see Locale.h.
+// 区域与语言设置实现，参见 Locale.h。
 
 #include "i18n/Locale.h"
 
@@ -73,8 +73,7 @@ char lower(char c) {
     return (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c;
 }
 
-// "zh_Hans_CN.UTF-8@modifier" -> {"zh", "hans", "cn"}, lowercased, at most
-// three subtags (nothing we match on needs a fourth).
+// zh_Hans_CN.UTF-8@modifier -> {zh, hans, cn}；统一小写，只需前三个子标签。
 struct Subtags {
     std::string t[3];
     int n = 0;
@@ -84,7 +83,7 @@ Subtags split_locale(const char* s) {
     Subtags out;
     std::string cur;
     for (const char* p = s; *p; p++) {
-        // The encoding and the modifier say nothing about the language.
+        // 编码与修饰符不影响语言判定。
         if (*p == '.' || *p == '@') break;
         if (*p == '-' || *p == '_') {
             if (!cur.empty() && out.n < 3) out.t[out.n++] = cur;
@@ -97,25 +96,22 @@ Subtags split_locale(const char* s) {
     return out;
 }
 
-// zh needs a script, and an OS will express it as a script subtag, a region,
-// or -- on older Windows -- as the "CHS"/"CHT" pseudo-scripts.
+// 中文需判断字形，系统可能使用文字子标签、地区，或旧 Windows 的 CHS/CHT 标记。
 bool resolve_chinese(const Subtags& st, Lang* out) {
     for (int i = 1; i < st.n; i++) {
         const std::string& t = st.t[i];
         if (t == "hans" || t == "chs") { *out = Lang::zh_hans; return true; }
         if (t == "hant" || t == "cht") { *out = Lang::zh_hant; return true; }
-        // Region. Macau and Hong Kong are traditional; Singapore and Malaysia
-        // follow the mainland.
+        // 澳门和香港采用繁体；新加坡和马来西亚采用简体。
         if (t == "cn" || t == "sg" || t == "my") { *out = Lang::zh_hans; return true; }
         if (t == "tw" || t == "hk" || t == "mo") { *out = Lang::zh_hant; return true; }
     }
-    // A bare "zh" with no script and no region. A Traditional build should
-    // stay Traditional; everything else takes the more common script.
+    // 只有 zh 而无文字、地区时，繁体默认构建保持繁体，其余采用简体。
     *out = (kDefaultLang == Lang::zh_hant) ? Lang::zh_hant : Lang::zh_hans;
     return true;
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 bool parse_lang(const char* s, Lang* out) {
     if (!s || !*s) return false;
@@ -123,15 +119,12 @@ bool parse_lang(const char* s, Lang* out) {
     const Subtags st = split_locale(s);
     if (st.n == 0) return false;
 
-    // "C" and "POSIX" mean "the user expressed no preference", which is not
-    // the same as "the user wants English" -- fall through to the next step of
-    // the chain rather than pinning en here.
+    // C 与 POSIX 表示未指定偏好，应继续尝试下一优先级，不能强行解释为英语。
     if (st.t[0] == "c" || st.t[0] == "posix") return false;
 
     if (st.t[0] == "zh") return resolve_chinese(st, out);
 
-    // Our own canonical codes, and the identifier spelling ("zh_hans") that
-    // SS_DEFAULT_LANG and the settings file use.
+    // 接受规范语言码，以及 SS_DEFAULT_LANG 和设置文件使用的 zh_hans 等标识符形式。
     std::string joined = st.t[0];
     for (int i = 1; i < st.n; i++) joined += "-" + st.t[i];
 
@@ -151,10 +144,10 @@ Lang detect_os_lang() {
     Lang l = kDefaultLang;
 
 #if defined(_WIN32)
-    // The user's UI language, e.g. L"zh-Hans-CN". Present since Vista.
+    // Windows 用户界面语言，如 zh-Hans-CN；Vista 起提供。
     wchar_t buf[LOCALE_NAME_MAX_LENGTH] = {0};
     if (GetUserDefaultLocaleName(buf, LOCALE_NAME_MAX_LENGTH) > 0) {
-        // Locale names are ASCII; a narrowing copy is exact.
+        // 区域名称均为 ASCII，窄字符复制不会损失信息。
         char narrow[LOCALE_NAME_MAX_LENGTH] = {0};
         size_t n = 0;
         for (; n + 1 < sizeof narrow && buf[n]; n++)
@@ -163,8 +156,7 @@ Lang detect_os_lang() {
         if (parse_lang(narrow, &l)) return l;
     }
 #elif defined(__APPLE__)
-    // POSIX env vars are usually absent for an app launched from Finder, so
-    // ask CoreFoundation. (CFLocale is C; no Objective-C is involved.)
+    // Finder 启动时通常没有 POSIX 区域变量，因此通过 CoreFoundation 查询；接口为 C，无需 Objective-C。
     if (CFLocaleRef loc = CFLocaleCopyCurrent()) {
         char buf[128] = {0};
         const bool ok = CFStringGetCString(CFLocaleGetIdentifier(loc), buf,
@@ -174,7 +166,7 @@ Lang detect_os_lang() {
     }
 #endif
 
-    // POSIX, and the fallback everywhere: LC_ALL beats LC_MESSAGES beats LANG.
+    // POSIX 及通用回退顺序：LC_ALL > LC_MESSAGES > LANG。
     for (const char* var : {"LC_ALL", "LC_MESSAGES", "LANG"})
         if (const char* v = std::getenv(var))
             if (parse_lang(v, &l)) return l;
@@ -243,9 +235,7 @@ std::string language_list() {
     return s;
 }
 
-// ---------------------------------------------------------------------------
-// Positional substitution -- see the rule in Message.h.
-// ---------------------------------------------------------------------------
+// ---------------- 位置参数替换，规则见 Message.h ----------------
 
 Arg::Arg(int v)                : s(std::to_string(v)) {}
 Arg::Arg(long v)               : s(std::to_string(v)) {}
@@ -255,8 +245,7 @@ Arg::Arg(unsigned long v)      : s(std::to_string(v)) {}
 Arg::Arg(unsigned long long v) : s(std::to_string(v)) {}
 
 Arg::Arg(double v) {
-    // std::to_string(double) is always %f, so 0.5 becomes "0.500000" and 1e-7
-    // becomes "0.000000". %g is what a UI wants.
+    // std::to_string(double) 固定使用 %f，会把 1e-7 变成 0.000000；界面数值使用 %g。
     char buf[32];
     std::snprintf(buf, sizeof buf, "%g", v);
     s = buf;
@@ -275,8 +264,7 @@ std::string format(const char* pattern, std::initializer_list<Arg> args) {
         bool digits = false;
         while (*q >= '0' && *q <= '9') { idx = idx * 10 + size_t(*q - '0'); q++; digits = true; }
         if (!digits || *q != '}' || idx >= args.size()) {
-            // Not a placeholder, or one with no argument. Copy it through so
-            // the mistake is visible as `{2}` in the UI instead of vanishing.
+            // 无效占位符或缺少参数时保留原文，使界面显露 {2} 等错误，避免静默丢失。
             out += *p++;
             continue;
         }
@@ -288,27 +276,26 @@ std::string format(const char* pattern, std::initializer_list<Arg> args) {
 
 namespace {
 
-// East Asian Wide / Fullwidth, in the ranges a translation can plausibly land
-// in. Not a full UAX #11 table.
+// 覆盖译文常见的东亚宽字符、全角字符范围，并非完整 UAX #11 表。
 bool wide_cp(unsigned int cp) {
-    return (cp >= 0x1100 && cp <= 0x115F) ||    // hangul jamo
-           (cp >= 0x2E80 && cp <= 0x303E) ||    // CJK radicals, punctuation
-           (cp >= 0x3041 && cp <= 0x33FF) ||    // kana, hangul compat, CJK compat
-           (cp >= 0x3400 && cp <= 0x4DBF) ||    // CJK ext A
-           (cp >= 0x4E00 && cp <= 0x9FFF) ||    // CJK unified
-           (cp >= 0xA000 && cp <= 0xA4CF) ||    // yi
-           (cp >= 0xAC00 && cp <= 0xD7A3) ||    // hangul syllables
-           (cp >= 0xF900 && cp <= 0xFAFF) ||    // CJK compat ideographs
-           (cp >= 0xFE30 && cp <= 0xFE6F) ||    // CJK compat forms
-           (cp >= 0xFF00 && cp <= 0xFF60) ||    // fullwidth forms
+    return (cp >= 0x1100 && cp <= 0x115F) ||    // 谚文字母
+           (cp >= 0x2E80 && cp <= 0x303E) ||    // CJK 部首与标点
+           (cp >= 0x3041 && cp <= 0x33FF) ||    // 假名、谚文兼容字符、CJK 兼容字符
+           (cp >= 0x3400 && cp <= 0x4DBF) ||    // CJK 扩展 A
+           (cp >= 0x4E00 && cp <= 0x9FFF) ||    // CJK 统一表意文字
+           (cp >= 0xA000 && cp <= 0xA4CF) ||    // 彝文
+           (cp >= 0xAC00 && cp <= 0xD7A3) ||    // 谚文音节
+           (cp >= 0xF900 && cp <= 0xFAFF) ||    // CJK 兼容表意文字
+           (cp >= 0xFE30 && cp <= 0xFE6F) ||    // CJK 兼容形式
+           (cp >= 0xFF00 && cp <= 0xFF60) ||    // 全角形式
            (cp >= 0xFFE0 && cp <= 0xFFE6) ||
-           (cp >= 0x20000 && cp <= 0x3FFFD);    // CJK ext B+
+           (cp >= 0x20000 && cp <= 0x3FFFD);    // CJK 扩展 B 及后续区段
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 int display_width(const char* s) {
-    // UTF-8 decode, counting East Asian Wide / Fullwidth as two columns.
+    // 解码 UTF-8，东亚宽字符与全角字符按两列计算。
     int w = 0;
     if (!s) return 0;
     for (const unsigned char* p = (const unsigned char*)s; *p;) {
@@ -329,8 +316,7 @@ int display_width(const char* s) {
 
 namespace {
 
-// One UTF-8 character: its codepoint, its byte length, and how many terminal
-// columns it takes.
+// UTF-8 字符的码点、字节长度及终端列宽。
 struct Ch { unsigned int cp; int bytes; int width; };
 
 Ch decode_one(const unsigned char* p) {
@@ -346,8 +332,7 @@ Ch decode_one(const unsigned char* p) {
     return c;
 }
 
-// A character a line may be broken BEFORE. True for wide scripts, which are
-// written without spaces; false for the punctuation that may not open a line.
+// 判断字符前是否允许断行；无空格书写的宽字符允许，禁止出现在行首的标点除外。
 bool can_break_before(unsigned int cp) {
     if (!wide_cp(cp)) return false;
     switch (cp) {
@@ -367,31 +352,31 @@ bool can_break_before(unsigned int cp) {
     }
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 std::vector<std::string> wrap(const std::string& text, int columns) {
     std::vector<std::string> out;
     if (columns < 2) columns = 2;
     const unsigned char* p = (const unsigned char*)text.c_str();
 
-    std::string line;          // what is committed to the current line
+    std::string line;          // 已确定写入当前行的内容
     int line_w = 0;
-    std::string word;          // the run since the last break opportunity
+    std::string word;          // 上次可断行位置之后的连续内容
     int word_w = 0;
 
-    // The space a break was taken at belongs to neither line.
+    // 断行处的空格不归属于任何一行。
     auto rtrim = [](std::string s) {
         while (!s.empty() && s.back() == ' ') s.pop_back();
         return s;
     };
 
-    auto commit = [&]() {      // word -> line, breaking the line first if need be
+    auto commit = [&]() {      // 将词并入当前行，必要时先换行
         if (word.empty()) return;
         if (line_w + word_w > columns && !line.empty()) {
             out.push_back(rtrim(line));
             line.clear();
             line_w = 0;
-            // A space that fell at a break is consumed by the break.
+            // 断行位置的空格由换行消耗。
             while (!word.empty() && word[0] == ' ') { word.erase(0, 1); word_w--; }
         }
         line += word;
@@ -410,8 +395,7 @@ std::vector<std::string> wrap(const std::string& text, int columns) {
             continue;
         }
         const Ch c = decode_one(p);
-        // A space ends the previous word; a wide character both ends the
-        // previous one and may itself start a line.
+        // 空格结束前一个词；宽字符既结束前词，也可自身作为行首。
         if (c.cp == ' ' || can_break_before(c.cp)) commit();
         word.append((const char*)p, (size_t)c.bytes);
         word_w += c.width;
@@ -430,16 +414,14 @@ std::string pad_to(const std::string& s, int columns) {
     return out;
 }
 
-// The inverse -- see the note in Message.h. Two passes: take the pattern apart
-// into literal runs and placeholder indices, then walk the text matching the
-// runs in order and calling whatever lies between them the argument.
+// format 的逆操作：先拆出固定文本和占位符索引，再按顺序匹配文本，将间隙解析为参数；约定见 Message.h。
 bool scan(const char* pattern, const std::string& text,
           std::vector<std::string>& out) {
     out.clear();
     if (!pattern) return false;
 
-    std::vector<std::string> lits;   // lits[i] precedes slot[i]; one extra tail
-    std::vector<size_t> slot;        // placeholder index of each gap
+    std::vector<std::string> lits;   // lits[i] 位于 slot[i] 前，另含一段尾部文本
+    std::vector<size_t> slot;        // 各间隙的占位符索引
     std::string cur;
     for (const char* p = pattern; *p;) {
         if (p[0] == '{' && p[1] == '{') { cur += '{'; p += 2; continue; }
@@ -450,15 +432,14 @@ bool scan(const char* pattern, const std::string& text,
         bool digits = false;
         while (*q >= '0' && *q <= '9') { idx = idx * 10 + size_t(*q - '0'); q++; digits = true; }
         if (!digits || *q != '}') { cur += *p++; continue; }
-        // A placeholder with nothing before it but another placeholder has no
-        // separator to find, so the split would be a guess. Say no instead.
+        // 相邻占位符之间没有分隔符，无法可靠划分，必须拒绝匹配。
         if (!lits.empty() && cur.empty()) return false;
         lits.push_back(cur);
         slot.push_back(idx);
         cur.clear();
         p = q + 1;
     }
-    lits.push_back(cur);              // the tail after the last placeholder
+    lits.push_back(cur);              // 最后一个占位符之后的尾部文本
 
     if (text.compare(0, lits[0].size(), lits[0]) != 0) return false;
     size_t pos = lits[0].size();
@@ -467,7 +448,7 @@ bool scan(const char* pattern, const std::string& text,
         const std::string& next = lits[i + 1];
         size_t at;
         if (next.empty()) {
-            // Last placeholder, pattern ends with it: it takes the remainder.
+            // 模式以最后一个占位符结束时，将剩余文本全部作为其参数。
             if (i + 1 != slot.size()) return false;
             at = text.size();
         } else {
@@ -479,7 +460,7 @@ bool scan(const char* pattern, const std::string& text,
     }
     if (pos != text.size()) return false;
 
-    // Placeholders may appear in any order in a translation, so index by slot.
+    // 译文可重排占位符，因此按槽位编号写入结果。
     size_t n = 0;
     for (size_t s : slot) n = std::max(n, s + 1);
     out.assign(n, std::string());
@@ -487,5 +468,5 @@ bool scan(const char* pattern, const std::string& text,
     return true;
 }
 
-}  // namespace i18n
-}  // namespace spirula
+}  // 命名空间 i18n
+}  // 命名空间 spirula

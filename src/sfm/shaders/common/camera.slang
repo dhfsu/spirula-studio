@@ -1,32 +1,16 @@
 #pragma once
-// Camera models.
-//
-// A camera is split into a per-image 6-DOF pose (angle-axis rotation +
-// translation, shared by all models) and per-group intrinsics. Multiple images
-// may reference the same intrinsics group ("camera groups"), and each group
-// picks its own model. To add a model:
-//   1. write a struct conforming to ICameraModel below,
-//   2. add cost_*/jac_* entry points for it at the bottom of ba.slang,
-//   3. register it in kModels in sfm/ba/Problem.h.
-// Intrinsic parameter counts may differ per model; nothing else in the solver
-// needs to change (keep kNumIntr <= kMaxCamDof - 6, see ba.slang).
+// 相机模型共享六自由度位姿与分组内参，各组可选不同模型。
+// 新增模型需实现 ICameraModel、添加 ba.slang 代价/雅可比入口并注册 Problem.h；参数数须满足自由度上限。
 
 #include "linalg.slang"
 
-// Parameter order is COLMAP's with the principal point moved to the *end*
-// (host mirror: packIntrinsics in sfm/core/Camera.h). Bundle adjustment refines a
-// leading prefix of each group's parameters -- how many is per group, in
-// u_group_info.z -- so which parameters are held constant is a count rather
-// than a mask, and the hot kernel needs no per-parameter indirection. The
-// Jacobian is still evaluated over all kNumIntr; only the leading columns are
-// assembled into the reduced system, so a held-constant parameter contributes
-// no column at all (rather than a zero column, which the multiplicative LM
-// damping in damp_S would leave singular). D49/D50.
+// 内参顺序与 Camera.h 的 packIntrinsics 一致，将主点移到末尾；BA 仅优化组内自由前缀 u_group_info.z。
+// 雅可比仍计算全部参数，但固定参数不占系统列，避免乘法阻尼无法修复全零列造成的奇异性（D49/D50）。
 interface ICameraModel : IDifferentiable {
     static const int kNumIntr;
     static const bool kPeriodicX;
     [Differentiable] static This fromArray(Real v[kNumIntr]);
-    // p is the point in camera frame; returns projected pixel coordinates.
+    // p 为相机坐标点，返回投影像素。
     [Differentiable] RVec2 project(RVec3 p);
 };
 
@@ -39,7 +23,7 @@ RVec3 angleAxisRotate(RVec3 axis, RVec3 p) {
     return p * ct + cross3(a, p) * st + a * (dot3(a, p) * (Real(1.0) - ct));
 }
 
-// pose = [angle-axis(3), translation(3)]
+// pose=[轴角(3),平移(3)]
 [Differentiable]
 RVec3 applyPose(Real pose[6], RVec3 p_world) {
     RVec3 aa = rvec3(pose[0], pose[1], pose[2]);
@@ -47,8 +31,7 @@ RVec3 applyPose(Real pose[6], RVec3 p_world) {
     return angleAxisRotate(aa, p_world) + t;
 }
 
-// BAL / Snavely model: log-focal, two radial distortion coefficients.
-// Projects along -z (BAL convention).
+// BAL/Snavely 模型使用对数焦距和两个径向畸变项，按 BAL 约定沿 -z 投影。
 struct SnavelyModel : ICameraModel {
     static const int kNumIntr = 3;
     static const bool kPeriodicX = false;
@@ -67,8 +50,7 @@ struct SnavelyModel : ICameraModel {
     }
 };
 
-// Same model with the focal length parameterized directly (as Ceres' BAL
-// examples do) instead of log-focal.
+// 直接参数化焦距的同类模型，与 Ceres 的 BAL 示例一致。
 struct SnavelyFModel : ICameraModel {
     static const int kNumIntr = 3;
     static const bool kPeriodicX = false;
@@ -86,9 +68,7 @@ struct SnavelyFModel : ICameraModel {
     }
 };
 
-// A 5-parameter pinhole with principal point and one radial coefficient
-// (+z looking, pixel = f * distorted + c). Demonstrates that models with a
-// different parameter count drop in without touching the solver.
+// 含主点和单径向系数的五参数针孔模型，沿 +z，pixel=f*distorted+c，示例说明不同内参数量无需修改求解器。
 struct PinholeRadialModel : ICameraModel {
     static const int kNumIntr = 5;
     static const bool kPeriodicX = false;
@@ -108,7 +88,7 @@ struct PinholeRadialModel : ICameraModel {
     }
 };
 
-// COLMAP SIMPLE_PINHOLE: one focal, principal point, no distortion.
+// COLMAP SIMPLE_PINHOLE：单焦距、主点，无畸变。
 struct SimplePinholeModel : ICameraModel {
     static const int kNumIntr = 3;
     static const bool kPeriodicX = false;
@@ -121,7 +101,7 @@ struct SimplePinholeModel : ICameraModel {
     }
 };
 
-// COLMAP PINHOLE: separate focals, principal point, no distortion.
+// COLMAP PINHOLE：双焦距、主点，无畸变。
 struct PinholeModel : ICameraModel {
     static const int kNumIntr = 4;
     static const bool kPeriodicX = false;
@@ -134,9 +114,7 @@ struct PinholeModel : ICameraModel {
     }
 };
 
-// COLMAP OPENCV model: separate focals, principal point, two radial and two
-// tangential coefficients (Brown-Conrady). Host mirror: sfm/core/Camera.h's
-// CamModel::OpenCV project(). +z looking, pixel = f*distorted + c.
+// COLMAP OPENCV：双焦距、主点、两径向和两切向 Brown-Conrady 系数，沿 +z；主机对应 Camera.h 的 OpenCV。
 struct OpenCVModel : ICameraModel {
     static const int kNumIntr = 8;
     static const bool kPeriodicX = false;
@@ -160,10 +138,7 @@ struct OpenCVModel : ICameraModel {
     }
 };
 
-// COLMAP OPENCV_FISHEYE (Kannala-Brandt): equidistant fisheye with four radial
-// polynomial terms on the angle theta from the optical axis. Valid for rays past
-// 90 deg (p.z <= 0), which is why the reconstruction had to move onto bearings
-// (D31). Host mirror: sfm/core/Camera.h CamModel::OpenCVFisheye.
+// OPENCV_FISHEYE 使用 Kannala-Brandt 的四项角度径向多项式，支持超过 90 度的视线，主机对应 OpenCVFisheye。
 struct FisheyeModel : ICameraModel {
     static const int kNumIntr = 8;
     static const bool kPeriodicX = false;
@@ -177,9 +152,9 @@ struct FisheyeModel : ICameraModel {
         return m;
     }
     [Differentiable] RVec2 project(RVec3 p) {
-        // eps under the sqrt keeps r (and the thd/r derivative) finite on-axis.
+        // sqrt 内的 epsilon 保证轴线上 r 及 thd/r 导数有限。
         Real r = sqrt(p.x * p.x + p.y * p.y + Real(1e-24));
-        Real theta = rAtan2(r, p.z);           // [0, pi], smooth at the axis
+        Real theta = rAtan2(r, p.z);           // [0,pi]，轴线上平滑
         Real t2 = theta * theta;
         Real thd = theta * (Real(1.0) + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))));
         Real scale = thd / r;
@@ -187,9 +162,7 @@ struct FisheyeModel : ICameraModel {
     }
 };
 
-// COLMAP FULL_OPENCV: pinhole Brown-Conrady with a rational radial term --
-// (1 + k1 r^2 + k2 r^4 + k3 r^6) / (1 + k4 r^2 + k5 r^4 + k6 r^6) -- plus the
-// two tangential terms. Host mirror: sfm/core/Camera.h CamModel::FullOpenCV.
+// FULL_OPENCV 的径向项为 (1+k1 r²+k2 r⁴+k3 r⁶)/(1+k4 r²+k5 r⁴+k6 r⁶)，另加两切向项。
 struct FullOpenCVModel : ICameraModel {
     static const int kNumIntr = 12;
     static const bool kPeriodicX = false;
@@ -216,9 +189,7 @@ struct FullOpenCVModel : ICameraModel {
     }
 };
 
-// COLMAP THIN_PRISM_FISHEYE: Kannala-Brandt fisheye (radial in theta) plus
-// tangential and thin-prism terms, all in the equidistant coords (uf,vf) =
-// theta*(x,y)/r. Valid past 90 deg. Host mirror: CamModel::ThinPrismFisheye.
+// THIN_PRISM_FISHEYE 在等距坐标 (uf,vf)=theta*(x,y)/r 上组合 KB 径向、切向和薄棱镜项，支持超过 90 度。
 struct ThinPrismFisheyeModel : ICameraModel {
     static const int kNumIntr = 12;
     static const bool kPeriodicX = false;
@@ -247,10 +218,7 @@ struct ThinPrismFisheyeModel : ICameraModel {
     }
 };
 
-// COLMAP EQUIRECTANGULAR: the spherical panorama. Azimuth spans the width,
-// elevation the height; every direction projects, including behind the camera.
-// The two parameters are the image dimensions and are never refined (the host
-// gives this group a free count of 0). Host mirror: CamModel::Equirect.
+// EQUIRECTANGULAR 将方位角映射到宽度、仰角映射到高度，覆盖所有方向；两个尺寸参数不参与 BA。
 struct EquirectModel : ICameraModel {
     static const int kNumIntr = 2;
     static const bool kPeriodicX = true;
@@ -260,8 +228,7 @@ struct EquirectModel : ICameraModel {
         EquirectModel m; m.w = v[0]; m.h = v[1]; return m;
     }
     [Differentiable] RVec2 project(RVec3 p) {
-        // theta measured from +z toward +x, phi from the equator toward -y.
-        // The epsilon keeps the gradient finite on the exact poles/origin.
+        // theta 从 +z 朝 +x，phi 从赤道朝 -y；epsilon 保证极点与原点的梯度有限。
         Real horiz = sqrt(p.x * p.x + p.z * p.z + Real(1e-24));
         Real theta = rAtan2(p.x, p.z);
         Real phi = rAtan2(-p.y, horiz);
@@ -283,7 +250,7 @@ RVec2 projectResidual<M : ICameraModel>(Real intr[M.kNumIntr], RVec3 p, no_diff 
     return r;
 }
 
-// Reprojection residual, generic in the camera model.
+// 通用相机模型的重投影残差。
 [Differentiable]
 RVec2 reproject<M : ICameraModel>(
     Real pose[6], Real intr[M.kNumIntr], RVec3 X, no_diff RVec2 obs
@@ -291,8 +258,7 @@ RVec2 reproject<M : ICameraModel>(
     return projectResidual<M>(intr, applyPose(pose, X), obs);
 }
 
-// The same through a rig: `pose` is the frame's rig_from_world, `ext` the
-// member's cam_from_rig (sfm/ba/Problem.h).
+// rig 路径中 pose 为 rig_from_world，ext 为成员 cam_from_rig。
 [Differentiable]
 RVec2 reprojectRig<M : ICameraModel>(
     Real pose[6], Real ext[6], Real intr[M.kNumIntr], RVec3 X, no_diff RVec2 obs

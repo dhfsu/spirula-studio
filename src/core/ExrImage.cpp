@@ -1,10 +1,5 @@
-// OpenEXR decode -- see core/ExrImage.h.
-//
-// Two facts shape the file. Chunks (scanline blocks or tiles) are entirely
-// independent, so the worker pool is over chunks and one image scales across
-// cores. And PIZ's Huffman tables are ~800 KB, so every per-block buffer
-// lives in a per-worker Scratch allocated once -- tens of MB faulted in per
-// call would serialize the workers on the kernel's mmap_lock.
+// OpenEXR 解码，接口见 core/ExrImage.h。
+// 扫描线块或瓦片可独立解码，工作池按块并行；PIZ 的 Huffman 表约 800 KB，各线程复用 Scratch，避免反复分配数十 MB 缓冲导致 mmap_lock 串行化。
 
 #include "core/ExrImage.h"
 
@@ -38,9 +33,7 @@
 namespace exr {
 namespace {
 
-// ===========================================================================
-// Format primitives
-// ===========================================================================
+// ================ 格式基础类型 ================
 
 enum PixType { kUint = 0, kHalf = 1, kFloat = 2 };
 
@@ -74,8 +67,7 @@ inline int num_samples(int s, int a, int b) {
     return s == 1 ? b - a + 1 : divp(b, s) - divp(a, s) + 1;
 }
 
-// 256 KB, built once. Real scene-linear captures are full of subnormals, and
-// the branchy bit-twiddle conversion measures slower on them than the table.
+// 查找表为 256 KB，仅构建一次；真实线性场景含大量次正规数，查表实测快于带分支的位操作转换。
 const float* half_table() {
     static const std::vector<float> table = [] {
         std::vector<float> t(65536);
@@ -116,9 +108,7 @@ inline float sample_to_float(int type, const uint8_t* p, const float* halves) {
     return (float)u;
 }
 
-// ===========================================================================
-// Memory-mapped input
-// ===========================================================================
+// ================ 内存映射输入 ================
 
 class Mapped {
 public:
@@ -195,9 +185,7 @@ private:
 #endif
 };
 
-// ===========================================================================
-// Header
-// ===========================================================================
+// ================ 文件头 ================
 
 struct Channel {
     std::string name;
@@ -207,7 +195,7 @@ struct Channel {
 };
 
 struct Part {
-    std::vector<Channel> channels;   // chlist order, which the spec sorts by name
+    std::vector<Channel> channels;   // 按规范规定的通道名称顺序排列 chlist
     int compression = kZip;
     int dx0 = 0, dy0 = 0, dx1 = -1, dy1 = -1;
     int px0 = 0, py0 = 0, px1 = -1, py1 = -1;
@@ -293,7 +281,7 @@ std::string parse_part(Reader& r, Part& part) {
         const std::string name = r.str();
         if (!r.ok) return "the header is truncated";
         if (name.empty()) return "";
-        r.str();                              // attribute type name
+        r.str();                              // 属性类型名称
         const uint32_t size = r.u32();
         const size_t start = r.at;
         if (!r.take(size)) return "the header is truncated";
@@ -322,25 +310,21 @@ std::string parse_part(Reader& r, Part& part) {
         } else if (name == "chunkCount") {
             part.chunk_count = a.i32();
         } else if (name == "type") {
-            // A string attribute is `size` raw bytes, with no terminator.
+            // 字符串属性是 size 个原始字节，不包含终止符。
             part.type.assign((const char*)r.p + start, size);
         }
         if (!a.ok) return "an attribute in the header is truncated";
     }
 }
 
-// ===========================================================================
-// Colour space
-// ===========================================================================
+// ================ 色彩空间 ================
 
 struct GamutEntry {
     const char* name;
     float xy[8];   // Rx Ry Gx Gy Bx By Wx Wy
 };
 
-// The white point is part of the match: core/ColorSpace.h's "DCI-P3" is the
-// theatrical white, and passing P3-D65 off as it is a visible green shift, so
-// that one is reported as unknown rather than as nearly right.
+// 匹配必须包含白点；ColorSpace.h 的 DCI-P3 使用影院白点，将 P3-D65 误判为它会明显偏绿，因此不匹配时报告未知。
 const GamutEntry kGamutTable[] = {
     {"Rec.709",    {0.640f, 0.330f, 0.300f, 0.600f, 0.150f, 0.060f, 0.3127f, 0.3290f}},
     {"ACES2065-1", {0.7347f, 0.2653f, 0.0f, 1.0f, 0.0001f, -0.0770f, 0.32168f, 0.33767f}},
@@ -365,7 +349,7 @@ void resolve_gamut(const Part& part, Info& info) {
     info.gamut_known = false;
 }
 
-// Luminance weights of the file's primaries, for the Y/RY/BY channel layout.
+// 文件基色的亮度权重，用于 Y/RY/BY 通道布局。
 void luminance_weights(const Part& part, float w[3]) {
     w[0] = 0.2126f; w[1] = 0.7152f; w[2] = 0.0722f;
     if (!part.has_chroma) return;
@@ -400,15 +384,13 @@ void luminance_weights(const Part& part, float w[3]) {
     for (int i = 0; i < 3; i++) w[i] = (float)(s[i] / sum);
 }
 
-// ===========================================================================
-// Channel selection
-// ===========================================================================
+// ================ 通道选择 ================
 
 struct Selection {
-    int idx[4] = {-1, -1, -1, -1};   // R G B A, or Y RY BY A
+    int idx[4] = {-1, -1, -1, -1};   // R G B A，或 Y RY BY A
     bool luminance_chroma = false;
     bool gray = false;
-    int count = 0;                   // what the file offers: 1, 3 or 4
+    int count = 0;                   // 文件提供的通道数：1、3 或 4
 };
 
 int find_channel(const std::vector<Channel>& ch, const std::string& name) {
@@ -467,9 +449,7 @@ std::string select_channels(const std::vector<Channel>& ch, Selection& sel) {
     return "the file has no R/G/B or Y channels (it has: " + names + ")";
 }
 
-// ===========================================================================
-// Huffman, for PIZ
-// ===========================================================================
+// ================ PIZ Huffman 编码 ================
 
 constexpr int kHufEncSize = (1 << 16) + 1;
 constexpr int kHufDecBits = 14;
@@ -482,7 +462,7 @@ constexpr int kShortestLongRun = 2 + kLongZeroRun - kShortZeroRun;
 struct HufDec {
     int len = 0;
     int lit = 0;
-    int off = 0;   // into Scratch::huf_long, for codes longer than kHufDecBits
+    int off = 0;   // 长于 kHufDecBits 的编码索引 Scratch::huf_long
     int num = 0;
 };
 
@@ -505,16 +485,14 @@ struct BitReader {
     }
 };
 
-// ===========================================================================
-// Per-worker scratch
-// ===========================================================================
+// ================ 每线程临时缓冲 ================
 
 struct Scratch {
-    std::vector<uint8_t> raw;      // uncompressed block bytes
-    std::vector<uint8_t> tmp;      // predictor / inflate staging
-    std::vector<float> row;        // one gathered output row
-    std::vector<float> chroma;     // last RY/BY row, for the odd rows below it
-    std::vector<uint16_t> words;   // PIZ / B44 word planes
+    std::vector<uint8_t> raw;      // 解压后的块字节
+    std::vector<uint8_t> tmp;      // 预测器与 inflate 的中间缓冲
+    std::vector<float> row;        // 汇集后的一行输出
+    std::vector<float> chroma;     // 上一行 RY/BY，供下方奇数行使用
+    std::vector<uint16_t> words;   // PIZ / B44 字平面
     std::vector<uint16_t> lut;
     std::vector<uint8_t> bitmap;
     std::vector<int64_t> hcode;
@@ -523,11 +501,9 @@ struct Scratch {
     std::vector<int> huf_count;
 };
 
-// ===========================================================================
-// Decompressors
-// ===========================================================================
+// ================ 解压器 ================
 
-// The delta predictor and byte de-interleave that ZIP, ZIPS and RLE share.
+// ZIP、ZIPS 与 RLE 共用差分预测和字节去交错。
 void unpredict(uint8_t* buf, size_t n, uint8_t* out) {
     for (size_t i = 1; i < n; i++)
         buf[i] = (uint8_t)((int)buf[i - 1] + (int)buf[i] - 128);
@@ -729,9 +705,7 @@ std::string huf_uncompress(Scratch& s, const uint8_t* in, size_t n,
     return huf_decode(s.hcode.data(), s, br.in, nbits, iM, no, out);
 }
 
-// ===========================================================================
-// PIZ wavelet
-// ===========================================================================
+// ================ PIZ 小波变换 ================
 
 inline void wdec14(uint16_t l, uint16_t h, uint16_t& a, uint16_t& b) {
     const int hi = (int16_t)h;
@@ -803,9 +777,7 @@ void wav2_decode(uint16_t* in, int nx, int ox, int ny, int oy, uint16_t mx) {
     }
 }
 
-// ===========================================================================
-// B44 block unpacking
-// ===========================================================================
+// ================ B44 块解包 ================
 
 void unpack14(const uint8_t* b, uint16_t s[16]) {
     s[0] = (uint16_t)((b[0] << 8) | b[1]);
@@ -839,9 +811,7 @@ void unpack3(const uint8_t* b, uint16_t s[16]) {
     for (int i = 1; i < 16; i++) s[i] = s[0];
 }
 
-// ===========================================================================
-// Block decode
-// ===========================================================================
+// ================ 块解码 ================
 
 struct Rect {
     int x0 = 0, x1 = 0, y0 = 0, y1 = 0;
@@ -856,9 +826,9 @@ size_t block_bytes(const Part& part, const Rect& r) {
     return n;
 }
 
-// Word planes, as PIZ and B44 lay a block out before it is interleaved.
+// PIZ 与 B44 在交错排列前采用的字平面布局。
 struct Plane {
-    size_t start = 0;   // in uint16 units within Scratch::words
+    size_t start = 0;   // Scratch::words 内的偏移，以 uint16 为单位
     int nx = 0, ny = 0, ys = 1, size = 1;
 };
 
@@ -1036,9 +1006,7 @@ std::string b44_uncompress(const Part& part, const Rect& r, const uint8_t* in,
     return "";
 }
 
-// ===========================================================================
-// Decoder
-// ===========================================================================
+// ================ 解码器 ================
 
 int level_count(int size, int round_up) {
     int n = size, i = 0;
@@ -1084,7 +1052,7 @@ struct Decoder {
     Selection sel;
     Info info;
     std::vector<uint64_t> offsets;
-    std::vector<int64_t> part_chunks;   // multi-part: each part has its own table
+    std::vector<int64_t> part_chunks;   // 多部件文件中，每个部件有独立的表
     int part_index = 0;
     bool multipart = false;
     int out_channels = 3;
@@ -1127,8 +1095,7 @@ std::string Decoder::open(const std::string& path) {
     }
     info.parts = (int)parts.size();
 
-    // Colour first, then anything readable: a multi-part render puts depth or
-    // an ID pass beside the beauty, and a one-channel part is not the image.
+    // 优先选择彩色部件，再选择其他可读取部件；多部件渲染中的深度或 ID 单通道层不能误当作主图。
     int chosen = -1;
     std::string why;
     for (int pass = 0; pass < 2 && chosen < 0; pass++) {
@@ -1184,8 +1151,7 @@ std::string Decoder::open(const std::string& path) {
     return read_offsets(r);
 }
 
-// Reconstructed by walking the chunks when the table is all zeros, which is
-// what an interrupted write leaves behind.
+// 写入中断会留下全零偏移表，此时遍历各块重建。
 std::string Decoder::read_offsets(Reader& r) {
     size_t count;
     if (part.tiled) {
@@ -1236,7 +1202,7 @@ void Decoder::emit_rows(const Rect& rect, const uint8_t* blk, Scratch& s) {
     if (sel.luminance_chroma && s.chroma.size() < (size_t)w * 2)
         s.chroma.assign((size_t)w * 2, 0.0f);
 
-    // Byte offset of each source channel within one row of the block.
+    // 块内单行中各源通道的字节偏移。
     const size_t stride[4] = {
         sel.idx[0] >= 0 ? (size_t)type_size(part.channels[(size_t)sel.idx[0]].type) : 0,
         sel.idx[1] >= 0 ? (size_t)type_size(part.channels[(size_t)sel.idx[1]].type) : 0,
@@ -1301,8 +1267,7 @@ void Decoder::emit_rows(const Rect& rect, const uint8_t* blk, Scratch& s) {
 }
 
 std::string Decoder::decode_chunk(size_t i, Scratch& s) {
-    // Zero is never a chunk offset -- the header is there. A mipmapped file
-    // whose upper levels were never written leaves those entries at zero.
+    // 偏移 0 位于文件头，不可能指向数据块；未写入的 mip 层条目会保留为 0。
     if (offsets[i] == 0) return "";
     const uint8_t* p = map.data() + offsets[i];
     const uint8_t* const end = map.data() + map.size();
@@ -1316,7 +1281,7 @@ std::string Decoder::decode_chunk(size_t i, Scratch& s) {
         int32_t v[4];
         std::memcpy(v, p, 16);
         p += 16;
-        if (v[2] != 0 || v[3] != 0) return "";   // mip / rip levels below the full one
+        if (v[2] != 0 || v[3] != 0) return "";   // 低于完整分辨率的 mip / rip 层级
         rect.x0 = part.dx0 + v[0] * (int)part.tile_w;
         rect.y0 = part.dy0 + v[1] * (int)part.tile_h;
         rect.x1 = std::min(rect.x0 + (int)part.tile_w - 1, part.dx1);
@@ -1377,8 +1342,7 @@ std::string Decoder::run(int threads) {
     unsigned hc = std::thread::hardware_concurrency();
     int want = threads > 0 ? threads : (hc > 0 ? (int)hc : 1);
     want = std::max(1, std::min<int>(want, (int)n));
-    // Y/RY/BY reconstructs an odd row from the chroma of the row above it, and
-    // that row is in the same chunk only when the chunk is not split up.
+    // Y/RY/BY 用上一行色度重建奇数行，只有未拆分的数据块能保证上一行位于同一块内。
     if (sel.luminance_chroma) want = 1;
 
     if (want == 1) {
@@ -1412,8 +1376,7 @@ std::string Decoder::run(int threads) {
     return first;
 }
 
-// Exact 8-bit quantization of linear_to_srgb: thresh[c] is the linear value at
-// which the code steps to c+1, so the search cannot disagree with the curve.
+// linear_to_srgb 的精确 8 位量化：thresh[c] 是编码跳至 c+1 的线性阈值，因此二分查找与曲线一致。
 const float* srgb_thresholds() {
     static const std::vector<float> t = [] {
         std::vector<float> v(255);
@@ -1438,12 +1401,10 @@ inline uint8_t quantize_unit(float x) {
     return (uint8_t)std::lround(std::min(std::max(x, 0.0f), 1.0f) * 255.0f);
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 
-// ===========================================================================
-// Public API
-// ===========================================================================
+// ================ 公共接口 ================
 
 bool is_exr(const std::string& path) {
     FILE* f = std::fopen(path.c_str(), "rb");
@@ -1476,8 +1437,7 @@ std::string decode(const std::string& path, const Options& opt, Info& info,
     d.out_channels = opt.channels;
     info = d.info;
 
-    // Only clear when the data window leaves pixels nobody will write: on a
-    // 24 MPix frame that memset is 288 MB of pure waste.
+    // 仅当数据窗口留下无人写入的像素时清零；对 2400 万像素帧，无条件 memset 会浪费 288 MB 写入。
     const size_t w = (size_t)d.info.width, h = (size_t)d.info.height;
     out.resize(w * h * (size_t)opt.channels);
     if (!d.covers_display()) std::fill(out.begin(), out.end(), 0.0f);
@@ -1511,8 +1471,7 @@ std::string decode_srgb8(const std::string& path, const Options& opt, Info& info
     const int nc = opt.channels;
     const float* thresh = srgb_thresholds();
     uint8_t* dst = out.data();
-    // A single channel is achromatic, and every gamut here maps white to
-    // white, so the matrix drops out and only the transfer is left.
+    // 单通道无色相，所有色域矩阵均保持白色，因此只需传递函数。
     d.sink = [&, dst, w, nc](int y, int x0, int n, const float* px) {
         uint8_t* o = dst + ((size_t)y * w + (size_t)x0) * (size_t)nc;
         for (int i = 0; i < n; i++, px += nc, o += nc) {
@@ -1535,4 +1494,4 @@ std::string decode_srgb8(const std::string& path, const Options& opt, Info& info
     return d.run(opt.threads);
 }
 
-}  // namespace exr
+}  // 命名空间 exr

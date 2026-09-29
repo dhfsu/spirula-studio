@@ -1,8 +1,5 @@
-// Worker pool for the CPU bundle adjustment: one for the process, not one per
-// solver. The bottom-up phase runs a mapper (and its solves) per atom worker,
-// and a pool inside each would oversubscribe the machine by that factor. So
-// parallel regions serialize against each other, which is what keeps them at
-// full width, and small solves stay inline instead of entering the pool.
+// CPU BA 共用进程级工作池，避免 bottom-up 每个原子工作线程再创建线程池而过度占用 CPU。
+// 并行区域互斥使用完整池宽度，小问题直接在调用线程求解。
 #pragma once
 
 #include <atomic>
@@ -20,9 +17,7 @@ namespace bacpu {
 
 class Pool {
 public:
-    // Machine-wide (SS_SFM_BA_THREADS overrides); a solve that wants fewer
-    // threads caps its task count instead. Sizing this from the first caller
-    // would leave every later solve as narrow as an atom worker's threads=1.
+    // 池宽度按整机设置，可由 SS_SFM_BA_THREADS 覆盖；单次求解通过任务数限流，避免首个单线程原子任务将全池永久限制为一线程。
     static Pool& get() {
         static Pool p;
         return p;
@@ -30,9 +25,7 @@ public:
 
     int size() const { return (int)workers_.size() + 1; }
 
-    // fn(task, tid) for task in [0, ntasks), handed out dynamically over at
-    // most `maxWorkers` threads. Anything reduced afterwards must be keyed on
-    // `task` rather than `tid`, or the result depends on the scheduling.
+    // 动态分配 fn(task, tid)，最多使用 maxWorkers 个线程；归约必须按 task 索引，不能按 tid，否则结果依赖调度。
     template <class F>
     void run(int ntasks, int maxWorkers, F&& fn) {
         if (ntasks <= 0) return;
@@ -79,7 +72,7 @@ private:
     }
 
     void dispatch(int ntasks, int maxWorkers, const AnyJob& job) {
-        std::lock_guard<std::mutex> region(region_);  // one parallel region at a time
+        std::lock_guard<std::mutex> region(region_);  // 同一时刻仅运行一个并行区域
         {
             std::lock_guard<std::mutex> lk(mu_);
             job_ = &job;
@@ -127,19 +120,18 @@ private:
     bool stop_ = false;
 };
 
-// Split [0, n) into `ntasks` contiguous pieces; piece `t` is [lo, hi).
+// 将 [0, n) 分成 ntasks 个连续区间，第 t 段为 [lo, hi)。
 inline void taskRange(int64_t n, int ntasks, int t, int64_t& lo, int64_t& hi) {
     int64_t q = n / ntasks, r = n % ntasks;
     lo = q * t + (t < r ? t : r);
     hi = lo + q + (t < r ? 1 : 0);
 }
 
-// `n` items at `grain` apiece, capped by the pool. One task runs inline, which
-// is what keeps a forty-image solve off the pool entirely.
+// 按 grain 粒度划分 n 项并限制在池容量内；仅一个任务时内联执行，避免小型求解进入线程池。
 inline int taskCount(int64_t n, int64_t grain, int nthreads) {
     if (n <= grain || nthreads <= 1) return 1;
     int64_t k = (n + grain - 1) / grain;
     return (int)(k < nthreads ? k : nthreads);
 }
 
-}  // namespace bacpu
+}  // 命名空间 bacpu

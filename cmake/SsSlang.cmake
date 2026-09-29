@@ -1,13 +1,9 @@
-# Locating slangc (the Slang -> SPIR-V compiler) for the Vulkan backend.
-#
-# SPIR-V blobs are never committed; they are compiled at build time (one slangc
-# edge per blob, see the SfM shader build) and embedded into the
-# binary. No Python is required for the Vulkan build.
+# 查找将 Slang 编译为 SPIR-V 的 slangc。
+# SPIR-V 在构建时逐模块编译并嵌入二进制，不提交到仓库；Vulkan 构建不依赖 Python。
 
 set(SS_SLANG_VERSION "2026.12.0.1")
 if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
-    # 2026.12.0.1 ships no macOS release assets; use the nearest release
-    # that does (upstream publishes macos-aarch64/x86_64 for 2026.12.1).
+    # 2026.12.0.1 未发布 macOS 资产，使用最近提供 macos-aarch64/x86_64 的 2026.12.1。
     set(SS_SLANG_VERSION "2026.12.1")
 endif()
 set(SS_SLANGC "" CACHE FILEPATH
@@ -28,11 +24,8 @@ function(_ss_slangc_version exe out_var)
     endif()
 endfunction()
 
-# ss_find_slangc(<out_var>)
-#
-# Returns a slangc executable matching SS_SLANG_VERSION: the one named by
-# -DSS_SLANGC, else one in PATH, else the pinned upstream release
-# downloaded into the build tree.
+# ss_find_slangc(<out_var>) 返回匹配 SS_SLANG_VERSION 的编译器。
+# 依次查找 -DSS_SLANGC、PATH，最后将固定的上游版本下载到构建目录。
 function(ss_find_slangc out_var)
     set(_slangc "${SS_SLANGC}")
     if(NOT _slangc)
@@ -99,22 +92,13 @@ function(ss_find_slangc out_var)
     set(${out_var} ${_slangc} PARENT_SCOPE)
 endfunction()
 
-# ss_build_spirv_tool(<out_var>)
-#
-# Compiles src/sfm/vk/spirv_tool.cpp once with the project
-# toolchain (try_compile + COPY_FILE, so it is portable across Windows / Linux /
-# macOS and needs neither Python nor spirv-tools) and returns the executable.
-#
-# One tool for the whole repository: the Vulkan backend uses its `discover` and
-# `embed` modes, the SfM module its `nocontract` and `embed --sfm` modes. It
-# lives under src/sfm/vk/ because it is the SfM shader build tool; it is a
-# pure host program and pulls in no Vulkan headers, so a CUDA build with
-# the standalone SfM build compiles it directly.
+# ss_build_spirv_tool(<out_var>) 通过项目工具链的 try_compile + COPY_FILE 编译 src/sfm/vk/spirv_tool.cpp 并返回程序路径。
+# 各模块共用该工具的 discover、embed、nocontract 与 embed --sfm 模式；它是纯主机程序，不依赖 Vulkan 头文件、Python 或 spirv-tools，支持 Windows/Linux/macOS。
 function(ss_build_spirv_tool out_var)
     set(tool_src ${SS_SRC}/sfm/vk/spirv_tool.cpp)
     set(tool_exe ${CMAKE_BINARY_DIR}/spirv_tool${CMAKE_EXECUTABLE_SUFFIX})
 
-    # Rebuilt only when its source is newer than the copied executable.
+    # 仅当源文件比复制出的可执行程序新时重新构建。
     if(NOT EXISTS ${tool_exe} OR ${tool_src} IS_NEWER_THAN ${tool_exe})
         try_compile(_spirv_tool_ok ${CMAKE_BINARY_DIR}/spirv_tool_build
             SOURCES ${tool_src}

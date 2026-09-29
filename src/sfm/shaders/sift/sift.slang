@@ -1,74 +1,55 @@
-// GPU SIFT feature extraction (src/sfm/README.md, extraction stage).
-//
-// A hand-written DoG/SIFT pipeline that follows VLFeat's algorithm and COLMAP's
-// default parameters (SiftExtractionOptions): first_octave -1 (2x upsample),
-// octave_resolution S = 3, sigma0 = 1.6, peak_threshold 0.02/3, edge_threshold
-// 10, up to 2 orientations per keypoint, 128-D 4x4x8 descriptor, RootSIFT
-// normalization quantized to uint8.  The host driver (sfm/feature/Sift.h)
-// owns the pyramid layout and issues one dispatch per (octave, level); this
-// module is stateless beyond its buffers.
-//
-// The whole Gaussian scale space lives in one flat `gauss` buffer and the DoG
-// in `dog`; per-level (offset,width,height) come from the `glev`/`dlev` tables
-// so a single push constant only carries indices and thresholds.  Everything is
-// plain float -- SIFT does not need the Real/Loss matrix the BA kernels do, so
-// this compiles to a single `sift` blob.
-//
-// COMPILE-TIME CONSTANTS BELOW MUST MATCH sfm/feature/Sift.h.
+// GPU DoG/SIFT 参考 VLFeat 与 COLMAP 默认：首 octave=-1，S=3，sigma0=1.6，峰阈值 0.02/3，边缘阈值 10，每点至多两方向，4×4×8 描述子并 RootSIFT 量化。
+// 主机提供各层偏移和尺寸，设备使用平铺 gauss/dog 缓冲；仅用 float，无需 BA 标量变体。
+// 编译期常量必须与 Sift.h 一致。
 
-static const int   S            = 3;        // octave_resolution (scales/octave)
-static const int   GAUSS_PER_OCT = S + 3;   // 6 Gaussian levels per octave
-static const int   DOG_PER_OCT   = S + 2;   // 5 DoG levels per octave
-static const float SIGMA0       = 1.6;      // base scale at level 0 of an octave
-static const int   FIRST_OCTAVE = -1;       // -1 upsamples the input 2x
+static const int   S            = 3;        // 每 octave 的尺度分辨率
+static const int   GAUSS_PER_OCT = S + 3;   // 每 octave 六个高斯层
+static const int   DOG_PER_OCT   = S + 2;   // 每 octave 五个 DoG 层
+static const float SIGMA0       = 1.6;      // octave 第零层基础尺度
+static const int   FIRST_OCTAVE = -1;       // -1 表示输入放大两倍
 static const float PI2          = 6.2831853071795864;
 
-static const int NBP  = 4;   // descriptor spatial bins per axis (4x4)
-static const int NBO  = 8;   // descriptor orientation bins
-static const int NORI = 36;  // orientation-assignment histogram bins
-static const float MAGNIF = 3.0;  // descriptor magnification (bin size = MAGNIF*sigma)
+static const int NBP  = 4;   // 描述子每轴空间桶数，4×4
+static const int NBO  = 8;   // 描述子方向桶数
+static const int NORI = 36;  // 方向分配的直方图桶数
+static const float MAGNIF = 3.0;  // 描述子放大系数，桶宽=MAGNIF*sigma
 
-// Raw keypoint stride (floats): [x_oct, y_oct, octave, s_cont, sigma_oct, resp]
+// 原始关键点浮点布局：[x_oct,y_oct,octave,s_cont,sigma_oct,resp]
 static const int KP_STRIDE  = 6;
-// Oriented keypoint stride (floats):
-//   [x_orig, y_orig, scale_orig, orientation, x_oct, y_oct, sigma_oct, octave]
+// 定向关键点布局：[x_orig,y_orig,scale_orig,orientation,x_oct,y_oct,sigma_oct,octave]
 static const int OKP_STRIDE = 8;
 
 [[vk::push_constant]] cbuffer PC {
     uint p0; uint p1; uint p2; uint p3; uint p4; uint p5; uint p6; uint p7;
 };
 
-[[vk::binding(0)]]  StructuredBuffer<float>   img_in;   // original grayscale [0,1]
-[[vk::binding(1)]]  RWStructuredBuffer<float> gauss;    // all Gaussian levels
-[[vk::binding(2)]]  RWStructuredBuffer<float> dog;      // all DoG levels
-[[vk::binding(3)]]  RWStructuredBuffer<float> tmpH;     // separable-blur scratch
-[[vk::binding(4)]]  StructuredBuffer<float>   weights;  // concatenated blur kernels
-[[vk::binding(5)]]  StructuredBuffer<uint4>   glev;     // (offset,w,h,_) per Gaussian level
-[[vk::binding(6)]]  StructuredBuffer<uint4>   dlev;     // (offset,w,h,octave) per DoG level
-[[vk::binding(7)]]  RWStructuredBuffer<float> kp;       // raw keypoints
-[[vk::binding(8)]]  RWStructuredBuffer<uint>  kpcount;  // [0] = raw keypoint count
-[[vk::binding(9)]]  RWStructuredBuffer<float> okp;      // oriented keypoints
-[[vk::binding(10)]] RWStructuredBuffer<uint>  okpcount; // [0] = oriented count
-[[vk::binding(11)]] RWStructuredBuffer<uint>  desc;     // 32 uint (128 uint8) per kept kp
-[[vk::binding(12)]] RWStructuredBuffer<uint>  scalehist;// log2(scale) histogram (top-K)
-[[vk::binding(13)]] RWStructuredBuffer<float> fokp;     // selected oriented keypoints (dense)
-[[vk::binding(14)]] RWStructuredBuffer<uint>  selcount; // [0] = selected count
+[[vk::binding(0)]]  StructuredBuffer<float>   img_in;   // 原始灰度，范围 [0,1]
+[[vk::binding(1)]]  RWStructuredBuffer<float> gauss;    // 全部高斯层
+[[vk::binding(2)]]  RWStructuredBuffer<float> dog;      // 全部 DoG 层
+[[vk::binding(3)]]  RWStructuredBuffer<float> tmpH;     // 可分离模糊临时区
+[[vk::binding(4)]]  StructuredBuffer<float>   weights;  // 拼接的模糊核
+[[vk::binding(5)]]  StructuredBuffer<uint4>   glev;     // 每高斯层的（偏移，宽，高，保留）
+[[vk::binding(6)]]  StructuredBuffer<uint4>   dlev;     // 每 DoG 层的（偏移，宽，高，octave）
+[[vk::binding(7)]]  RWStructuredBuffer<float> kp;       // 原始关键点
+[[vk::binding(8)]]  RWStructuredBuffer<uint>  kpcount;  // 第 0 项为原始关键点数
+[[vk::binding(9)]]  RWStructuredBuffer<float> okp;      // 已分配方向的关键点
+[[vk::binding(10)]] RWStructuredBuffer<uint>  okpcount; // 第 0 项为定向关键点数
+[[vk::binding(11)]] RWStructuredBuffer<uint>  desc;     // 每保留关键点 32 个 uint，即 128 字节
+[[vk::binding(12)]] RWStructuredBuffer<uint>  scalehist;// 用于 top-K 的 log2(scale) 直方图
+[[vk::binding(13)]] RWStructuredBuffer<float> fokp;     // 压缩后的选中定向关键点
+[[vk::binding(14)]] RWStructuredBuffer<uint>  selcount; // 第 0 项为选中数量
 
 int clampi(int v, int lo, int hi) { return max(lo, min(hi, v)); }
 
-// =====================================================================
-// Pyramid construction
-// =====================================================================
+// ================ 金字塔构建 ================
 
-// 2x bilinear upsample of the original image into a Gaussian-level slot.
-// p0=outOff  p1=inW  p2=inH  p3=outW  p4=outH
+// 将原图双线性放大两倍到高斯层槽；p0=输出偏移，p1/p2=输入宽高，p3/p4=输出宽高。
 [shader("compute")] [numthreads(16, 16, 1)]
 void upsample(uint3 t : SV_DispatchThreadID) {
     uint ox = t.x, oy = t.y;
     if (ox >= p3 || oy >= p4) return;
     int inW = int(p1), inH = int(p2);
-    // Destination pixel center maps to source coordinate (x-0.5)/2 ... align so
-    // even output pixels land on source samples (standard 2x upsample).
+    // 目标像素中心反向映射到 (x-0.5)/2，按标准两倍上采样约定对齐。
     float fx = 0.5 * float(ox) - 0.25;
     float fy = 0.5 * float(oy) - 0.25;
     int x0 = int(floor(fx)), y0 = int(floor(fy));
@@ -81,8 +62,7 @@ void upsample(uint3 t : SV_DispatchThreadID) {
     gauss[p0 + oy * p3 + ox] = top + (bot - top) * wy;
 }
 
-// Horizontal Gaussian pass: gauss[srcOff] -> tmpH.  Border = clamp (replicate).
-// p0=srcOff  p1=W  p2=H  p3=radius  p4=weightOff
+// 水平高斯：gauss[srcOff]->tmpH，边界复制；p0=源偏移，p1/p2=宽高，p3=半径，p4=权重偏移。
 [shader("compute")] [numthreads(16, 16, 1)]
 void blur_h(uint3 t : SV_DispatchThreadID) {
     uint x = t.x, y = t.y;
@@ -96,8 +76,7 @@ void blur_h(uint3 t : SV_DispatchThreadID) {
     tmpH[y * p1 + x] = acc;
 }
 
-// Vertical Gaussian pass: tmpH -> gauss[dstOff].
-// p0=dstOff  p1=W  p2=H  p3=radius  p4=weightOff
+// 垂直高斯：tmpH->gauss[dstOff]；p0=目标偏移，p1/p2=宽高，p3=半径，p4=权重偏移。
 [shader("compute")] [numthreads(16, 16, 1)]
 void blur_v(uint3 t : SV_DispatchThreadID) {
     uint x = t.x, y = t.y;
@@ -111,8 +90,7 @@ void blur_v(uint3 t : SV_DispatchThreadID) {
     gauss[p0 + y * p1 + x] = acc;
 }
 
-// Decimate by 2 (nearest): gauss[srcOff] (srcW x srcH) -> gauss[dstOff].
-// p0=srcOff  p1=dstOff  p2=srcW  p3=dstW  p4=dstH
+// 最近邻二倍抽取；p0/p1=源/目标偏移，p2=源宽，p3/p4=目标宽高。
 [shader("compute")] [numthreads(16, 16, 1)]
 void downsample(uint3 t : SV_DispatchThreadID) {
     uint x = t.x, y = t.y;
@@ -120,8 +98,7 @@ void downsample(uint3 t : SV_DispatchThreadID) {
     gauss[p1 + y * p3 + x] = gauss[p0 + (2 * y) * p2 + (2 * x)];
 }
 
-// DoG = gauss(o,d+1) - gauss(o,d).
-// p0=gLoOff  p1=gHiOff  p2=dogOff  p3=W  p4=H
+// DoG=gauss(o,d+1)-gauss(o,d)；p0/p1=低/高层偏移，p2=DoG 偏移，p3/p4=宽高。
 [shader("compute")] [numthreads(16, 16, 1)]
 void dog_diff(uint3 t : SV_DispatchThreadID) {
     uint x = t.x, y = t.y;
@@ -130,15 +107,11 @@ void dog_diff(uint3 t : SV_DispatchThreadID) {
     dog[p2 + i] = gauss[p1 + i] - gauss[p0 + i];
 }
 
-// =====================================================================
-// Extrema detection + subpixel refinement
-// =====================================================================
+// ================ 极值检测与亚像素精化 ================
 
 float dogAt(uint off, uint W, int x, int y) { return dog[off + uint(y) * W + uint(x)]; }
 
-// One thread per pixel of DoG level d in [1,S] of octave `oct`.
-// p0=oct  p1=d  p2=dogBaseOff (offset of dog(oct,0))  p3=W  p4=H  p5=kpCap
-// p6=asuint(peak_threshold)  p7=asuint(edge_threshold)
+// octave 中 d∈[1,S] 的 DoG 每像素一线程；p0=oct，p1=d，p2=首层偏移，p3/p4=宽高，p5=容量，p6/p7=峰/边缘阈值位表示。
 [shader("compute")] [numthreads(16, 16, 1)]
 void extrema(uint3 t : SV_DispatchThreadID) {
     int W = int(p3), H = int(p4);
@@ -146,7 +119,7 @@ void extrema(uint3 t : SV_DispatchThreadID) {
     if (x < 1 || y < 1 || x >= W - 1 || y >= H - 1) return;
     float peakThresh = asfloat(p6);
     float edgeThresh = asfloat(p7);
-    uint layer = p3 * p4;                 // pixels per DoG level in this octave
+    uint layer = p3 * p4;                 // 该 octave 每 DoG 层像素数
     uint offC = p2 + p1 * layer;          // dog(oct,d)
     uint offL = offC - layer;             // dog(oct,d-1)
     uint offU = offC + layer;             // dog(oct,d+1)
@@ -154,7 +127,7 @@ void extrema(uint3 t : SV_DispatchThreadID) {
     float v = dogAt(offC, p3, x, y);
     if (abs(v) < 0.8 * peakThresh) return;
 
-    // Strict extremum among the 26 neighbors across three DoG levels.
+    // 在相邻三层的 26 个邻居中检测严格极值。
     bool isMax = true, isMin = true;
     [unroll] for (int dy = -1; dy <= 1; dy++)
         [unroll] for (int dx = -1; dx <= 1; dx++) {
@@ -167,7 +140,7 @@ void extrema(uint3 t : SV_DispatchThreadID) {
         }
     if (!isMax && !isMin) return;
 
-    // Subpixel refinement: up to 5 relocations of a 3D quadratic fit.
+    // 三维二次拟合最多重定位五次，得到亚像素位置。
     int xi = x, yi = y, si = int(p1);
     float ox = 0, oy = 0, os = 0;
     float Dval = v;
@@ -187,7 +160,7 @@ void extrema(uint3 t : SV_DispatchThreadID) {
                           - dogAt(oL, p3, xi + 1, yi) + dogAt(oL, p3, xi - 1, yi));
         float dys = 0.25 * (dogAt(oU, p3, xi, yi + 1) - dogAt(oU, p3, xi, yi - 1)
                           - dogAt(oL, p3, xi, yi + 1) + dogAt(oL, p3, xi, yi - 1));
-        // Solve H * offset = -grad (3x3), via cofactor inverse.
+        // 用伴随矩阵逆求 H*offset=-grad，尺寸 3×3。
         float A00 = dxx, A01 = dxy, A02 = dxs;
         float A11 = dyy, A12 = dys, A22 = dss;
         float c00 = A11 * A22 - A12 * A12;
@@ -213,7 +186,7 @@ void extrema(uint3 t : SV_DispatchThreadID) {
     if (!ok) return;
     if (abs(Dval) < peakThresh) return;
 
-    // Edge rejection using the 2x2 spatial Hessian at the refined site.
+    // 用精化位置的 2×2 空间 Hessian 排除边缘响应。
     {
         uint oC = p2 + uint(si) * layer;
         float c   = dogAt(oC, p3, xi, yi);
@@ -240,11 +213,9 @@ void extrema(uint3 t : SV_DispatchThreadID) {
     kp[b + 5] = abs(Dval);
 }
 
-// =====================================================================
-// Gradient sampling (shared by orientation + descriptor)
-// =====================================================================
+// ================ 方向与描述子共用梯度采样 ================
 
-// Central-difference gradient of a Gaussian level; returns (mag, angle[0,2pi)).
+// 高斯层中心差分梯度，返回幅值和 [0,2pi) 方向。
 void gradAt(uint off, int W, int H, int x, int y, out float mag, out float ang) {
     int xa = clampi(x + 1, 0, W - 1), xb = clampi(x - 1, 0, W - 1);
     int ya = clampi(y + 1, 0, H - 1), yb = clampi(y - 1, 0, H - 1);
@@ -256,18 +227,15 @@ void gradAt(uint off, int W, int H, int x, int y, out float mag, out float ang) 
     ang = a;
 }
 
-// Nearest Gaussian level within an octave for a continuous scale s_cont.
+// 为连续尺度 s_cont 选择当前 octave 内最近高斯层。
 uint gaussLevelIndex(uint oct, float s_cont) {
     int s = clampi(int(round(s_cont)), 0, GAUSS_PER_OCT - 1);
     return oct * uint(GAUSS_PER_OCT) + uint(s);
 }
 
-// =====================================================================
-// Orientation assignment
-// =====================================================================
+// ================ 方向分配 ================
 
-// One thread per raw keypoint of [p3, p0). Emits up to p1 oriented keypoints.
-// p0=kpEnd  p1=maxOri  p2=okpCap  p3=kpBegin
+// [p3,p0) 每原始关键点一线程，至多输出 p1 个方向；p0=结束，p1=方向上限，p2=容量，p3=开始。
 [shader("compute")] [numthreads(64, 1, 1)]
 void orient(uint3 t : SV_DispatchThreadID) {
     uint ki = t.x + p3;
@@ -301,7 +269,7 @@ void orient(uint3 t : SV_DispatchThreadID) {
             hist[bin] += w;
         }
 
-    // Smooth the histogram 6x with a circular 3-tap box (VLFeat).
+    // 循环三点均值平滑直方图六次，与 VLFeat 一致。
     for (int pass = 0; pass < 6; pass++) {
         float prev = hist[NORI - 1];
         float first = hist[0];
@@ -318,8 +286,7 @@ void orient(uint3 t : SV_DispatchThreadID) {
     if (maxh <= 0.0) return;
     float thresh = 0.8 * maxh;
 
-    // Collect peaks (parabolic interpolation), keep the strongest p1.
-    // Only the first nbest entries are ever read; zeroed to keep slangc quiet.
+    // 峰值做抛物线插值并保留最强 p1 个；仅前 nbest 项被读，仍清零以避免编译器未初始化警告。
     float bestVal[4] = {0.0, 0.0, 0.0, 0.0};
     float bestAng[4] = {0.0, 0.0, 0.0, 0.0};
     int nbest = 0;
@@ -330,7 +297,7 @@ void orient(uint3 t : SV_DispatchThreadID) {
         float di = 0.5 * (h0 - h2) / (h0 - 2.0 * h1 + h2);
         float ang = PI2 * (float(i) + di) / float(NORI);
         if (ang < 0) ang += PI2; if (ang >= PI2) ang -= PI2;
-        // insertion into a tiny top-k by peak height
+        // 按峰高插入小型 top-k 列表
         int pos = nbest;
         while (pos > 0 && bestVal[pos - 1] < h1) {
             if (pos < cap) { bestVal[pos] = bestVal[pos - 1]; bestAng[pos] = bestAng[pos - 1]; }
@@ -359,19 +326,10 @@ void orient(uint3 t : SV_DispatchThreadID) {
     }
 }
 
-// =====================================================================
-// Top-K selection by scale (GPU histogram-select + compaction)
-// =====================================================================
-//
-// COLMAP keeps the largest-scale features when more than max_num_features are
-// found. Rather than a full sort (the phase-0 GPU radix sort does not exist
-// yet), bin log2(scale) into a histogram, let the host pick a scale threshold
-// that keeps ~K, then compact the survivors into a dense `fokp` list so the
-// expensive descriptor pass only runs on kept keypoints. The host applies the
-// exact K cut afterwards on the (already small) survivor list.
+// ================ 按尺度选择 top-K ================
+// log2(scale) 分桶后由主机选近似阈值，压缩到 fokp，仅为保留点运行昂贵描述子；主机最后精确截到 K。
 
-// One thread per oriented keypoint -> log2(scale) histogram.
-// p0=okpCount  p1=numBins  p2=asuint(logMin)  p3=asuint(invLogRange)
+// 每定向点一线程累加尺度直方图；p0=点数，p1=桶数，p2/p3=最小对数尺度/逆范围的位表示。
 [shader("compute")] [numthreads(64, 1, 1)]
 void scale_hist(uint3 t : SV_DispatchThreadID) {
     uint i = t.x;
@@ -383,8 +341,7 @@ void scale_hist(uint3 t : SV_DispatchThreadID) {
     InterlockedAdd(scalehist[uint(b)], 1u, old);
 }
 
-// Compact oriented keypoints with scale >= threshold into `fokp`.
-// p0=okpCount  p1=asuint(threshold)  p2=cap
+// 将 scale>=threshold 的点压缩到 fokp；p0=点数，p1=阈值位表示，p2=容量。
 [shader("compute")] [numthreads(64, 1, 1)]
 void select_topk(uint3 t : SV_DispatchThreadID) {
     uint i = t.x;
@@ -398,11 +355,9 @@ void select_topk(uint3 t : SV_DispatchThreadID) {
     [unroll] for (int k = 0; k < OKP_STRIDE; k++) fokp[ob + k] = okp[ib + k];
 }
 
-// =====================================================================
-// 128-D descriptor
-// =====================================================================
+// ================ 128 维描述子 ================
 
-// One thread per selected keypoint of [p1, p0).
+// [p1,p0) 每个选中关键点一线程。
 [shader("compute")] [numthreads(64, 1, 1)]
 void descriptor(uint3 t : SV_DispatchThreadID) {
     uint ki = t.x + p1;
@@ -412,15 +367,14 @@ void descriptor(uint3 t : SV_DispatchThreadID) {
     float x_oct = fokp[ob + 4], y_oct = fokp[ob + 5], sigma_oct = fokp[ob + 6];
     uint oct = uint(fokp[ob + 7]);
 
-    float s_cont = SIGMA0;  // recover s_cont from sigma_oct for the level pick
-    // sigma_oct = SIGMA0 * 2^(s_cont/S)  ->  s_cont = S*log2(sigma_oct/SIGMA0)
+    float s_cont = SIGMA0;  // 由 sigma_oct=SIGMA0*2^(s_cont/S) 恢复 s_cont=S*log2(sigma_oct/SIGMA0)，用于选层。
     s_cont = float(S) * log2(sigma_oct / SIGMA0);
     uint gi = gaussLevelIndex(oct, s_cont);
     uint4 L = glev[gi];
     uint off = L.x; int W = int(L.y), H = int(L.z);
 
     float binSize = MAGNIF * sigma_oct;
-    // Support radius: cover NBP+1 bins, rotated (sqrt2 factor), +0.5 round.
+    // 支持半径覆盖 NBP+1 桶，旋转引入 sqrt(2) 系数，再加 0.5 取整。
     int R = int(floor(1.41421356 * binSize * float(NBP + 1) * 0.5 + 0.5));
     float ct = cos(theta), st = sin(theta);
     int xi = int(round(x_oct)), yi = int(round(y_oct));
@@ -434,10 +388,10 @@ void descriptor(uint3 t : SV_DispatchThreadID) {
         for (int dx = -R; dx <= R; dx++) {
             int px = xi + dx, py = yi + dy;
             if (px < 0 || py < 0 || px >= W || py >= H) continue;
-            // Rotate sample offset into the descriptor frame, in bin units.
+            // 将采样偏移旋到描述子坐标系，以桶宽为单位。
             float rx = (ct * float(dx) + st * float(dy)) / binSize;
             float ry = (-st * float(dx) + ct * float(dy)) / binSize;
-            // continuous bin coordinates centered so bins are at 0..NBP-1
+            // 连续桶坐标居中，使桶中心编号为 0..NBP-1
             float bx = rx + float(NBP) * 0.5 - 0.5;
             float by = ry + float(NBP) * 0.5 - 0.5;
             if (bx <= -1.0 || bx >= float(NBP) || by <= -1.0 || by >= float(NBP)) continue;
@@ -452,7 +406,7 @@ void descriptor(uint3 t : SV_DispatchThreadID) {
 
             int bx0 = int(floor(bx)), by0 = int(floor(by)), ob0 = int(floor(ob_c));
             float fx = bx - float(bx0), fy = by - float(by0), fo = ob_c - float(ob0);
-            // trilinear scatter into 2x2x2 neighborhood
+            // 向 2×2×2 邻域做三线性散射
             [unroll] for (int iy = 0; iy <= 1; iy++) {
                 int yb = by0 + iy;
                 if (yb < 0 || yb >= NBP) continue;
@@ -470,8 +424,7 @@ void descriptor(uint3 t : SV_DispatchThreadID) {
             }
         }
 
-    // Normalize: L2, clip to 0.2*||d||, L2 again (VLFeat), then RootSIFT
-    // (L1-normalize + sqrt), then quantize round(512*x) clamped to 255 (COLMAP).
+    // 先 L2 归一化、截断到 0.2*||d||、再 L2，随后 RootSIFT 的 L1+sqrt，最后 round(512*x) 并钳位到 255。
     float norm = 0.0;
     [unroll] for (int i = 0; i < 128; i++) norm += d[i] * d[i];
     norm = sqrt(norm) + 1e-12;

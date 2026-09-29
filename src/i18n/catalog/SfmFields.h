@@ -1,27 +1,7 @@
 #pragma once
 
-// What every `spirula sfm` flag does -- one help sentence per row of
-// sfm/SfmConfig.h's SFM_CONFIG_FIELDS table, plus the name of each group they
-// are printed under.
-//
-// The text lives here rather than in the field table for the same reason the
-// trainer's does (i18n/catalog/TrainFields.h): `spirula sfm --help` is read by
-// whoever is running a reconstruction, and a terminal has no language picker
-// to fix it with afterwards.
-//
-// The link to the table is a TOKEN in the table's last column, so a flag added
-// with no entry here is a compile error naming the flag rather than a blank
-// line in the help. The FLAG NAMES themselves are never translated --
-// `--min-tri-angle` is `--min-tri-angle` in every language -- and neither are
-// the choice lists beside them (`low|medium|high|extreme`), which are what the
-// reader types.
-//
-// Two flags may share a name across commands (`--max-error` means one thing to
-// the mapper and a looser one to `merge`), so a few entries carry the group in
-// their name to keep them apart.
-//
-// D-numbers (D47, D68, ...) are decision records in src/sfm/README.md. They
-// stay as they are: they are a citation, not a word.
+// SfM 配置字段的帮助说明与分组标题；SFM_CONFIG_FIELDS 末列引用此目录，缺少条目会导致编译错误。
+// 选项名、候选值及引用决策记录的 D 编号保持不变；跨命令同名选项可通过分组前缀区分。
 
 #include "i18n/BeginCatalog.h"
 
@@ -30,7 +10,7 @@ namespace i18n {
 namespace msg {
 namespace sfmfield {
 
-// ---- the group headings the options are printed under ----
+// ---------------- 选项分组标题 ----------------
 
 SS_MSG(group_pipeline,
     EN("pipeline"), JA("パイプライン"), ZH_HANS("流程"), ZH_HANT("流程"),
@@ -90,9 +70,7 @@ SS_MSG(group_runtime,
     PT("execução"), IT("esecuzione"), NL("uitvoering"), RU("выполнение"),
     TR("çalışma"));
 
-// ===========================================================================
-// pipeline
-// ===========================================================================
+// ================ 流水线 ================
 
 SS_MSG(quality_help,
     EN("Working resolution, feature budget and pair-selection breadth"),
@@ -566,9 +544,7 @@ SS_MSG(mask_dir_help,
     RU("Другое имя для --masks"),
     TR("--masks için başka bir ad"));
 
-// ===========================================================================
-// colour
-// ===========================================================================
+// ================ 色彩 ================
 
 SS_MSG(image_gamut_help,
     EN("Colour primaries the input images were captured in. Pixels are "
@@ -665,9 +641,7 @@ SS_MSG(point_color_help,
        "fotoğraflarla aynı uzayda yazar, eğitim varsayılan olarak bunu kabul "
        "eder; srgb için eğitimde point-color-gamut Rec.709 olmalıdır"));
 
-// ===========================================================================
-// camera
-// ===========================================================================
+// ================ 相机 ================
 
 SS_MSG(camera_mode_help,
     EN("How images are grouped into cameras; every mode splits on image "
@@ -900,9 +874,7 @@ SS_MSG(exif_orientation_help,
        "alır, `apply` pikselleri döndürüp kameraları döndürülmüş kareye "
        "oturtur"));
 
-// ===========================================================================
-// features
-// ===========================================================================
+// ================ 特征 ================
 
 SS_MSG(features_help,
     EN("Which detector and descriptor; the aliked and loma ones are learned and "
@@ -1119,9 +1091,7 @@ SS_MSG(spv_path_help,
     RU("Загружать ядра SIFT из этого файла SPIR-V, а не из встроенного блоба"),
     TR("SIFT çekirdeklerini gömülü blob yerine bu SPIR-V dosyasından yükle"));
 
-// ===========================================================================
-// matching
-// ===========================================================================
+// ================ 匹配 ================
 
 SS_MSG(matcher_help,
     EN("How descriptors are matched. lightglue and loma-* are learned matchers, "
@@ -1471,9 +1441,7 @@ SS_MSG(prefilter_ratio_help,
     TR("Puanlama geçişinin Lowe oranı; yalnızca sıraladığı için eşleştiricininki "
        "kadar sıkı değildir"));
 
-// ===========================================================================
-// mapper
-// ===========================================================================
+// ================ 建图 ================
 
 SS_MSG(compact_unused_features_help,
     EN("Keep in memory only feature rows referenced by stored matches; files on "
@@ -2697,9 +2665,7 @@ SS_MSG(audit_evidence_help,
     TR("Denetimin duruşunu yargılaması için bir görüntünün gereksindiği karşılık "
        "sayısı"));
 
-// ===========================================================================
-// manage
-// ===========================================================================
+// ================ 模型管理 ================
 
 SS_MSG(rounds_help,
     EN("Merge levels, run until one changes nothing"),
@@ -3103,9 +3069,7 @@ SS_MSG(seam_max_rescues_help,
     TR("Dikiş kurtarmanın tek bir birleştirme geçişinde harcayabileceği "
        "iyileştirme sayısı"));
 
-// ===========================================================================
-// merge
-// ===========================================================================
+// ================ 合并 ================
 
 SS_MSG(merge_align_max_error_help,
     EN("Alignment inlier threshold in pixels; looser than the mapper's, as the "
@@ -3314,9 +3278,7 @@ SS_MSG(in_place_help,
     RU("Записать слитые модели поверх входного каталога"),
     TR("Birleştirilmiş modelleri girdi dizininin üzerine yaz"));
 
-// ===========================================================================
-// input
-// ===========================================================================
+// ================ 输入 ================
 
 SS_MSG(images_help,
     EN("Image directory, used to put real filenames back into the model"),
@@ -3427,9 +3389,7 @@ SS_MSG(check_help,
     TR("--resume ile birlikte: her modelin, kurulduğu iki görüşlü geometrilerle "
        "ne kadar uyuştuğunu bildir ve hiçbir şey yazmadan çık"));
 
-// ===========================================================================
-// runtime
-// ===========================================================================
+// ================ 运行时 ================
 
 SS_MSG(threads_help,
     EN("Host worker threads: two-view verification, and the mapper's per-point "
@@ -4053,9 +4013,9 @@ SS_MSG(sensor_gauge_help,
     TR("Telemetrinin belirlediği: `auto` denetimlerini geçen her şeyden yukarı, ölçek ve konumu, "
        "`up` yalnızca yönü alır, `none` sensörleri yok sayar"));
 
-}  // namespace sfmfield
-}  // namespace msg
-}  // namespace i18n
-}  // namespace spirula
+}  // 命名空间 sfmfield
+}  // 命名空间 msg
+}  // 命名空间 i18n
+}  // 命名空间 spirula
 
 #include "i18n/EndCatalog.h"

@@ -1,20 +1,11 @@
 #pragma once
 
-// SS_FILE -- __FILE__ trimmed to a repo-relative path, "src/core/Common.cuh".
-//
-// Both build systems hand the compiler absolute source paths, so a bare
-// __FILE__ in an error message names a directory on the machine that built the
-// binary, which is not one whoever hit the error can open. The trim and the
-// separator fold happen at compile time, so the absolute path never reaches
-// the binary either.
-//
-// Header-only for the same reason src/core/Env.h is: the standalone tool
-// binaries link neither the engine nor each other.
+// SS_FILE 将编译器提供的绝对源路径裁剪为仓库相对路径，并统一分隔符。
+// 处理在编译期完成，避免将构建机私人目录写入错误消息和二进制；仅含头文件，供独立工具共用。
 
 #include <cstddef>
 
-// The repository root, no trailing separator (CMakeLists.txt). Empty
-// leaves __FILE__ alone, so a build that does not set it still compiles.
+// 仓库根目录不含末尾分隔符，由 CMakeLists.txt 提供；为空时保留编译器原始路径。
 #ifndef SS_SOURCE_ROOT
 #define SS_SOURCE_ROOT ""
 #endif
@@ -22,7 +13,7 @@
 namespace spirula {
 namespace detail {
 
-// Windows spells one path several ways; the comparison folds both sides.
+// Windows 同一路径可能有多种写法，比较前对两侧规范化。
 constexpr char path_fold(char c) {
     return c == '\\' ? '/' :
            (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
@@ -37,9 +28,7 @@ constexpr std::size_t root_len(const char *root) {
     return n;
 }
 
-// Length of the `root` prefix of `p`, the separators after it included; 0 if
-// `p` does not start with it. The root has to end on a component boundary, or
-// a sibling of the repository directory would trim to a path inside it.
+// 返回 p 中 root 前缀及后续分隔符的长度，不匹配时为 0；须在路径分量边界结束，防止将相邻目录误裁剪。
 constexpr std::size_t root_prefix(const char *p, const char *root) {
     const std::size_t n = root_len(root);
     if (!n)
@@ -55,8 +44,7 @@ constexpr std::size_t root_prefix(const char *p, const char *root) {
     return i;
 }
 
-// `root` is a parameter so src/core/tests/source_path.cpp can drive it with
-// paths this platform never produces.
+// root 显式作为参数，便于测试当前平台不会生成的路径形式。
 template <std::size_t N>
 struct SourcePath {
     char v[N];
@@ -68,11 +56,10 @@ struct SourcePath {
     }
 };
 
-}  // namespace detail
-}  // namespace spirula
+}  // 命名空间 detail
+}  // 命名空间 spirula
 
-// Host code only. The static is what lets the trimmed string outlive the
-// expression it is used in.
+// 仅供主机代码使用；静态存储使裁剪后的字符串在表达式结束后仍有效。
 #define SS_FILE                                                                \
     ([]() -> const char * {                                                    \
         static constexpr ::spirula::detail::SourcePath<sizeof(__FILE__)>       \

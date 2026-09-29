@@ -1,10 +1,5 @@
-// Dense SPD solver for the reduced camera system on the host, in place on the
-// same packed lower triangle the GPU path uses (row r starts at r(r+1)/2).
-//
-// That layout has a per-row stride, so the trailing update copies the current
-// block column out to a contiguous panel once per step -- 4n^2 bytes over the
-// factorization against n^3/3 flops -- and both operands of every tile update
-// are then unit-stride.
+// 主机约化相机系统的稠密 SPD 求解器，原地使用与 GPU 相同的压缩下三角，第 r 行起点为 r(r+1)/2。
+// 每步将当前块列复制到连续面板，使尾部更新的两个输入均连续；总复制量为 4n^2 字节，相比 n^3/3 次浮点运算较小。
 #pragma once
 
 #include <algorithm>
@@ -55,15 +50,14 @@ public:
         });
     }
 
-    // Factor in place, then solve L L^T x = g leaving x in g.
+    // 原地分解并求解 L L^T x = g，结果 x 写回 g。
     void factorSolve(double* g, Pool& pool, int nthreads) {
         factor(pool, nthreads);
         solveInPlace(g, pool, nthreads);
     }
     void solve(double* g, Pool& pool, int nthreads) { solveInPlace(g, pool, nthreads); }
 
-    // With `diag`, a pivot under `rel` of its row's diag entry is replaced by
-    // that entry (cholesky.slang's pivot(), for the coarse matrix).
+    // 指定 diag 时，小于对应对角值 rel 比例的主元由该对角值替代，与粗矩阵 cholesky.slang 的保护一致。
     void factor(Pool& pool, int nthreads, const double* diag = nullptr, double rel = 0) {
         diag_in_ = diag;
         rel_ = rel;
@@ -120,8 +114,7 @@ public:
     }
 
 private:
-    // Right-looking factorization of one diagonal block, guarded exactly as
-    // chol_diag in sfm/shaders/ba/cholesky.slang.
+    // 对角块的右看式分解，主元保护与 chol_diag 一致。
     void factorDiag(uint32_t base, uint32_t m) {
         for (uint32_t j = 0; j < m; j++) {
             double* Rj = row(base + j) + base;
@@ -142,7 +135,7 @@ private:
         }
     }
 
-    // One row of L_ik = A_ik L_kk^-T.
+    // 计算 L_ik = A_ik L_kk^-T 的一行。
     void trsmRow(double* a, uint32_t m) {
         for (uint32_t j = 0; j < m; j++) {
             const double* Lj = &diag_[(size_t)j * m];
@@ -152,7 +145,7 @@ private:
         }
     }
 
-    // A_ij -= L_ik L_jk^T for one tile of the trailing submatrix.
+    // 对尾部子矩阵的一个块执行 A_ij -= L_ik L_jk^T。
     void updateTile(uint32_t rbase, uint32_t i, uint32_t j, uint32_t m, uint32_t rest) {
         const uint32_t r0 = i * kBlock, c0 = j * kBlock;
         const uint32_t mr = std::min(kBlock, rest - r0), nc = std::min(kBlock, rest - c0);
@@ -160,7 +153,7 @@ private:
         const double* Bt = &panelT_[(size_t)j * kBlock * kBlock];
         const uint32_t gi = rbase + r0, gj = rbase + c0;
 
-        if (i == j) {  // symmetric: lower triangle of the tile only
+        if (i == j) {  // 对称块仅处理下三角
             for (uint32_t r = 0; r < mr; r++) {
                 double* C = row(gi + r) + gj;
                 const double* Ar = A + (size_t)r * m;
@@ -174,9 +167,7 @@ private:
             return;
         }
 
-        // 2x8 accumulators fill the baseline build's 16 SSE2 registers exactly,
-        // and measured best of the shapes tried: 132 GFLOP/s at n=6102 on 32
-        // threads, against 108 for 4x4 and 90 for 6x4.
+        // 2×8 累加器恰好占满基线构建的 16 个 SSE2 寄存器；n=6102、32 线程时测得 132 GFLOP/s，优于 4×4 的 108 与 6×4 的 90。
         constexpr uint32_t MR = 2, NR = 8;
         uint32_t r = 0;
         for (; r + MR <= mr; r += MR) {
@@ -269,4 +260,4 @@ private:
     uint32_t n_ = 0;
 };
 
-}  // namespace bacpu
+}  // 命名空间 bacpu

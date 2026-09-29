@@ -1,6 +1,4 @@
-// Model merging: Sim(3) algebra, alignment, track splicing (host only).
-//
-// Prints PASS/FAIL and returns 0/1. See docs/testing.md.
+// 纯主机模型合并测试：Sim(3)、对齐与轨迹拼接。
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -19,8 +17,7 @@
 namespace fs = std::filesystem;
 using namespace sfm;
 
-// Camera at C looking at `target`, y-up. Also in sfm_map_test.cpp: a local
-// copy beats a shared test-support header for nine lines of scene setup.
+// 相机位于 C 看向 target，y 向上；简短场景初始化在测试内局部定义。
 static Pose lookAt(const Vec3& C, const Vec3& target) {
     Vec3 f = (target - C).normalized();
     Vec3 up0 = {0, 1, 0};
@@ -31,16 +28,8 @@ static Pose lookAt(const Vec3& C, const Vec3& target) {
     return {R, {-t.x, -t.y, -t.z}};
 }
 
-// -----------------------------------------------------------------------
-// merge-selftest: model merging (host only, no GPU)
-// -----------------------------------------------------------------------
-//
-// The scene is one camera arc split into two overlapping halves, each written
-// as its own reconstruction, with the second one moved into a different gauge
-// by a known similarity -- exactly what the mapper hands the merger for a
-// capture that fragmented (D41/D43). The merge has to recover that similarity
-// from the four images the halves share, put the model back together, and
-// refuse the cases where it cannot.
+// ---------------- 模型合并测试 ----------------
+// 圆弧相机分成有四张共享图像的两半，一半施加已知相似变换；合并须恢复规范并拒绝不满足条件的情况。
 int cmdMergeSelftest(int, char**) {
     int fails = 0;
     auto check = [&](bool ok, const char* what) {
@@ -73,9 +62,7 @@ int cmdMergeSelftest(int, char**) {
             }
         }
 
-    // A model over a subset of the cameras: every image carries all N feature
-    // slots (so `point2D_idx` means the same keypoint in both halves, which is
-    // what merging requires), and every point seen at least twice is triangulated.
+    // 各图保留全部 N 个特征槽，使两半的 point2D_idx 含义一致；至少双视图的点参与三角化。
     auto buildModel = [&](int first, int last) {
         Reconstruction r;
         r.cameras[1] = K;
@@ -115,10 +102,8 @@ int cmdMergeSelftest(int, char**) {
         return n ? sum / (double)n : 0.0;
     };
 
-    // ---- 1. Sim3 algebra ----
-    // Projection is invariant under a similarity applied to both the world and
-    // the cameras: that invariance is the reason a merge is possible at all,
-    // and everything below assumes transformPose/transformPoint agree on it.
+    // ---------------- Sim3 代数 ----------------
+    // 世界与相机同时变换后投影必须不变，验证 transformPose 与 transformPoint 一致。
     Sim3 S;
     S.scale = 2.7;
     S.R = angleAxisToRotation({0.3, -0.7, 0.2});
@@ -152,7 +137,7 @@ int cmdMergeSelftest(int, char**) {
         check(maxC < 1e-9, "composeSim3 is the two applied in order");
     }
 
-    // ---- 2. Umeyama on exact correspondences ----
+    // ---------------- 精确对应的 Umeyama ----------------
     {
         std::vector<Vec3> a, b;
         for (int i = 0; i < 8; i++) {
@@ -168,16 +153,14 @@ int cmdMergeSelftest(int, char**) {
         printf("  estimateSim3: scale %.6f (want %.6f), max residual %.2e\n", T.scale, S.scale,
                err);
         check(ok && err < 1e-9, "estimateSim3 does not reproduce an exact similarity");
-        // Degenerate input (all points identical) must be reported, not returned.
+        // 全部点重合的退化输入必须报告失败。
         std::vector<Vec3> same(4, Vec3{1, 2, 3});
         Sim3 bad;
         check(!estimateSim3(same, same, bad), "estimateSim3 accepted a degenerate sample");
     }
 
-    // ---- 2b. poses beat centers where captures actually fragment ----
-    // Three cameras on a straight line, which is what a corridor or a walked
-    // facade gives: their centers leave the rotation about that line free, so
-    // the center-only fit is degenerate, while the pose fit is not.
+    // ---------------- 共线相机的位姿对齐 ----------------
+    // 三个中心共线不能确定绕线旋转，完整位姿仍可确定 Sim3。
     {
         std::vector<Pose> src, dst;
         for (int i = 0; i < 3; i++) {
@@ -190,7 +173,7 @@ int cmdMergeSelftest(int, char**) {
         double err = 0;
         for (int p = 0; p < N; p += 13)
             err = std::max(err, (transformPoint(T, pts[p]) - transformPoint(S, pts[p])).norm());
-        // The same three centers through Umeyama: it "succeeds" and is wrong.
+        // 同样中心仅用 Umeyama 可能表面成功但结果错误。
         std::vector<Vec3> cs, cd;
         for (int i = 0; i < 3; i++) {
             cs.push_back(cameraCenter(src[i]));
@@ -210,10 +193,10 @@ int cmdMergeSelftest(int, char**) {
         check(uerr > 1e-3, "the center-only fit was expected to be degenerate here");
     }
 
-    // ---- 3. alignment from shared images ----
+    // ---------------- 共享图像对齐 ----------------
     Reconstruction A = buildModel(0, 7);
     Reconstruction B = buildModel(4, 11);
-    applySim3(B, S);  // the second half lives in its own gauge
+    applySim3(B, S);  // 第二半位于独立坐标规范
     {
         AlignmentResult r = alignReconstructions(B, A, MergeOptions());
         double err = 0;
@@ -227,7 +210,7 @@ int cmdMergeSelftest(int, char**) {
         check(err < 1e-2, "recovered similarity is wrong");
     }
 
-    // ---- 4. the merge itself ----
+    // ---------------- 执行合并 ----------------
     {
         MergeOptions mo;
         mo.verbose = false;
@@ -243,9 +226,7 @@ int cmdMergeSelftest(int, char**) {
         check(merges == 1 && out.size() == 1, "the two halves did not merge into one model");
         if (!out.empty()) {
             check(out.front().numRegistered() == (uint32_t)M, "merged model lost images");
-            // Tracks that meet at a shared image must be spliced, not
-            // duplicated: two copies of every point is what a merge that only
-            // concatenates would produce.
+            // 共享特征的轨迹必须拼接，不能只连接数组而生成重复三维点。
             check(out.front().points3D.size() <= (size_t)(1.2 * N),
                   "merged model has duplicate points");
             check(spliced > (size_t)(N / 2), "hardly any tracks were spliced");
@@ -253,7 +234,7 @@ int cmdMergeSelftest(int, char**) {
         }
     }
 
-    // ---- 5. too little overlap: refused, models untouched ----
+    // ---------------- 重叠不足时拒绝且保持模型 ----------------
     {
         Reconstruction a2 = buildModel(0, 5), b2 = buildModel(5, 11);
         applySim3(b2, S);
@@ -269,16 +250,14 @@ int cmdMergeSelftest(int, char**) {
               "a refused merge modified the models");
     }
 
-    // ---- 6. a wrong alignment is detected and undone ----
-    // The GUI path (a caller-supplied transform) with a transform that is
-    // plausible-looking but wrong: the images it adds land nowhere their
-    // observations support, and the merge has to come back off.
+    // ---------------- 错误外部对齐须检测并回滚 ----------------
+    // 测试界面可提供的看似合理但错误变换，新增图像缺少观测支持时必须拒绝。
     {
         MergeOptions mo;
         mo.verbose = false;
         MergeSession s({A, B}, mo);
         Sim3 bad = invertSim3(S);
-        bad.R = mul(angleAxisToRotation({0, 0.5, 0}), bad.R);  // 29 deg off
+        bad.R = mul(angleAxisToRotation({0, 0.5, 0}), bad.R);  // 旋转偏差 29 度
         bad.scale *= 1.3;
         const size_t points_before = s.model(0).points3D.size();
         const uint32_t imgs_before = s.model(0).numRegistered();
@@ -293,10 +272,8 @@ int cmdMergeSelftest(int, char**) {
         check(s.alive(1), "a refused merge consumed the source model");
     }
 
-    // ---- 7. incompatible models are refused, not merged into garbage ----
-    // Same image ids, different keypoints: the assumption that point2D_idx
-    // means the same feature in both models is broken, and COLMAP's merge
-    // would silently produce nonsense.
+    // ---------------- 拒绝不兼容模型 ----------------
+    // 同图像 ID 但关键点不同，意味着 point2D_idx 不再指向同一特征。
     {
         Reconstruction b3 = buildModel(4, 11);
         applySim3(b3, S);
@@ -307,11 +284,11 @@ int cmdMergeSelftest(int, char**) {
         check(!r.success, "aligned two models built from different features");
     }
 
-    // ---- 8. filtering removes what the merge should not keep ----
+    // ---------------- 过滤不应保留的点 ----------------
     {
         Reconstruction f = buildModel(0, 7);
         const size_t before = f.points3D.size();
-        f.points3D.begin()->second.xyz = {1000, 1000, 1000};  // nowhere near its track
+        f.points3D.begin()->second.xyz = {1000, 1000, 1000};  // 点位置远离轨迹支持
         size_t robs = 0, rpts = 0;
         filterModel(f, 4.0, 1.5, robs, rpts);
         printf("  filterModel: %zu points -> %zu (%zu obs dropped)\n", before, f.points3D.size(),
@@ -320,15 +297,8 @@ int cmdMergeSelftest(int, char**) {
               "filterModel did not drop a point that reprojects nowhere");
     }
 
-    // ---- 9. a fold: two places written on top of each other (D45) ----
-    //
-    // The failure no other test here can see, because a fold is *self*-
-    // consistent. Built literally: a second copy of the arc, its images placed
-    // at the first copy's poses and its points at the first copy's points, but
-    // with disjoint point ids -- exactly what a wrong merge or a chain of
-    // registrations through repeated structure produces. The detector must find
-    // co-located, co-oriented image pairs with no structure in common, and the
-    // split must put the two copies back in separate models.
+    // ---------------- 两处场景错误叠合的折叠（D45）----------------
+    // 复制相机和点位置但使用互斥点 ID，形成内部自洽副本；检查器应找到同位同向却无共同结构的图像对，并拆成两个模型。
     {
         Reconstruction sound = buildModel(0, 11);
         DuplicateOptions dopt;
@@ -337,8 +307,7 @@ int cmdMergeSelftest(int, char**) {
                clean.conflicts, clean.colocated);
         check(!clean.duplicated(dopt), "the fold detector fired on a sound model");
 
-        // The fold. Copy 2's image ids are offset, its poses are copy 1's, and
-        // its tracks are its own -- no point is shared with copy 1.
+        // 第二副本使用偏移图像 ID、第一副本相同位姿和独立轨迹，双方不共享点。
         Reconstruction folded = sound;
         const uint32_t off = 100;
         const uint64_t pid_off = 100000;
@@ -369,9 +338,7 @@ int cmdMergeSelftest(int, char**) {
         check(rep.duplicated(dopt), "the fold detector missed two copies at identical poses");
         check(parts.size() == 2 && sizes.size() == 2 && sizes[0] == 12 && sizes[1] == 12,
               "the fold split did not separate the two copies");
-        // ... and a caller that supplies the correspondence graph must be able
-        // to veto: if the two copies *were* matched to each other, the model is
-        // right and its tracks are merely split.
+        // 对应图若确认两副本图像曾真实匹配，应否决折叠判定，因为可能只是轨迹未合并。
         DuplicateReport vetoed = findDuplicateStructure(
             folded, dopt, [](uint32_t, uint32_t) { return true; });
         printf("  ... with every pair reported as matched: %zu conflicts (%zu vetoed)\n",
@@ -379,20 +346,14 @@ int cmdMergeSelftest(int, char**) {
         check(vetoed.conflicts == 0 && vetoed.unmatched_but_seen == rep.conflicts,
               "the matched-pair veto did not suppress the conflicts");
 
-        // The verdict is the *cut*, not the conflict count (D46). Two copies
-        // share nothing, so separating them costs no co-visibility at all --
-        // which is what makes the split safe to take by default.
+        // 按切割代价而非冲突数判断；真正独立副本分开不损失共视（D46）。
         printf("  ... the split severs %.2f%% of co-visibility (%llu of %llu) -> %s\n",
                100.0 * cut.fraction(), (unsigned long long)cut.severed,
                (unsigned long long)(cut.severed + cut.kept),
                foldSplitAccepted(rep, cut, dopt) ? "folded" : "kept whole");
         check(foldSplitAccepted(rep, cut, dopt), "the fold's split was not accepted");
 
-        // The false positive that the rate alone cannot reject: a sound, densely
-        // covisible model with conflicts declared between images that really do
-        // share structure. Cutting it has to run through that structure, so the
-        // cut is expensive and the split must be refused -- this is drjohnson,
-        // which the conflict rate rated *more* folded than the real fold.
+        // 正确密集共视模型即使人为声明冲突，切分也会切断真实结构，必须因高代价拒绝，不能仅看冲突率。
         DuplicateReport bogus;
         bogus.colocated = 20;
         bogus.conflicts = 8;
@@ -408,18 +369,12 @@ int cmdMergeSelftest(int, char**) {
         check(bcut.groups > 1 && !foldSplitAccepted(bogus, bcut, dopt),
               "a split through a sound model's own co-visibility was accepted");
 
-        // The other false positive, which the cut cost cannot reject either:
-        // the piece the conflicts cut off has to stand *on top of* something,
-        // or it is not a duplicate of anywhere (D67). The same fold with all
-        // but three of the second copy's images moved a hundred units away --
-        // the conflicts still fire, the cut still costs no co-visibility, and
-        // three images out of twelve standing where copy 1 stands is not a
-        // fold. This is what tore 358 images off a settled 5500-image model.
+        // 切出组还必须与其他部分空间重叠；将第二副本除三图外移远，仍有冲突和零共视损失，但不是真正整体折叠（D67）。
         {
             Reconstruction partial = folded;
             for (int c = 3; c <= 11; c++) {
                 Pose& p = partial.images.at((uint32_t)c + off).pose;
-                p.t = p.t - mul(p.R, Vec3{100, 0, 0});  // centre += (100,0,0)
+                p.t = p.t - mul(p.R, Vec3{100, 0, 0});  // 相机中心增加 (100,0,0)
             }
             DuplicateReport prep = findDuplicateStructure(partial, dopt);
             size_t pdropped = 0;
@@ -433,7 +388,7 @@ int cmdMergeSelftest(int, char**) {
             check(pparts.size() == 1 && pcut.reattached == 1,
                   "a piece standing on top of nothing was written out as a duplicate");
 
-            // ... while the fold itself still splits with the same bar on.
+            // 相同门限下真正折叠仍应成功拆开。
             DuplicateCut fcut;
             size_t fdropped = 0;
             std::vector<Reconstruction> fparts = splitDuplicateStructure(

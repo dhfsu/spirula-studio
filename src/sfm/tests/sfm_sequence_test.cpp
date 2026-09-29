@@ -1,7 +1,4 @@
-// Sequences (sfm/core/Sequence.h, D79): the table, its window pairs, and a
-// synthetic walk past a duplicated structure through the mapper.
-//
-// Prints PASS/FAIL and returns 0/1. See docs/testing.md.
+// 序列测试覆盖表、时间窗口及重复结构步行的增量重建（D79）。
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -80,9 +77,7 @@ static void testTable() {
     check(threw, "an image in two sequences is an error");
 }
 
-// A walk along a wall whose far end repeats its near end feature for feature:
-// room A, a corridor of its own, and room B a copy of A. Every camera of B
-// matches every camera of A that saw the same part of the pattern.
+// 房间 A 与相同房间 B 由独立走廊连接，B 中图像会与 A 相同纹理位置产生错误匹配。
 struct Walk {
     int W = 1280, H = 960;
     double focal = 800;
@@ -93,7 +88,7 @@ struct Walk {
 };
 
 static Pose lookAtX(const Vec3& C) {
-    // Camera z along world +x, camera x along world +z, camera y along world -y.
+    // 相机 z=世界 +x，相机 x=世界 +z，相机 y=世界 -y。
     Mat3 R = {0, 0, 1, 0, -1, 0, 1, 0, 0};
     Vec3 t = mul(R, C);
     return {R, {-t.x, -t.y, -t.z}};
@@ -106,7 +101,7 @@ static Walk makeWalk() {
     std::mt19937 rng(7);
     std::uniform_real_distribution<double> ux(4.5, 7.5), uy(-3.5, 3.5), uz(0, 9), uc(9, 21);
     std::normal_distribution<double> noise(0.0, 0.4);
-    // ids 0..NA-1: room A and, 21 units on, its copy; ids NA..: the corridor.
+    // 0..NA-1 表示 A 及相距 21 单位的副本，其余为走廊。
     std::vector<Vec3> A(NA), C(NC);
     for (Vec3& p : A) p = {ux(rng), uy(rng), uz(rng)};
     for (Vec3& p : C) p = {ux(rng), uy(rng), uc(rng)};
@@ -154,9 +149,7 @@ static Walk makeWalk() {
     return w;
 }
 
-// Alignment-free shape check: every inter-camera distance of the model over
-// the truth's is one scale. Returns the largest relative departure from the
-// median ratio, or -1 with too few cameras.
+// 无需对齐的形状检查：所有相机对距离与真值之比应为同一尺度，返回相对中位比的最大偏差，图像不足时为 -1。
 static double shapeError(const Reconstruction& m, const Walk& w, uint32_t& registered) {
     std::vector<uint32_t> ids;
     for (const auto& kv : m.images)

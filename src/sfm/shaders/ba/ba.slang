@@ -1,27 +1,16 @@
-// Bundle adjustment kernels (sfm/ba/README.md).
-//
-// Parameterization (sfm/ba/Problem.h): a 6-DOF pose per frame, a 6-DOF
-// cam_from_rig per rig member, intrinsics per group; the camera-side unknown
-// vector u (n_dim) is [frame poses | free member extrinsics | free group
-// intrinsics]. Points are Schur-eliminated: S = J_u^T J_u - A_up (App +
-// lambda)^-1 A_up^T is assembled into a packed lower triangle (cholesky.slang)
-// or applied matrix-free (cg.slang). The Jacobian pass stores Jc (2 x dof), Jp
-// (2 x 3) and the weighted residual per observation; A_cp = Jc^T Jp is never
-// materialized. Push constants: u0..u3 counts / offsets, f0..f3 damping / loss,
-// u4 is the first item of a launch the host split into ranges (sfm/ba/Solver.h).
+// BA 内核，未知量为 [帧位姿 | 自由成员外参 | 自由组内参]；点经 Schur 消元，S=J_u^T J_u-A_up(App+lambda)^-1 A_up^T，可显式压缩存储或隐式应用。
+// 逐观测保存 Jc(2×dof)、Jp(2×3) 与加权残差，不显式生成 A_cp=Jc^T Jp。
+// 推送常量 u0..u3 为数量/偏移，f0..f3 为阻尼/损失，u4 为主机分段后的首项。
 
 #include "common/camera.slang"
 #include "common/loss.slang"
 
-// Dof tiers of the model-agnostic kernels (register arrays sized by MD); the
-// host picks the narrowest the problem fits (sfm/ba/Solver.h pickTiers).
-// The rig tier is 6 + 6 + 12; must match kMaxCamDof in sfm/ba/Problem.h.
+// 主机选择能容纳问题的最窄自由度档；rig 档为 6+6+12，须与 Problem.h 的 kMaxCamDof 一致。
 static const int kDofCompact = 12;
 static const int kDofMid = 14;
 static const int kDofWide = 18;
 static const int kDofRig = 24;
-// Preconditioner blocks never exceed the wide tier: exclusive problems have no
-// rig, and a rigged problem's blocks are per frame / member / group.
+// 预条件块不超过宽档；有 rig 时按帧、成员和组分别成块。
 static const int kPrecDof = kDofWide;
 static const uint kNoMember = 0xFFFFFFFFu;
 
@@ -31,76 +20,61 @@ static const uint kNoMember = 0xFFFFFFFFu;
     uint u4;
 };
 
-// ---- problem data ----
-[[vk::binding(0)]]  StructuredBuffer<Real> u_obs;          // (2 per obs)
-[[vk::binding(1)]]  StructuredBuffer<uint> u_obs_image;    // (per obs)
-[[vk::binding(2)]]  StructuredBuffer<uint> u_obs_point;    // (per obs)
-[[vk::binding(3)]]  StructuredBuffer<uint4> u_image_info;  // (per image) x=frame, y=member (kNoMember: none), z=group, w=flags (bit0: frame shared)
-[[vk::binding(4)]]  StructuredBuffer<uint4> u_group_info;  // (per group) x=intr param offset, y=intr column base, z=n_intr, w=model id
-[[vk::binding(5)]]  RWStructuredBuffer<Real> u_poses;      // (6 per frame)
-[[vk::binding(6)]]  RWStructuredBuffer<Real> u_intr;       // (flat intrinsics)
-[[vk::binding(7)]]  RWStructuredBuffer<Real> u_points;     // (3 per point)
-[[vk::binding(8)]]  StructuredBuffer<uint> u_obs_ranges;   // (num_points+1) obs sorted by point
-[[vk::binding(9)]]  StructuredBuffer<uint> u_model_obs;    // per-model obs index lists, concatenated
-[[vk::binding(10)]] StructuredBuffer<uint> u_jc_off;       // (per obs) element offset into u_Jc
+// ---------------- 问题数据 ----------------
+[[vk::binding(0)]]  StructuredBuffer<Real> u_obs;          // 每观测 2 项
+[[vk::binding(1)]]  StructuredBuffer<uint> u_obs_image;    // 逐观测
+[[vk::binding(2)]]  StructuredBuffer<uint> u_obs_point;    // 逐观测
+[[vk::binding(3)]]  StructuredBuffer<uint4> u_image_info;  // 逐图像：x=帧，y=成员（kNoMember 表示无），z=组，w=标志，第 0 位表示共享帧
+[[vk::binding(4)]]  StructuredBuffer<uint4> u_group_info;  // 逐组：x=内参偏移，y=内参列起点，z=自由内参数，w=模型 ID
+[[vk::binding(5)]]  RWStructuredBuffer<Real> u_poses;      // 每帧 6 项
+[[vk::binding(6)]]  RWStructuredBuffer<Real> u_intr;       // 平铺内参
+[[vk::binding(7)]]  RWStructuredBuffer<Real> u_points;     // 每点 3 项
+[[vk::binding(8)]]  StructuredBuffer<uint> u_obs_ranges;   // num_points+1 项，观测按点排序
+[[vk::binding(9)]]  StructuredBuffer<uint> u_model_obs;    // 拼接的逐模型观测索引列表
+[[vk::binding(10)]] StructuredBuffer<uint> u_jc_off;       // 逐观测在 u_Jc 中的元素偏移
 
-// ---- work buffers (double-bound: Real view + atomic-word view) ----
-[[vk::binding(11)]] RWStructuredBuffer<Real> u_Jp;         // point Jacobian, [6*o + 2*j + row]
-[[vk::binding(12)]] RWStructuredBuffer<Real> u_S;          // packed lower triangle, n_dim*(n_dim+1)/2
+// ---------------- 工作缓冲：Real 与原子字双视图 ----------------
+[[vk::binding(11)]] RWStructuredBuffer<Real> u_Jp;         // 点雅可比，索引 [6*o+2*j+row]
+[[vk::binding(12)]] RWStructuredBuffer<Real> u_S;          // 压缩下三角，共 n_dim*(n_dim+1)/2 项
 [[vk::binding(13)]] RWStructuredBuffer<AWord> u_S_a;
-[[vk::binding(14)]] RWStructuredBuffer<Real> u_g;          // gradient -> in-place solution dU
+[[vk::binding(14)]] RWStructuredBuffer<Real> u_g;          // 梯度缓冲原地改写为解 dU
 [[vk::binding(15)]] RWStructuredBuffer<AWord> u_g_a;
-[[vk::binding(16)]] RWStructuredBuffer<Real> u_App;        // (9 per point)
+[[vk::binding(16)]] RWStructuredBuffer<Real> u_App;        // 每点 9 项
 [[vk::binding(17)]] RWStructuredBuffer<AWord> u_App_a;
-[[vk::binding(18)]] RWStructuredBuffer<Real> u_Bp;         // (3 per point)
+[[vk::binding(18)]] RWStructuredBuffer<Real> u_Bp;         // 每点 3 项
 [[vk::binding(19)]] RWStructuredBuffer<AWord> u_Bp_a;
 [[vk::binding(20)]] RWStructuredBuffer<Real> u_cost;       // (1)
 [[vk::binding(21)]] RWStructuredBuffer<AWord> u_cost_a;
 
-// ---- pair-aggregated Schur tables (see sfm/ba/Problem.h buildPairTables) ----
-[[vk::binding(22)]] StructuredBuffer<uint2> u_pair_entries; // (obs_i, obs_j) per entry
-[[vk::binding(23)]] StructuredBuffer<uint2> u_pair_chunks;  // (offset, count|atomic_flag)
-[[vk::binding(24)]] RWStructuredBuffer<Real> u_W;           // (9 per point) (App+l)^-1
-[[vk::binding(25)]] RWStructuredBuffer<Real> u_Y;           // (Jp W)^T per obs, [6*o + 2*j + row]
-[[vk::binding(26)]] RWStructuredBuffer<Real> u_y;           // (n_dim) triangular-solve scratch
-[[vk::binding(27)]] RWStructuredBuffer<Real> u_Jc;          // camera Jacobian rows per obs,
-                                                            // [2*a+row], offset u_jc_off
-[[vk::binding(28)]] RWStructuredBuffer<Real> u_res;         // weighted residual (2 per obs)
+// ---------------- 按图像对聚合的 Schur 表，见 buildPairTables ----------------
+[[vk::binding(22)]] StructuredBuffer<uint2> u_pair_entries; // 每条目保存 (obs_i,obs_j)
+[[vk::binding(23)]] StructuredBuffer<uint2> u_pair_chunks;  // 偏移与 count|atomic_flag
+[[vk::binding(24)]] RWStructuredBuffer<Real> u_W;           // 每点 9 项，(App+l)^-1
+[[vk::binding(25)]] RWStructuredBuffer<Real> u_Y;           // 逐观测 (Jp W)^T，索引 [6*o+2*j+row]
+[[vk::binding(26)]] RWStructuredBuffer<Real> u_y;           // n_dim 项的三角求解临时区
+[[vk::binding(27)]] RWStructuredBuffer<Real> u_Jc;          // 逐观测相机雅可比，块内 [2*a+row]，起点 u_jc_off
+[[vk::binding(28)]] RWStructuredBuffer<Real> u_res;         // 加权残差，每观测 2 项
 
-// ---- rigs (bindings 29..44 are cg.slang's, 47..51 prior.slang's) ----
-[[vk::binding(45)]] StructuredBuffer<uint4> u_member_info;  // (per member) x=ext offset, y=ext column base, z=n_free, w=free-parameter mask
-[[vk::binding(46)]] RWStructuredBuffer<Real> u_exts;        // (6 per member) cam_from_rig
+// ---------------- rig：29..44 为 CG 绑定，47..51 为先验绑定 ----------------
+[[vk::binding(45)]] StructuredBuffer<uint4> u_member_info;  // 逐成员：x=外参偏移，y=外参列起点，z=自由参数数，w=自由参数掩码
+[[vk::binding(46)]] RWStructuredBuffer<Real> u_exts;        // 每成员 6 项 cam_from_rig
 
-// packed lower-triangular index, row >= col
+// 压缩下三角索引，row >= col
 uint pidx(uint r, uint c) { return r * (r + 1) / 2 + c; }
 
-// =====================================================================
-// cost
-// =====================================================================
+// ================ 代价 ================
 
 static const uint kCostWg = 256;
 
-// Three groupshared pools, sized to what actually uses them. The *sum* of a
-// module's Workgroup variables counts against maxComputeSharedMemorySize, so
-// they cannot be handed out per kernel freely -- but they must not be one pool
-// either: a driver allocates each pipeline the shared memory its entry point
-// reaches, and a 32-thread workgroup carrying the Cholesky pool's 16.9 kB
-// (double) fits about five to an SM. That costs nothing for a kernel that
-// never touches shared memory, and 2.2x for schur_pair, which lives on it
-// (measured, RTX 4080 Super). The three together are ~26 kB at fp64, inside
-// every device's 32 kB floor.
-//
-// g_chol - the Cholesky tiles: two 32x32 blocks, the second at kSh2 with row
-//          pitch 33 to avoid bank conflicts, plus a vector for the solves
-// g_pair - schur_pair's per-entry staging (see kPr* below)
-// g_sh   - everything small: block reductions, and the CG kernels' per-obs and
-//          per-chunk staging
+// 共享内存分三池，模块总量 fp64 约 26 KB，低于 32 KB 基线；流水线仅分配入口实际访问的池。
+// g_chol 存两个 32×32 块及求解向量，第二块行距 33；g_pair 存 Schur 分批中间量，g_sh 存小型归约与 CG 临时量。
+// 若全部共用 16.9 KB Cholesky 池，32 线程组占用受限，RTX 4080 Super 的 schur_pair 实测慢 2.2 倍。
 static const uint kSh2 = 32 * 32;
 static const uint kShPool = 32 * 32 + 32 * 33 + 32;
 groupshared Real g_chol[kShPool];
 groupshared Real g_sh[512];
 
-// u0 = obs count for this model, u1 = offset into u_model_obs, f0 = loss param
+// u0 为模型观测数，u1 为 u_model_obs 偏移，f0 为损失参数
 void cost_impl<M : ICameraModel, let RIG : int>(uint tid, uint lid) {
     Real c = Real(0.0);
     if (tid < u0) {
@@ -141,18 +115,10 @@ void cost_impl<M : ICameraModel, let RIG : int>(uint tid, uint lid) {
         atomicAccum(u_cost_a, 0, g_sh[0]);
 }
 
-// =====================================================================
-// residual/jacobian evaluation: Jc, Jp, weighted residual, App, Bp
-// =====================================================================
+// ================ 残差、雅可比、App 与 Bp ================
 
-// The S/g accumulation is *not* done here on any path -- the Schur kernels own
-// it, since a workgroup that already holds a camera's whole observation list
-// can sum the J^T J block in registers instead of issuing ~dof^2 heavily
-// contended atomics per observation (for the df config the CAS-loop contention
-// dominated this kernel). It also makes the pass idempotent in the parameters:
-// a rejected step restores them and every downstream kernel can simply re-run,
-// which is why no path snapshots S.
-// u0 = obs count for this model, u1 = offset into u_model_obs, f0 = loss param
+// S/g 统一由 Schur 阶段累加，可在寄存器合并整相机 J^T J，避免逐观测 dof² 次高争用原子操作。
+// 雅可比阶段对参数幂等，拒绝步骤恢复参数后可直接重跑下游，无需备份 S；u0/u1 为观测数量/偏移，f0 为损失参数。
 void jac_impl<M : ICameraModel, let RIG : int>(uint tid) {
     if (tid >= u0) return;
     uint o = u_model_obs[u1 + tid];
@@ -168,9 +134,7 @@ void jac_impl<M : ICameraModel, let RIG : int>(uint tid) {
     RVec3 X = rvec3(u_points[3 * pt + 0], u_points[3 * pt + 1], u_points[3 * pt + 2]);
     RVec2 obs = rvec2(u_obs[2 * o + 0], u_obs[2 * o + 1]);
 
-    // Evaluated over [frame 6 | member 6 if RIG | intrinsics kNumIntr]; stored
-    // packed as [6 | mfree | gi.z], since a held parameter owns no column
-    // (D50). The loops stay unrolled over the static DOF and predicate.
+    // 求值布局为 [帧6 | rig 成员6 | 模型全部内参]，存储仅保留 [6 | mfree | gi.z] 自由列；固定参数不占列（D50）。
     const int NE = RIG != 0 ? 6 : 0;
     const int DOF = 6 + NE + M.kNumIntr;
     uint mfree = 0, mmask = 0;
@@ -194,7 +158,7 @@ void jac_impl<M : ICameraModel, let RIG : int>(uint tid) {
     Real s = r.x * r.x + r.y * r.y;
     Real sw = sqrt(Loss.weight(s, f0));
 
-    // Jacobian rows via two backward passes
+    // 两次反向微分得到雅可比的两行
     {
         var dp_pose = diffPair(pose);
         var dp_ext = diffPair(ext);
@@ -222,7 +186,7 @@ void jac_impl<M : ICameraModel, let RIG : int>(uint tid) {
     uint jb = u_jc_off[o];
     [ForceUnroll]
     for (int a = 0; a < DOF; a++) {
-        // Where column `a` of the evaluated block lands in the packed one.
+        // 求值列 a 在压缩自由列中的位置。
         uint dst;
         bool write;
         if (a < 6) {
@@ -249,7 +213,7 @@ void jac_impl<M : ICameraModel, let RIG : int>(uint tid) {
     u_res[2 * o] = r.x;
     u_res[2 * o + 1] = r.y;
 
-    // App += Jp^T Jp (full 3x3), Bp += Jp^T r
+    // App += Jp^T Jp（完整 3×3），Bp += Jp^T r
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
             Real v = Jp[0][i] * Jp[0][j] + Jp[1][i] * Jp[1][j];
@@ -262,12 +226,9 @@ void jac_impl<M : ICameraModel, let RIG : int>(uint tid) {
     }
 }
 
-// =====================================================================
-// Schur complement (model-agnostic; uses per-obs tables only)
-// =====================================================================
+// ================ 与相机模型无关的 Schur 补 ================
 
-// Global columns of image `img`: [frame | member extrinsic | intrinsics],
-// the packed Jacobian's order (jac_impl).
+// 图像全局列按 [帧 | 成员外参 | 内参] 排列，与压缩雅可比一致。
 void camCols<let MD : int>(uint img, out uint dof, out uint cols[MD]) {
     uint4 ii = u_image_info[img];
     uint4 gi = u_group_info[ii.z];
@@ -287,21 +248,13 @@ void obsCamCols<let MD : int>(uint o, out uint dof, out uint base, out uint cols
     base = u_jc_off[o];
 }
 
-// One thread per observation ("row" i of its point's pair block):
-//   S += Jc^T Jc,  g += Jc^T r,  S -= A_up (App+l)^-1 A_up^T,  g -= A_up W Bp
-// Work per thread is linear in the point's track length (one thread per point
-// would be quadratic and can exceed the GPU watchdog on long tracks).
-//
-// The atomic fallback for the Schur assembly: the pair kernel below aggregates
-// the same sums per image pair and needs no atomics, but it requires exclusive
-// column ownership. The (1+lambda) damping of the J^T J diagonal is folded in
-// here exactly as it is there.
-// u0 = num_obs, f0 = lambda_point
+// 每观测一线程，累加 Jc^T Jc 与梯度，再减 Schur 项；每线程成本随轨迹长度线性，避免逐点平方任务触发看门狗。
+// 此为支持共享列的原子回退，图像对内核要求独占列；对角乘法阻尼同样在此合并。u0=观测数，f0=点阻尼。
 void schurObsImpl<let MD : int>(uint ti) {
     if (ti >= u0) return;
     uint p = u_obs_point[ti];
 
-    // W = (App + lambda)^-1, already inverted per point by point_prep
+    // W=(App+lambda)^-1，已由 point_prep 逐点预计算
     Real W[9];
     for (int i = 0; i < 9; i++) W[i] = u_W[9 * p + i];
 
@@ -311,7 +264,7 @@ void schurObsImpl<let MD : int>(uint ti) {
     Real Jci[2 * MD];
     for (uint a = 0; a < 2 * dof_i; a++) Jci[a] = u_Jc[jb_i + a];
 
-    // Y = (Jp_i W)^T, 2x3 stored column-major like u_Jp
+    // Y=(Jp_i W)^T，2×3 按列存储，与 u_Jp 一致
     Real Y[6];
     for (int j = 0; j < 3; j++)
         for (int row = 0; row < 2; row++)
@@ -319,7 +272,7 @@ void schurObsImpl<let MD : int>(uint ti) {
                            + u_Jp[6 * ti + 2 + row] * W[3 + j]
                            + u_Jp[6 * ti + 4 + row] * W[6 + j];
 
-    // S += Jc^T Jc (damped diagonal), g += Jc^T r - Jc^T (Y Bp)
+    // S+=Jc^T Jc，含对角阻尼；g+=Jc^T r-Jc^T(Y Bp)
     Real yb0 = Y[0] * u_Bp[3 * p] + Y[2] * u_Bp[3 * p + 1] + Y[4] * u_Bp[3 * p + 2];
     Real yb1 = Y[1] * u_Bp[3 * p] + Y[3] * u_Bp[3 * p + 1] + Y[5] * u_Bp[3 * p + 2];
     Real r0 = u_res[2 * ti], r1 = u_res[2 * ti + 1];
@@ -335,15 +288,14 @@ void schurObsImpl<let MD : int>(uint ti) {
             atomicAccum(u_g_a, cols_i[a], gv);
     }
 
-    // S -= Jc_i^T (Jp_i W Jp_j^T) Jc_j over all observations j of the same
-    // point (ordered pairs across threads); only write row >= col
+    // 对同点全部观测 j 累加 S-=Jc_i^T(Jp_i W Jp_j^T)Jc_j，仅写 row>=col。
     uint t0 = u_obs_ranges[p];
     uint t1 = u_obs_ranges[p + 1];
     for (uint tj = t0; tj < t1; tj++) {
         uint dof_j, jb_j;
         uint cols_j[MD];
         obsCamCols<MD>(tj, dof_j, jb_j, cols_j);
-        // Q = Y Jp_j^T, 2x2
+        // Q=Y Jp_j^T，尺寸 2×2
         Real q00 = Real(0.0), q01 = Real(0.0), q10 = Real(0.0), q11 = Real(0.0);
         for (int j = 0; j < 3; j++) {
             Real b0 = u_Jp[6 * tj + 2 * j], b1 = u_Jp[6 * tj + 2 * j + 1];
@@ -367,8 +319,7 @@ void schurObsImpl<let MD : int>(uint ti) {
     }
 }
 
-// Precompute per-point W = (App + l)^-1 (used by acp_prep and point_update).
-// u0 = num_points, f0 = lambda_point
+// 逐点预计算 W=(App+l)^-1，供 acp_prep 与点更新使用；u0=点数，f0=点阻尼。
 [shader("compute")] [numthreads(256, 1, 1)]
 void point_prep(uint3 t : SV_DispatchThreadID) {
     uint p = t.x;
@@ -383,9 +334,7 @@ void point_prep(uint3 t : SV_DispatchThreadID) {
     for (int i = 0; i < 9; i++) u_W[9 * p + i] = Ai[i];
 }
 
-// Precompute Y = (Jp W)^T per observation (W depends only on the obs's point),
-// so the pair-Schur kernel's per-entry 2x2 middle matrix is one small product.
-// u0 = num_obs
+// 逐观测预计算 Y=(Jp W)^T，使 pair-Schur 中间 2×2 矩阵仅需小矩阵乘；u0=观测数。
 [shader("compute")] [numthreads(256, 1, 1)]
 void y_prep(uint3 t : SV_DispatchThreadID) {
     uint o = t.x + u4;
@@ -401,33 +350,17 @@ void y_prep(uint3 t : SV_DispatchThreadID) {
                 Jp[row] * W[j] + Jp[2 + row] * W[3 + j] + Jp[4 + row] * W[6 + j];
 }
 
-// Pair-aggregated Schur complement: one workgroup (warp) per chunk of one
-// unordered image pair {a,b}. Each element of S belongs to exactly one image
-// pair (per-image intrinsics groups; checked host-side), so the accumulated
-// dof_i x dof_j block is written back without atomics unless the pair was
-// split across chunks (flag bit 31). Diagonal pairs (a==b; their entries are
-// exactly the observations of that camera) additionally accumulate the
-// deferred J^T J block and gradient J^T r - Acp W Bp from u_Jc/u_res, and
-// apply the multiplicative damping (1+lambda) to the global diagonal, so
-// neither the Jacobian kernel nor damp_S touches S/g on this path.
-// u0 = num chunks, f0 = lambda
+// 每 warp 处理一个无序图像对块，独占 S 的块时无原子写入，跨块共享时由计数第 31 位标记原子累加。
+// 对角对额外累加 J^T J 与梯度，并合并全局对角 (1+lambda) 阻尼，因此雅可比与独立阻尼阶段不再写 S/g。u0=块数，f0=lambda。
 static const uint kPairWg = 32;
-// Wide-tier element count, used by the (untiered) CG pair kernel in cg.slang.
+// 宽档元素数，供未分档的 CG 图像对内核使用。
 static const uint kPairEl = (kPrecDof * kPrecDof + kPairWg - 1) / kPairWg;
 
-// Groupshared staging for the per-entry 2x2 middle matrix Q = Y_i Jp_j^T (plus
-// the 2-vector Y_i Bp the diagonal pairs' gradient wants) and the
-// half-contracted Z = Q^T Jc_i, so each element of the block costs one 2-term
-// dot product (see the A_cp note at the top of the file).
-//
-// Staged kPrB entries at a time: the cooperative steps need a barrier each, and
-// at one entry per barrier the synchronization cost buried the arithmetic
-// (measured 2.3x slower than the materialized-A_cp kernel it replaced, which
-// had none). Batching amortizes them away while the per-element work stays at
-// two multiplies instead of three.
-static const uint kPrB = 8;         // entries staged per barrier round
-static const uint kPrQ = 0;         // 6 per entry: Q (4) then Y_i Bp (2)
-static const uint kPrZ = 6 * kPrB;  // 2*MD per entry, then Jc_j the same again
+// 共享暂存 Q=Y_i Jp_j^T、Y_i Bp 与 Z=Q^T Jc_i，使每块元素仅需两项点积。
+// 每屏障批量处理 kPrB 条目；逐条屏障曾比显式 A_cp 版本慢 2.3 倍，批量摊薄同步成本。
+static const uint kPrB = 8;         // 每轮屏障暂存的条目数
+static const uint kPrQ = 0;         // 每条目 6 项：Q 占 4，Y_i Bp 占 2
+static const uint kPrZ = 6 * kPrB;  // 每条目 2*MD 项，再接同大小 Jc_j
 groupshared Real g_pair[6 * kPrB + 4 * kPrB * kPrecDof];
 
 void schurPairImpl<let MD : int>(uint wgx, uint gi) {
@@ -445,10 +378,10 @@ void schurPairImpl<let MD : int>(uint wgx, uint gi) {
     obsCamCols<MD>(e0.y, dof_j, base0_j, cols_j);
     bool diag = e0.x == e0.y;
 
-    // static element ownership: element el = r*dof_j + c owned by lane el%32
+    // 元素 el=r*dof_j+c 由 lane el%32 固定负责
     uint nel = dof_i * dof_j;
     Real acc[kEl];
-    Real acc2[kEl];  // deferred J^T J (diagonal pairs only)
+    Real acc2[kEl];  // 延后的 J^T J，仅对角图像对使用
     uint elr[kEl], elc[kEl];
     [ForceUnroll]
     for (uint k = 0; k < kEl; k++) {
@@ -460,11 +393,11 @@ void schurPairImpl<let MD : int>(uint wgx, uint gi) {
     }
     Real gacc = Real(0.0);
 
-    const uint kZs = 2 * MD;              // per-entry stride of the staged blocks
-    const uint kPrJ = kPrZ + kPrB * kZs;  // staged Jc_j
+    const uint kZs = 2 * MD;              // 暂存块的逐条目步长
+    const uint kPrJ = kPrZ + kPrB * kZs;  // 暂存的 Jc_j
     for (uint t0 = 0; t0 < count; t0 += kPrB) {
         uint nb = min(kPrB, count - t0);
-        GroupMemoryBarrierWithGroupSync();  // previous batch done being read
+        GroupMemoryBarrierWithGroupSync();  // 前一批已读取完毕
         for (uint i = gi; i < nb * 6; i += kPairWg) {
             uint b = i / 6, m = i - 6 * b;
             uint2 e = u_pair_entries[off + t0 + b];
@@ -474,7 +407,7 @@ void schurPairImpl<let MD : int>(uint wgx, uint gi) {
                 v = u_Y[6 * e.x + qr] * u_Jp[6 * e.y + qs]
                   + u_Y[6 * e.x + 2 + qr] * u_Jp[6 * e.y + 2 + qs]
                   + u_Y[6 * e.x + 4 + qr] * u_Jp[6 * e.y + 4 + qs];
-            } else if (diag) {  // (Y_i Bp)[row], only the gradient wants it
+            } else if (diag) {  // (Y_i Bp)[row]，仅梯度使用
                 uint row = m - 4;
                 uint p = u_obs_point[e.x];
                 v = u_Y[6 * e.x + row] * u_Bp[3 * p] + u_Y[6 * e.x + 2 + row] * u_Bp[3 * p + 1]
@@ -499,17 +432,14 @@ void schurPairImpl<let MD : int>(uint wgx, uint gi) {
         GroupMemoryBarrierWithGroupSync();
         for (uint b = 0; b < nb; b++) {
             uint zb = kPrZ + kZs * b, jb = kPrJ + kZs * b;
-            // Jc_i stays in global for the deferred J^T J block: a diagonal
-            // pair has Jc_i == Jc_j staged right there, but taking it from
-            // shared as well costs 45% -- two shared operands per product is
-            // one too many, and these reads all hit L1 anyway.
+            // 延后 J^T J 的 Jc_i 保留从全局读取；双共享输入实测增加 45% 成本，而全局读通常命中 L1。
             uint bi = u_jc_off[u_pair_entries[off + t0 + b].x];
             [ForceUnroll]
             for (uint k = 0; k < kEl; k++) {
                 uint el = gi + kPairWg * k;
                 if (el >= nel) continue;
                 uint r = elr[k], c = elc[k];
-                if (diag && r < c) continue;  // symmetric block: lower triangle only
+                if (diag && r < c) continue;  // 对称块仅计算下三角
                 acc[k] = acc[k] + g_pair[zb + 2 * r] * g_pair[jb + 2 * c]
                                 + g_pair[zb + 2 * r + 1] * g_pair[jb + 2 * c + 1];
                 if (diag)
@@ -534,7 +464,7 @@ void schurPairImpl<let MD : int>(uint wgx, uint gi) {
         if (diag) {
             Real jj = acc2[k];
             if (r == c)
-                jj = jj * (Real(1.0) + Real(f0));  // damp_S folded in
+                jj = jj * (Real(1.0) + Real(f0));  // 已合并 damp_S 的阻尼操作
             v = v + jj;
         }
         if (!isfinite(v)) continue;
@@ -554,11 +484,9 @@ void schurPairImpl<let MD : int>(uint wgx, uint gi) {
     }
 }
 
-// =====================================================================
-// parameter updates (after cholesky solve leaves dU in u_g)
-// =====================================================================
+// ================ 参数更新，Cholesky 解 dU 位于 u_g ================
 
-// Bp -= Acp^T dU = Jp^T (Jc dU), one thread per observation; u0 = num_obs
+// Bp-=Acp^T dU=Jp^T(Jc dU)，每观测一线程，u0=观测数。
 void dpAccumImpl<let MD : int>(uint o) {
     if (o >= u0) return;
     uint dof, base;
@@ -578,8 +506,7 @@ void dpAccumImpl<let MD : int>(uint o) {
     }
 }
 
-// dP = (App+l)^-1 Bp; points -= dP.  W was precomputed by point_prep with the
-// same lambda; Bp has since been updated in place by dp_accum.  u0 = num_points
+// dP=(App+l)^-1 Bp，points-=dP；W 使用相同阻尼预计算，Bp 已由 dp_accum 原地更新，u0=点数。
 [shader("compute")] [numthreads(256, 1, 1)]
 void point_update(uint3 t : SV_DispatchThreadID) {
     uint p = t.x;
@@ -592,7 +519,7 @@ void point_update(uint3 t : SV_DispatchThreadID) {
     }
 }
 
-// frame poses -= dU.  u0 = pose_dim
+// 帧位姿减去 dU，u0=pose_dim。
 [shader("compute")] [numthreads(256, 1, 1)]
 void cam_update(uint3 t : SV_DispatchThreadID) {
     uint i = t.x;
@@ -602,8 +529,7 @@ void cam_update(uint3 t : SV_DispatchThreadID) {
     u_poses[i] = u_poses[i] - d;
 }
 
-// member extrinsics -= dU, one thread per member; a held member has no
-// columns and is skipped.  u0 = num members
+// 成员外参减去 dU，每成员一线程；固定成员无自由列，跳过。u0=成员数。
 [shader("compute")] [numthreads(64, 1, 1)]
 void ext_update(uint3 t : SV_DispatchThreadID) {
     uint m = t.x;
@@ -619,12 +545,7 @@ void ext_update(uint3 t : SV_DispatchThreadID) {
     }
 }
 
-// Apply the intrinsics half of the step: one thread per camera group, walking
-// its free parameters. Column j of a group maps to its slot j -- but only
-// within the group, since a group's stored parameters are contiguous while its
-// *columns* are packed against the other groups' (a group whose principal point
-// is held owns fewer columns than it stores). Going through the group table is
-// what keeps those two layouts independent (D50).  u0 = num groups
+// 每相机组一线程，按组表将自由内参列映回参数槽；存储全部内参但列仅含自由前缀，两种布局不能混同（D50）。u0=组数。
 [shader("compute")] [numthreads(64, 1, 1)]
 void intr_update(uint3 t : SV_DispatchThreadID) {
     uint g = t.x;
@@ -636,10 +557,7 @@ void intr_update(uint3 t : SV_DispatchThreadID) {
     }
 }
 
-// =====================================================================
-// Schur entry points, two dof tiers (compact / wide); the host dispatches
-// the tier that fits the problem's max camera dof (sfm/ba/Solver.h).
-// =====================================================================
+// ================ Schur 分档入口，由主机按最大自由度选择 ================
 
 [shader("compute")] [numthreads(128, 1, 1)]
 void schur_obs_c(uint3 t : SV_DispatchThreadID) { schurObsImpl<kDofCompact>(t.x + u4); }
@@ -666,10 +584,7 @@ void dp_accum_w(uint3 t : SV_DispatchThreadID) { dpAccumImpl<kDofWide>(t.x + u4)
 [shader("compute")] [numthreads(256, 1, 1)]
 void dp_accum_x(uint3 t : SV_DispatchThreadID) { dpAccumImpl<kDofRig>(t.x + u4); }
 
-// =====================================================================
-// per-model entry points -- four lines per camera model: cost and Jacobian,
-// plain and through a rig (sfm/ba/Problem.h buckets observations by both)
-// =====================================================================
+// ================ 逐相机模型入口：普通/rig 的代价与雅可比 ================
 
 [shader("compute")] [numthreads(256, 1, 1)]
 void cost_snavely(uint3 t : SV_DispatchThreadID, uint gi : SV_GroupIndex) { cost_impl<SnavelyModel, 0>(t.x, gi); }

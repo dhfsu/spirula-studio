@@ -1,14 +1,4 @@
-// The from-scratch GPU dense Cholesky, against a CPU reference on a random SPD
-// system. One run per scalar configuration compiled into the binary.
-//
-//   sfm_cholesky_test [N] [--real float|double|df] [--device I]
-//
-// Prints PASS/FAIL and returns 0/1. See docs/testing.md.
-//
-//   sfm_cholesky_test --bench [--real ...]
-//
-// instead measures submit and dispatch overhead against problem size -- what a
-// solve costs before any arithmetic happens.
+// 随机 SPD 问题上的 GPU Cholesky 与 CPU 参考对照，支持各标量配置；--bench 测量提交与分派固定开销。
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -22,15 +12,13 @@
 #include "sfm/ba/Solver.h"
 #include "sfm/tests/TestMain.h"
 
-// Validate the from-scratch GPU Cholesky against a CPU reference on a random
-// SPD system of dimension n.
+// 在 n 维随机 SPD 系统验证 GPU 分解与 CPU 参考。
 int selftestChol(uint32_t n, SolverOptions opt) {
-    BAProblem P;  // empty problem, only n_dim used
+    BAProblem P;  // 空问题，仅使用 n_dim
     P.n_dim = n;
     BundleSolver solver(P, opt);
     solver.init();
-    // init() may have stepped the scalar type down to what the device supports;
-    // everything below packs and unpacks against what the kernels actually use.
+    // init 可能按设备能力调整标量类型，后续打包必须使用实际内核类型。
     const RealCfg real = solver.real();
     if (real == RealCfg::CPU) {
         printf("selftest-chol: this device runs bundle adjustment on the host; "
@@ -70,7 +58,7 @@ int selftestChol(uint32_t n, SolverOptions opt) {
     std::vector<double> x;
     unpackReals(x, raw.data(), n, real);
 
-    // CPU reference solve (LLT via simple Cholesky)
+    // CPU 简单 Cholesky 的 LLT 参考解
     std::vector<double> L = A;
     for (uint32_t j = 0; j < n; j++) {
         for (uint32_t k = 0; k < j; k++)
@@ -102,24 +90,15 @@ int selftestChol(uint32_t n, SolverOptions opt) {
     return maxRel < tol ? 0 : 1;
 }
 
-// What a solve costs *besides* arithmetic: one queue submit and its fence, and
-// each dispatch-plus-barrier inside it. The mapper's bundle adjustments are
-// mostly tiny -- a forty-image atom's reduced system is a couple of hundred
-// wide -- and at that size the answer decides where the time goes and what is
-// worth optimizing. The blocked Cholesky costs 1 + 2(nb-1) + 2nb dispatches for
-// nb = ceil(n/32) blocks, so subtracting the empty submit and dividing gives
-// the per-dispatch figure directly.
-//
-// S is uploaded as the identity, which factors to itself: every repetition
-// does the same arithmetic on the same finite values, however many times it
-// runs.
+// 测量算术外的提交、栅栏和分派屏障成本；nb=ceil(n/32) 时总分派为 1+2(nb-1)+2nb。
+// 上传恒等矩阵，重复分解数值不变，扣除空提交可得单次分派开销。
 int benchDispatch(SolverOptions opt) {
     printf("real=%s\n%6s %5s %11s %11s %11s %11s\n", realCfgName(opt.real), "n", "disp",
            "empty ms", "chol ms", "per-disp us", "solves/s");
     for (uint32_t n : {12u, 24u, 48u, 96u, 150u, 204u, 300u, 500u, 1000u}) {
         const uint32_t nb = (n + 31) / 32;
         const uint32_t ndisp = 1 + 2 * (nb - 1) + 2 * nb;
-        double t[2];  // empty submit, submit + the whole factor and solve
+        double t[2];  // 空提交与完整分解求解提交
         for (int mode = 0; mode < 2; mode++) {
             BAProblem P;
             P.n_dim = n;

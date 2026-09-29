@@ -36,7 +36,7 @@ sfm/ba/
   CpuCamera.h        host mirror of the camera and loss models, forward-mode duals
   CpuDense.h         packed blocked Cholesky for the host path
   CpuParallel.h      the process-wide worker pool the host path runs on
-src/app/cli/sfm_ba.cpp   the `spirula sfm ba` subcommand: a model's global BA, or a BAL problem
+src/app/cli/sfm_ba.cpp   the `spirula-sfm ba` subcommand: a model's global BA, or a BAL problem
 ```
 
 `spirv_tool nocontract` (src/sfm/vk/) is the SPIR-V post-pass
@@ -48,10 +48,10 @@ regenerates the minimax transcendental coefficients in `df.slang` /
 
 ```bash
 bash build_develop.bash -DSS_BACKEND=vulkan
-./build_vulkan/spirula sfm ba /path/to/sparse/0 refined/0        # a COLMAP model
-./build_vulkan/spirula sfm ba /path/to/sparse/0 /path/to/sparse/0 # ... in place
-./build_vulkan/spirula sfm ba /path/to/sparse/0 refined/0 --real cpu   # ... on the host
-./build_vulkan/spirula sfm ba problem-16-22106-pre.txt out.ply --real df --loss huber
+./build_vulkan/spirula-sfm ba /path/to/sparse/0 refined/0        # a COLMAP model
+./build_vulkan/spirula-sfm ba /path/to/sparse/0 /path/to/sparse/0 # ... in place
+./build_vulkan/spirula-sfm ba /path/to/sparse/0 refined/0 --real cpu   # ... on the host
+./build_vulkan/spirula-sfm ba problem-16-22106-pre.txt out.ply --real df --loss huber
 ./build_vulkan/sfm_cholesky_test 500 --real df          # dense solver unit test
 ./build_vulkan/sfm_ba_cpu_test                          # host solver vs a written-out reference
 ```
@@ -355,7 +355,7 @@ factor, so it happens only when the last CG solve took more than 12
 iterations, and is reused for up to three solves unless the damping has moved
 tenfold -- a stale `A_c` only costs iterations.
 
-One global BA each (`spirula sfm ba`, defaults, RTX 5070), before and after
+One global BA each (`spirula-sfm ba`, defaults, RTX 5070), before and after
 this correction and the stopping rule above:
 
 | capture | solver | CG its/solve | solve | final cost |
@@ -562,7 +562,7 @@ Notes:
 
 ### On real captures
 
-One global BA (`spirula sfm ba <sparse dir>`, Huber 2 px, fp64), same machine.
+One global BA (`spirula-sfm ba <sparse dir>`, Huber 2 px, fp64), same machine.
 The interesting axis is camera *sharing*: all of these have one camera group
 behind every image, which is what used to force the dense path.
 
@@ -605,4 +605,4 @@ peak (the largest single BA being 6372 images / 12.7 M observations).
   CUDA prototype).
 - The BAL loader covers the Snavely models only. Every other camera model
   reaches the solver through `sfm/map/Bundle.h` instead, which is what the
-  mapper and a model given to `spirula sfm ba` use.
+  mapper and a model given to `spirula-sfm ba` use.

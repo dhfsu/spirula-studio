@@ -1,17 +1,7 @@
 #pragma once
 
-// What an interrupted run left behind, and whether the next one may use it.
-//
-// A stage's leftovers are reusable when the settings that produced them still
-// read the same (SfmConfig::stageSignature) -- so the files carry that text and
-// a re-run compares before it trusts them. Everything lives in `<workspace>/
-// .resume/`, is safe to delete at any point, and is deleted by a front end
-// clearing the intermediates.
-//
-// Verification is the one stage worth resuming part way through: it is the
-// longest, and it is a long list of independent pairs. MatchJournal is the
-// append-only record of every pair it finished, kept ONLY until matches.bin is
-// written.
+// 通过阶段签名判断中断缓存是否可复用，缓存位于工作区 .resume/，可删除后重新计算。
+// 验证阶段按独立图像对追加记录，适合中途恢复；完整 matches.bin 写出后移除日志。
 
 #include "sfm/core/Matches.h"
 
@@ -27,47 +17,39 @@
 namespace sfm {
 namespace resume {
 
-// Under the workspace, beside features/ and matches.bin. Dotted: the workspace
-// is the user's folder, and a plain name there could be theirs.
+// 位于工作区、与 features 和 matches.bin 相邻，使用点前缀降低与用户目录命名冲突的可能。
 inline constexpr const char* kDir = ".resume";
 
 std::filesystem::path dir(const std::string& workspace);
 
-// A stage's recorded signature, "" when it has none. `store` writes one and
-// `forget` removes it, which is how a stage says its output is no longer valid.
+// 读取已保存签名，无记录时为空；store 写入，forget 删除并使对应输出失效。
 std::string recorded(const std::filesystem::path& file);
 void store(const std::filesystem::path& file, const std::string& signature);
 void forget(const std::filesystem::path& file);
 
-// Everything under `<workspace>/.resume/`.
+// 工作区 .resume/ 下的全部内容。
 void clear(const std::string& workspace);
 
-// The pair list matching settled on, so a resumed run need not select it again
-// (a fraction of matching, but not a small one on a large capture). False --
-// leaving `pairs` alone -- when the file is absent or carries other settings.
+// 复用已选择的图像对以节省筛选时间；文件不存在或设置不同则返回 false 且不修改 pairs。
 bool readPairs(const std::filesystem::path& file, const std::string& signature,
                std::vector<std::pair<uint32_t, uint32_t>>& pairs);
 void writePairs(const std::filesystem::path& file, const std::string& signature,
                 const std::vector<std::pair<uint32_t, uint32_t>>& pairs);
 
-// One key per unordered image pair.
+// 每个无序图像对对应一个键。
 inline uint64_t pairKey(uint32_t a, uint32_t b) {
     return a < b ? ((uint64_t)a << 32) | b : ((uint64_t)b << 32) | a;
 }
 
-// Every pair verification finished, kept or not: one the journal names is never
-// verified twice, one absent from it was never reached (or went with the tail
-// the writer had not flushed). Appended from the workers, hence the lock.
+// 记录所有已完成验证的图像对，无论保留与否，避免重复计算；工作线程并发追加，通过锁保护。
 class MatchJournal {
 public:
     ~MatchJournal() { close(); }
 
-    // Open for appending after `resume` read it, or fresh. False leaves the
-    // journal disarmed and every call below a no-op.
+    // 恢复后继续追加或新建日志；打开失败则关闭日志功能，后续调用为空操作。
     bool open(const std::filesystem::path& file, const std::string& signature,
               bool append);
-    // `putative` is what the matcher offered before verification, which only
-    // this record can say afterwards -- the summary counts it.
+    // putative 保存验证前候选匹配数量，供最终摘要统计。
     void record(uint32_t a, uint32_t b, int32_t config, uint32_t putative,
                 const uint32_t* idx1, const uint32_t* idx2, size_t stride,
                 uint32_t count);
@@ -85,13 +67,11 @@ private:
     bool _armed = false;
 };
 
-// What a journal holds: the pairs it finished, and the matches of the ones it
-// kept. False (leaving both untouched) when the file is absent, was written for
-// other settings, or names other images.
+// 读取已完成图像对及保留匹配；文件缺失、设置或图像不同则返回 false，不改输出。
 bool readJournal(const std::filesystem::path& file, const std::string& signature,
                  const std::vector<ImageEntry>& images,
                  std::unordered_map<uint64_t, TwoViewMatches>& kept,
                  std::vector<uint64_t>& done, uint64_t& putative);
 
-}  // namespace resume
-}  // namespace sfm
+}  // 命名空间 resume
+}  // 命名空间 sfm

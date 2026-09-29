@@ -1,12 +1,5 @@
-// Absolute pose (PnP): one camera's pose from its 2D-3D correspondences, and a
-// rig's pose from every lens's at once (src/sfm/README.md,
-// docs/notes/sfm-rig-constraints.md).
-//
-// Both run LO-RANSAC. The minimal solver is P3P for a camera and gp3p for a
-// rig; the local optimization refits by DLT (>= 6 points) or, for a rig,
-// refines the incumbent over its inliers. Correspondences are given as unit
-// bearings, so a fisheye needs no special case and residuals come out in
-// normalized units.
+// 绝对位姿估计：单相机由二维、三维对应执行 P3P，rig 联合各镜头对应执行 GP3P，均使用 LO-RANSAC。
+// 局部优化采用至少六点的 DLT 或整帧内点精化；单位视线统一支持鱼眼，残差使用归一化单位。
 #pragma once
 
 #include <algorithm>
@@ -24,13 +17,11 @@
 
 namespace sfm {
 
-// DLT pose from >= 6 correspondences: world points `X` and unit bearings `b`.
-// Uses the forward-ray perspective form (b.x/b.z, b.y/b.z), bit-identical to the
-// old normalized-coordinate DLT. Returns 0 or 1 candidate.
+// 由至少六组世界点 X 与单位视线 b 执行 DLT，采用前向透视形式 (b.x/b.z,b.y/b.z)，返回零或一个候选。
 inline std::vector<Pose> estimatePoseDLT(const std::vector<Vec3>& X, const std::vector<Vec3>& b,
                                          const std::vector<int>& idx) {
     if (idx.size() < 6) return {};
-    // Normalize world points (centroid + isotropic scale) for conditioning.
+    // 对世界点去中心并各向同性缩放以改善条件数。
     Vec3 c{};
     for (int i : idx) c = c + X[i];
     c = c * (1.0 / idx.size());
@@ -43,7 +34,7 @@ inline std::vector<Pose> estimatePoseDLT(const std::vector<Vec3>& X, const std::
     std::vector<double> A(2 * n * 12, 0.0);
     for (size_t k = 0; k < n; k++) {
         int i = idx[k];
-        Vec3 W = (X[i] - c) * sw;  // normalized world
+        Vec3 W = (X[i] - c) * sw;  // 归一化世界坐标
         double u = b[i].x / b[i].z, v = b[i].y / b[i].z;
         double Xh[4] = {W.x, W.y, W.z, 1.0};
         double* r0 = &A[(2 * k) * 12];
@@ -56,21 +47,17 @@ inline std::vector<Pose> estimatePoseDLT(const std::vector<Vec3>& X, const std::
         }
     }
     std::vector<double> p = nullspaceVector(A, (int)(2 * n), 12);
-    // P_n maps normalized-world homogeneous -> image. Undo the world scaling:
-    // P = P_n * S, S = [[sw I, -sw c],[0,1]].
+    // P_n 将归一化世界齐次坐标映射到图像，恢复尺度时 P=P_n*S，S=[[sw I,-sw c],[0,1]]。
     Mat3 M = {p[0], p[1], p[2], p[4], p[5], p[6], p[8], p[9], p[10]};
     Vec3 p4 = {p[3], p[7], p[11]};
-    // Actual R (unnormalized) = M * sw ; actual t = p4 - M*(sw c) ... fold below.
+    // 未归一化旋转为 M*sw，平移为 p4-M*(sw c)，在下方合并处理。
     Mat3 Rraw = {M[0] * sw, M[1] * sw, M[2] * sw, M[3] * sw, M[4] * sw,
                  M[5] * sw, M[6] * sw, M[7] * sw, M[8] * sw};
     Vec3 traw = {p4.x - (M[0] * c.x + M[1] * c.y + M[2] * c.z) * sw,
                  p4.y - (M[3] * c.x + M[4] * c.y + M[5] * c.z) * sw,
                  p4.z - (M[6] * c.x + M[7] * c.y + M[8] * c.z) * sw};
 
-    // The null vector is defined only up to a nonzero scalar (arbitrary sign
-    // and magnitude). Fix the sign so the rotation block is proper (det > 0):
-    // the improper sign is the mirror solution that puts points behind the
-    // camera, so det > 0 simultaneously fixes handedness and cheirality.
+    // 零空间向量有任意非零尺度与符号；令旋转块 det>0 排除镜像解，同时确定右手性与正深度。
     if (det3(Rraw) < 0) {
         for (int i = 0; i < 9; i++) Rraw[i] = -Rraw[i];
         traw = {-traw.x, -traw.y, -traw.z};
@@ -86,17 +73,15 @@ inline std::vector<Pose> estimatePoseDLT(const std::vector<Vec3>& X, const std::
     return {pose};
 }
 
-// Squared PnP residual of a camera-frame point against a unit bearing: the
-// normalized-plane error for a forward ray, sin^2 of the angle for a wide one
-// -- same small-angle scale, and defined past 90 deg off axis, where p.z <= 0.
+// 前向视线使用归一化平面误差平方，宽角使用夹角正弦平方，两者小角度尺度一致且后者可覆盖 p.z<=0。
 inline double pnpResidualSqAt(const Vec3& p, const Vec3& b) {
     if (b.z > 0.1) {
-        if (p.z < 1e-8) return 1e30;  // cheirality (forward hemisphere)
+        if (p.z < 1e-8) return 1e30;  // 前半球正深度检查
         double du = p.x / p.z - b.x / b.z, dv = p.y / p.z - b.y / b.z;
         return du * du + dv * dv;
     }
-    if (p.dot(b) <= 0) return 1e30;   // cheirality along the ray
-    Vec3 ph = p.normalized();         // b is already unit
+    if (p.dot(b) <= 0) return 1e30;   // 沿观测射线检查正深度
+    Vec3 ph = p.normalized();         // b 已为单位向量
     Vec3 cr = ph.cross(b);
     return cr.dot(cr);                // sin^2(angle)
 }
@@ -114,9 +99,7 @@ struct PnPResult {
 
 namespace pose_detail {
 
-// The two residual components of one correspondence under pose `p`, the
-// bearing reinterpreted at focal scale `s`. A cheirality failure is a large
-// constant with no gradient: it cannot steer a step, only get it rejected.
+// 在位姿 p 和焦距比例 s 下计算二维残差；正深度失败返回无梯度大常量，只能拒绝步骤，不能引导优化。
 inline void residualPair(const Pose& p, const Vec3& X, const Vec3& bi, double s, double* r) {
     Vec3 pc = mul(p.R, X) + p.t;
     if (bi.z > 0.1) {
@@ -126,7 +109,7 @@ inline void residualPair(const Pose& p, const Vec3& X, const Vec3& bi, double s,
         return;
     }
     if (pc.dot(bi) <= 0) { r[0] = r[1] = 1e3; return; }
-    // tangent-plane components of the direction error (matches sin^2 form)
+    // 方向误差的切平面分量，与 sin^2 形式一致
     Vec3 e1 = (std::fabs(bi.x) < 0.9 ? Vec3{1, 0, 0} : Vec3{0, 1, 0}).cross(bi).normalized();
     Vec3 e2 = bi.cross(e1);
     Vec3 ph = pc.normalized();
@@ -134,9 +117,7 @@ inline void residualPair(const Pose& p, const Vec3& X, const Vec3& bi, double s,
     r[1] = ph.dot(e2);
 }
 
-// LM over (angle-axis delta, translation[, log focal scale]) with a
-// central-difference Jacobian: `resid(pose, s, j, r)` fills the two residual
-// components of correspondence j of n, 1e3 marking a cheirality failure.
+// 对轴角增量、平移及可选对数焦距比例执行 LM，雅可比用中心差分；每对应两维残差，1e3 表示正深度失败。
 template <class Resid>
 bool lmRefine(int n, const Resid& resid, int NP, Pose& pose, double& s0, int max_iters) {
     auto cost = [&](const Pose& p, double s) {
@@ -144,8 +125,7 @@ bool lmRefine(int n, const Resid& resid, int NP, Pose& pose, double& s0, int max
         for (int i = 0; i < n; i++) { resid(p, s, i, r); c += r[0] * r[0] + r[1] * r[1]; }
         return c;
     };
-    // Compose a step onto a base state: R <- exp(w) R0, t <- t0 + dt,
-    // s <- s0 * exp(ds) (multiplicative: focal is a positive scale).
+    // 更新 R <- exp(w)R0，t <- t0+dt，s <- s0*exp(ds)，乘法焦距更新保证正值。
     auto stepP = [&](const Pose& p0, const double* d) {
         Pose p;
         p.R = mul(angleAxisToRotation({d[0], d[1], d[2]}), p0.R);
@@ -156,7 +136,7 @@ bool lmRefine(int n, const Resid& resid, int NP, Pose& pose, double& s0, int max
 
     double lambda = 1e-4, c0 = cost(pose, s0);
     for (int it = 0; it < max_iters; it++) {
-        // J^T J and J^T r accumulated point by point (numeric Jacobian).
+        // 逐点累加数值雅可比的 J^T J 与 J^T r。
         double JtJ[49] = {0}, Jtr[7] = {0};
         const double h = 1e-6;
         for (int i = 0; i < n; i++) {
@@ -178,7 +158,7 @@ bool lmRefine(int n, const Resid& resid, int NP, Pose& pose, double& s0, int max
                 Jtr[a] += J[0][a] * r0[0] + J[1][a] * r0[1];
             }
         }
-        // (JtJ + lambda diag) d = -Jtr, solved by Gaussian elimination.
+        // 用高斯消元求 (JtJ + lambda diag)d = -Jtr。
         double A[49], g[7], d[7];
         bool solved = false;
         for (int tries = 0; tries < 8 && !solved; tries++) {
@@ -231,11 +211,9 @@ bool lmRefine(int n, const Resid& resid, int NP, Pose& pose, double& s0, int max
     return true;
 }
 
-}  // namespace pose_detail
+}  // 命名空间 pose_detail
 
-// LM refinement of a pose over the masked correspondences, on the residual
-// RANSAC scored (COLMAP refines every PnP pose). `focal_scale` adds a 7th
-// parameter, the bearings reinterpreted at f0*s; wide-angle rays stay fixed.
+// 在内点掩码上按 RANSAC 同一残差执行 LM；可选第七参数 focal_scale 将视线解释为 f0*s，宽角视线保持固定。
 inline bool refinePose(const std::vector<Vec3>& X, const std::vector<Vec3>& b,
                        const std::vector<char>& mask, Pose& pose, double* focal_scale = nullptr,
                        int max_iters = 30) {
@@ -253,9 +231,7 @@ inline bool refinePose(const std::vector<Vec3>& X, const std::vector<Vec3>& b,
     return ok;
 }
 
-// One member of a rig frame: its correspondences, which of them count, where
-// it sits on the rig, and a `weight` of 1/inlier-radius, which puts lenses of
-// different focal length on one residual scale.
+// rig 成员携带对应点、内点掩码、外参及 1/内点半径权重，使不同镜头残差处于同一尺度。
 struct FrameMember {
     const std::vector<Vec3>* X;
     const std::vector<Vec3>* b;
@@ -264,9 +240,7 @@ struct FrameMember {
     double weight = 1.0;
 };
 
-// The same refinement over a whole frame: one pose (rig_from_world) explains
-// every member's inliers through its extrinsic, so lenses that share no
-// view still constrain the frame together.
+// 整帧共用一个 rig_from_world 位姿，经各成员外参解释其内点，即使镜头视野不重叠也可共同约束帧。
 inline bool refineFramePose(const std::vector<FrameMember>& members, Pose& rig_from_world,
                             int max_iters = 30) {
     std::vector<std::pair<int, int>> idx;
@@ -278,7 +252,7 @@ inline bool refineFramePose(const std::vector<FrameMember>& members, Pose& rig_f
         const FrameMember& m = members[idx[j].first];
         const int i = idx[j].second;
         pose_detail::residualPair(composePose(m.cam_from_rig, F), (*m.X)[i], (*m.b)[i], s, r);
-        if (r[0] < 1e3) {  // 1e3 is the cheirality marker, and carries no scale
+        if (r[0] < 1e3) {  // 1e3 为正深度失败标记，不随尺度变化
             r[0] *= m.weight;
             r[1] *= m.weight;
         }
@@ -287,20 +261,13 @@ inline bool refineFramePose(const std::vector<FrameMember>& members, Pose& rig_f
     return pose_detail::lmRefine((int)idx.size(), resid, 6, rig_from_world, s0, max_iters);
 }
 
-// LO-RANSAC PnP over 2D-3D correspondences given as world points `X` and unit
-// bearings `b`. `max_error_px` is converted to normalized units via `focal`.
-// `max_trials` caps the RANSAC budget. The default is the mapper's; a caller
-// that runs this over every image of a model at once (the D44 audit) pays the
-// full budget on every image whose correspondences are noise, which is most of
-// them, and does not need the deep search.
+// 对世界点与单位视线执行 LO-RANSAC PnP，像素阈值按 focal 归一化；max_trials 限制预算，批量审查可降低上限以避免为噪声对应做深度搜索。
 inline PnPResult ransacPnP(const std::vector<Vec3>& X, const std::vector<Vec3>& b, double focal,
                            double max_error_px = 4.0, unsigned seed = 0, int max_trials = 3000) {
     PnPResult out;
     int n = (int)X.size();
     if (n < 4) return out;
-    // Minimal solver: P3P on the bearings directly (it already consumes unit
-    // rays; robust to coplanar/elongated point sets). LO refit: DLT on the
-    // inliers (only accepted if it improves).
+    // 最小解使用对共面和细长点集稳健的 P3P；局部重拟合使用 DLT，仅改善时接受。
     auto fit = [&](const std::vector<int>& s) {
         std::array<Vec3, 3> br, Xs;
         for (int k = 0; k < 3; k++) { br[k] = b[s[k]]; Xs[k] = X[s[k]]; }
@@ -309,7 +276,7 @@ inline PnPResult ransacPnP(const std::vector<Vec3>& X, const std::vector<Vec3>& 
     auto refit = [&](const std::vector<int>& s) { return estimatePoseDLT(X, b, s); };
     auto res = [&](const Pose& p, int i) { return pnpResidualSq(p, X[i], b[i]); };
     RansacOptions ro;
-    ro.max_error = max_error_px / focal;  // residual is in normalized units
+    ro.max_error = max_error_px / focal;  // 残差使用归一化单位
     ro.seed = seed;
     ro.min_num_trials = std::min(100, max_trials);
     ro.max_num_trials = max_trials;
@@ -321,11 +288,9 @@ inline PnPResult ransacPnP(const std::vector<Vec3>& X, const std::vector<Vec3>& 
     return out;
 }
 
-// ---- generalized (rig) PnP -------------------------------------------------
+// ---------------- 广义相机装置 PnP ----------------
 
-// What one member brings to its frame's registration: the world points its
-// features saw, their unit bearings in its own camera frame, its place on the
-// rig, and its lens's inlier radius (`errRad`).
+// 每成员提供世界点、镜头坐标单位视线、rig 外参及镜头内点角半径 errRad。
 struct RigPnPMember {
     const std::vector<Vec3>* X;
     const std::vector<Vec3>* b;
@@ -339,9 +304,7 @@ struct RigPnPResult {
     bool success = false;
 };
 
-// LO-RANSAC over every member's correspondences at once: the frame, not a
-// lens, is what a hypothesis has to explain, and a sample whose rays miss a
-// common centre solves as a generalized camera (gp3p, D78).
+// LO-RANSAC 联合全部成员对应，假设必须解释整帧；射线不共心时使用广义 GP3P（D78）。
 inline RigPnPResult ransacRigPnP(const std::vector<RigPnPMember>& members, unsigned seed = 0,
                                  int max_trials = 3000) {
     RigPnPResult out;
@@ -374,9 +337,7 @@ inline RigPnPResult ransacRigPnP(const std::vector<RigPnPMember>& members, unsig
                                (*mem.b)[e.i]) *
                inv2[e.m];
     };
-    // The lens the first draw landed on fills the sample when it can: a rig
-    // estimated from a reconstruction is good to a degree, not to a pixel, and
-    // only one lens's own rays are exact of it (docs/notes/sfm-rig-constraints.md).
+    // 首个样本所在镜头若有足够对应，优先从同镜头取满；重建估计的 rig 外参通常只有角度级精度，单镜头射线几何更精确。
     std::mt19937 sampler(seed + 1);
     auto fit = [&](const std::vector<int>& s) {
         int take[3] = {s[0], s[1], s[2]};
@@ -409,14 +370,13 @@ inline RigPnPResult ransacRigPnP(const std::vector<RigPnPMember>& members, unsig
         for (int k : idx) masks[pool[k].m][pool[k].i] = 1;
         Pose F = seed;
         std::vector<Pose> got;
-        // 10 LM iterations, not the default 30: this runs on every improvement
-        // and the numeric Jacobian costs 13 residuals per point per iteration.
+        // 局部优化每次改善都会运行，数值雅可比每点每轮需 13 次残差，因此只用 10 轮 LM，而非默认 30。
         if (refineFramePose(fm, F, 10)) got.push_back(F);
         return got;
     };
 
     RansacOptions ro;
-    ro.max_error = 1.0;  // `res` already divides by the member's own radius
+    ro.max_error = 1.0;  // res 已除以成员自身内点半径
     ro.seed = seed;
     ro.min_num_trials = std::min(100, max_trials);
     ro.max_num_trials = max_trials;
@@ -428,4 +388,4 @@ inline RigPnPResult ransacRigPnP(const std::vector<RigPnPMember>& members, unsig
     return out;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

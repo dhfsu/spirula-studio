@@ -1,8 +1,4 @@
-// Homography estimation (src/sfm/README.md).
-//
-//   estimateHomography  normalized DLT, >= 4 points (minimal sampler = 4,
-//                       also the refit solver since DLT takes any N >= 4).
-//   symmetricTransferSq symmetric transfer error (px^2), the RANSAC residual.
+// 单应性采用至少四点的归一化 DLT，RANSAC 使用平方像素单位的对称传递误差。
 #pragma once
 
 #include <cmath>
@@ -12,7 +8,7 @@
 
 namespace sfm {
 
-// Hartley-normalized DLT homography H mapping image-1 points to image-2 points.
+// Hartley 归一化 DLT 求图像 1 到图像 2 的单应矩阵 H。
 inline std::vector<Mat3> estimateHomography(const std::vector<Vec2>& p1,
                                             const std::vector<Vec2>& p2,
                                             const std::vector<int>& idx) {
@@ -36,21 +32,15 @@ inline std::vector<Mat3> estimateHomography(const std::vector<Vec2>& p1,
     if (nv.empty()) return {};
     Mat3 Hn;
     for (int i = 0; i < 9; i++) Hn[i] = nv[0][i];
-    // denormalize: H = T2^-1 Hn T1
+    // 反归一化：H=T2^-1 Hn T1
     Mat3 H = mul(mul(inverse3(T2), Hn), T1);
     if (std::fabs(H[8]) > 1e-12)
         for (double& v : H) v /= H[8];
     return {H};
 }
 
-// Homography on unit bearings (D45). A world plane maps rays to rays --
-// b2 ~ H b1 with H = R + t n^T / d -- so the DLT rows are the same, written
-// for homogeneous 3-vectors. No Hartley normalization: see estimateEpipolar*.
-//
-// The overall sign of H is fixed so that most of the fitted sample transfers
-// *forwards* (positive dot). Without that, `angularTransferSq` would have to
-// treat a ray and its opposite as equal, and a plane behind the camera would
-// score as well as the real one.
+// 单位视线平面映射满足 b2~H b1，H=R+t n^T/d，直接对齐次三维向量做 DLT，无需 Hartley 归一化。
+// 选择 H 符号使多数样本正向传递，避免把背向射线或相机后方平面当成同等有效解。
 inline std::vector<Mat3> estimateHomographyBearing(const std::vector<Vec3>& p1,
                                                    const std::vector<Vec3>& p2,
                                                    const std::vector<int>& idx) {
@@ -78,23 +68,12 @@ inline std::vector<Mat3> estimateHomographyBearing(const std::vector<Vec3>& p1,
     return {H};
 }
 
-// Symmetric angular transfer error on the sphere. A ray transferred to the
-// opposite hemisphere lands past 90 deg and is rejected, which is the point of
-// the sign convention above.
-//
-// The value is tan^2 of each transfer angle, not the angle squared. The two
-// agree to seven digits over the thresholds this is ever compared against (a
-// few milliradians -- `--max-error` pixels over a focal length), they are
-// monotone in each other everywhere short of 90 deg, and MSAC clamps everything
-// past the threshold anyway, so the inlier sets and the scores are the same.
-// What it buys is the arithmetic: |u x v|^2 / (u.v)^2 is scale-invariant in
-// both arguments, so this runs with no transcendental and no square root at
-// all, where the angle form needed two atan2 and four sqrt. It is evaluated
-// hundreds of times per RANSAC trial on every pair of a capture.
+// 球面对称传递误差采用 tan^2(angle)=|u×v|^2/(u·v)^2，拒绝转到相反半球的射线。
+// 在毫弧度阈值内与角度平方一致到七位，MSAC 又截断大残差，因此内点和评分等效，同时省去两次 atan2 与四次 sqrt。
 inline double angularTransferSq(const Mat3& H, const Mat3& Hinv, const Vec3& a, const Vec3& b) {
     const Vec3 hb = mul(H, a), ha = mul(Hinv, b);
     const double d1 = hb.dot(b), d2 = ha.dot(a);
-    if (d1 <= 0 || d2 <= 0) return 1e30;  // transferred to the far hemisphere
+    if (d1 <= 0 || d2 <= 0) return 1e30;  // 传递到相反半球
     const Vec3 c1 = hb.cross(b), c2 = ha.cross(a);
     return c1.dot(c1) / (d1 * d1) + c2.dot(c2) / (d2 * d2);
 }
@@ -105,7 +84,7 @@ inline Vec2 applyH(const Mat3& H, const Vec2& p) {
     return {q.x / q.z, q.y / q.z};
 }
 
-// Symmetric transfer error: |b - H a|^2 + |a - H^-1 b|^2.
+// 对称传递误差：|b-H a|^2+|a-H^-1 b|^2。
 inline double symmetricTransferSq(const Mat3& H, const Mat3& Hinv, const Vec2& a, const Vec2& b) {
     Vec2 hb = applyH(H, a);
     Vec2 ha = applyH(Hinv, b);
@@ -114,4 +93,4 @@ inline double symmetricTransferSq(const Mat3& H, const Mat3& Hinv, const Vec2& a
     return d1 + d2;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

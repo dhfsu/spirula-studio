@@ -1,5 +1,4 @@
-// The recorded camera attitude: the XMP it is read from, the rotation its
-// angles name, and the gauge fitted from it (map/AttitudeGauge.h).
+// 测试相机 XMP 姿态读取、角度旋转约定及姿态规范拟合。
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -33,7 +32,7 @@ const char* kDjiXmp =
     "   drone-dji:GimbalPitchDegree=\"-55.00\"\n"
     "   drone-dji:FlightYawDegree=\"-12.40\"/></rdf:RDF></x:xmpmeta>";
 
-// SOI, an Exif APP1 whose IFD0 holds only Orientation, the XMP APP1, EOI.
+// 文件依次为 SOI、仅含 Orientation 的 EXIF APP1、XMP APP1、EOI。
 void write_jpeg(const std::string& path, int orientation, const std::string& xmp) {
     std::vector<uint8_t> f{0xFF, 0xD8};
     auto app1 = [&f](const std::string& payload) {
@@ -41,11 +40,11 @@ void write_jpeg(const std::string& path, int orientation, const std::string& xmp
         f.insert(f.end(), {0xFF, 0xE1, (uint8_t)(len >> 8), (uint8_t)len});
         f.insert(f.end(), payload.begin(), payload.end());
     };
-    const uint8_t tiff[] = {'I', 'I', 42, 0, 8, 0, 0, 0,           // header, IFD0 at 8
-                            1, 0,                                  // one entry
-                            0x12, 0x01, 3, 0, 1, 0, 0, 0,          // Orientation, SHORT x1
+    const uint8_t tiff[] = {'I', 'I', 42, 0, 8, 0, 0, 0,           // 文件头，IFD0 位于偏移 8
+                            1, 0,                                  // 一个条目
+                            0x12, 0x01, 3, 0, 1, 0, 0, 0,          // Orientation，单个 SHORT
                             (uint8_t)orientation, 0, 0, 0,
-                            0, 0, 0, 0};                           // no IFD1
+                            0, 0, 0, 0};                           // 无 IFD1
     app1(std::string("Exif\0\0", 6) + std::string((const char*)tiff, sizeof tiff));
     app1(std::string("http://ns.adobe.com/xap/1.0/\0", 29) + xmp);
     f.insert(f.end(), {0xFF, 0xD9});
@@ -68,9 +67,7 @@ Mat3 randomRotation(std::mt19937& rng) {
     return angleAxisToRotation(Vec3{n(rng), n(rng), n(rng)} * 2.0);
 }
 
-// A drone capture: `n` cameras over a 100 m field looking at pitch -45, -55
-// turned upside down by the gimbal, or straight down, reconstructed in the
-// gauge `G` (model = G(world)). `noise_deg` perturbs each recorded attitude.
+// 百米范围的无人机合成相机，包含斜拍、云台倒置和正下视；模型=G(world)，记录姿态加入 noise_deg 扰动。
 struct Capture {
     Reconstruction rec;
     AttitudeRef ref;
@@ -106,7 +103,7 @@ Capture makeCapture(int n, const Sim3& G, double noise_deg, std::mt19937& rng) {
     return c;
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 static void check_xmp();
 static void check_convention();
@@ -164,7 +161,7 @@ static void check_xmp() {
     std::filesystem::remove_all(dir);
 }
 
-// Camera x right, y down, z forward, written in east-north-up.
+// 相机轴为右、下、前，世界使用东、北、上。
 static void check_convention() {
     auto W = [](double y, double p, double r) {
         CameraAttitude a;
@@ -197,7 +194,7 @@ static void check_fit() {
     Capture c = makeCapture(60, G, 0.5, rng);
     AttitudeFit fit = fitAttitudeGauge(c.rec, c.ref, true);
     check(fit.ok && fit.north, "a consistent capture fixes up and north");
-    // The gauge undoes G's rotation: world = T.R model, model = G.R world.
+    // 拟合规范应抵消 G 旋转，world=T.R model，model=G.R world。
     check(rotDeg(mul(fit.T.R, G.R), mat3Identity()) < 0.3, "... to within the noise");
     check(fit.up.spread_deg < 1.0 && fit.up.outliers == 0, "... and says the votes agree");
 
@@ -205,7 +202,7 @@ static void check_fit() {
     const Vec3 up = mul(fit.T.R, mul(G.R, Vec3{0, 0, 1}));
     check(fit.ok && !fit.north && up.z > std::cos(0.3 * M_PI / 180.0), "`up` levels alone");
 
-    // A quarter of the recorded attitudes belong to some other camera.
+    // 四分之一姿态记录来自另一相机。
     Capture bad = c;
     for (size_t k = 0; k < bad.ref.world_from_cam.size(); k += 4)
         bad.ref.world_from_cam[k] = randomRotation(rng);
@@ -213,13 +210,13 @@ static void check_fit() {
     check(fit.ok && fit.up.outliers > 0, "a minority of wrong attitudes is outvoted");
     check(rotDeg(mul(fit.T.R, G.R), mat3Identity()) < 0.5, "... and does not move the answer");
 
-    // Most of them wrong: the model contradicts the set, and nothing is applied.
+    // 多数姿态错误时拒绝整组，不应用变换。
     for (size_t k = 0; k < bad.ref.world_from_cam.size(); k++)
         if (k % 4 != 1) bad.ref.world_from_cam[k] = randomRotation(rng);
     fit = fitAttitudeGauge(bad.rec, bad.ref, true);
     check(!fit.ok && fit.reason == AttitudeFail::Disagree, "a contradicted set is refused");
 
-    // Pitch and roll right, yaw scattered: up stands, north does not.
+    // 俯仰滚转正确而偏航分散时，仅接受向上，不接受北向。
     Capture compass = c;
     std::uniform_real_distribution<double> turn(-M_PI, M_PI);
     for (Mat3& w : compass.ref.world_from_cam) {

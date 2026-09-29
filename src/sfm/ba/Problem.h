@@ -1,8 +1,5 @@
-// The bundle adjustment problem: a 6-DOF pose per FRAME, a 6-DOF extrinsic
-// per rig member (cam_from_rig, shared by every frame of the rig), and
-// intrinsics per camera group; observations sorted by point, per-kernel
-// observation lists, and the column layout of the reduced camera system.
-// An image is its own frame with no member unless a rig says otherwise.
+// BA 问题每帧含 6 自由度位姿，每个 rig 成员含跨帧共享的 6 自由度 cam_from_rig，各相机组共享内参。
+// 观测按点排序，并生成内核观测列表与约化相机系统列布局；没有 rig 时每张图独占一帧且没有成员外参。
 #pragma once
 
 #include <algorithm>
@@ -19,11 +16,7 @@
 #include "core/Env.h"
 #include "sfm/core/Log.h"
 
-// Camera model registry; must match the entry points in sfm/shaders/ba/ba.slang.
-// `n_intr` is how many parameters the kernel *reads* for this model (its
-// ICameraModel::kNumIntr). How many of them bundle adjustment may *change* is
-// a property of the problem, not the model -- see BAProblem::Group::n_intr and
-// sfm/core/Camera.h camNumFreeParams (D50).
+// 相机模型注册表须与 ba.slang 入口一致；n_intr 是内核读取的参数数，可优化数量由问题的 Group::n_intr 决定（D50）。
 struct ModelDesc {
     const char* name;
     uint32_t n_intr;
@@ -31,8 +24,8 @@ struct ModelDesc {
     const char* jac_entry;
 };
 static const ModelDesc kModels[] = {
-    {"snavely", 3, "cost_snavely", "jac_snavely"},                       // BAL, log-focal
-    {"snavely_f", 3, "cost_snavely_f", "jac_snavely_f"},                 // BAL, direct focal
+    {"snavely", 3, "cost_snavely", "jac_snavely"},                       // BAL，对数焦距
+    {"snavely_f", 3, "cost_snavely_f", "jac_snavely_f"},                 // BAL，直接焦距
     {"pinhole_radial", 5, "cost_pinhole_radial", "jac_pinhole_radial"},  // COLMAP RADIAL
     {"opencv", 8, "cost_opencv", "jac_opencv"},                          // COLMAP OPENCV (D29)
     {"simple_pinhole", 3, "cost_simple_pinhole", "jac_simple_pinhole"},  // COLMAP SIMPLE_PINHOLE
@@ -43,8 +36,7 @@ static const ModelDesc kModels[] = {
     {"equirect", 2, "cost_equirect", "jac_equirect"},                    // COLMAP EQUIRECTANGULAR (D49)
 };
 static const int kNumModels = sizeof(kModels) / sizeof(kModels[0]);
-// 6 frame + 6 member extrinsic + up to 12 intrinsics; must match ba.slang. A
-// problem without rigs never exceeds kMaxPlainDof and pays for nothing wider.
+// 6 帧参数 + 6 成员外参 + 至多 12 内参，必须与 ba.slang 一致；无 rig 时不超过 kMaxPlainDof。
 static const uint32_t kMaxCamDof = 24;
 static const uint32_t kMaxPlainDof = 18;
 static const uint32_t kNoMember = 0xFFFFFFFFu;
@@ -59,103 +51,83 @@ namespace sfm { struct PosePriors; }
 
 struct BAProblem {
     uint32_t num_images = 0, num_points = 0, num_obs = 0;
-    // Camera-side priors on the poses (sfm/ba/Priors.h), on BA image indices;
-    // null or empty leaves both solvers exactly as they were.
+    // 使用 BA 图像索引的位姿先验，见 Priors.h；空值保持普通求解路径。
     const sfm::PosePriors* priors = nullptr;
-    // Pose blocks. Without rigs num_frames == num_images and image_frame is
-    // the identity; with them, images must be ordered by frame (finalizeTables
-    // checks), which is what lets the host solver own a frame's rows per task.
+    // 无 rig 时 num_frames == num_images，image_frame 为恒等映射；有 rig 时图像须按帧排列，便于 CPU 任务独占帧行，finalizeTables 会检查。
     uint32_t num_frames = 0;
-    std::vector<uint32_t> image_frame;    // per image
-    std::vector<uint32_t> image_member;   // per image; kNoMember = no extrinsic
+    std::vector<uint32_t> image_frame;    // 逐图像
+    std::vector<uint32_t> image_member;   // 逐图像；kNoMember 表示无外参
     struct Member {
-        uint32_t ext_offset;  // into `exts` (6 entries)
-        uint32_t ext_col;     // column base; unused when n_free == 0
-        uint32_t n_free;      // columns owned: popcount(mask), 0 = held
-        // Which of the 6 stored parameters (angle-axis, t) own those columns,
-        // in order; `refine: axial` is the rotation and t.z alone.
+        uint32_t ext_offset;  // exts 中的偏移，共 6 项
+        uint32_t ext_col;     // 列起点，n_free == 0 时不使用
+        uint32_t n_free;      // 自由列数 popcount(mask)，0 表示固定
+        // 按顺序选择六个轴角/平移参数，axial 仅优化旋转与 t.z。
         uint32_t mask = kExtAll;
     };
     std::vector<Member> members;
 
-    // observations, sorted by (point, image)
+    // 观测按（点，图像）排序
     std::vector<uint32_t> obs_image, obs_point;
-    std::vector<double> obs_xy;          // 2 per obs
+    std::vector<double> obs_xy;          // 每观测 2 项
     std::vector<uint32_t> obs_ranges;    // num_points+1
 
-    // camera groups
+    // 相机分组
     struct Group {
-        uint32_t intr_offset;  // into flat intrinsics array (kModels[model].n_intr entries)
-        uint32_t intr_col;     // column base in the reduced system
-        uint32_t n_intr;       // *free* params: columns owned, and the dof beyond the
-                               // pose. <= kModels[model].n_intr; the parameters
-                               // past it are read by the kernels and held
-                               // constant (D50). The kernels still read all
-                               // kModels[model].n_intr from intr_offset.
+        uint32_t intr_offset;  // 平铺内参数组中的偏移，共 kModels[model].n_intr 项
+        uint32_t intr_col;     // 约化系统中的列起点
+        uint32_t n_intr;       // 自由内参数量及其列数，不超过 kModels[model].n_intr；后续参数固定，但内核仍从 intr_offset 读取全部模型参数（D50）。
         uint32_t model;
     };
-    std::vector<uint32_t> image_group;   // per image
+    std::vector<uint32_t> image_group;   // 逐图像
     std::vector<Group> groups;
 
-    // parameters (host copy, double)
-    std::vector<double> poses;   // 6 per frame
-    std::vector<double> exts;    // 6 per member (cam_from_rig)
-    std::vector<double> intr;    // flat
-    std::vector<double> points;  // 3 per point
+    // 主机参数副本，使用 double
+    std::vector<double> poses;   // 每帧 6 项
+    std::vector<double> exts;    // 每成员 6 项，表示 cam_from_rig
+    std::vector<double> intr;    // 平铺数组
+    std::vector<double> points;  // 每三维点 3 项
 
-    // per-(model, rig) observation lists (concatenated) for specialized dispatches
+    // 按（模型，rig）拼接的观测列表，用于专用内核分派
     struct ModelRange { uint32_t model, offset, count; bool rig; };
     std::vector<uint32_t> model_obs;
     std::vector<ModelRange> model_ranges;
 
-    // Jc block pool offsets (element index; block is 2 x dof). Jp, Y and the
-    // residual are fixed-stride per observation and need no table.
+    // Jc 块池的元素偏移，每块 2 × dof；Jp、Y 与残差按观测固定步长，无需偏移表。
     std::vector<uint32_t> jc_off;
     uint64_t jc_total = 0;
 
-    // pair-aggregated Schur tables: for each unordered image pair {a,b} seen
-    // together by at least one point, the list of (obs_a, obs_b) index pairs
-    // (one per shared point; a==b entries are the per-obs diagonal terms).
-    // Grouped contiguously per pair, split into chunks; chunks with bit 31 of
-    // the count set share their pair with other chunks and must use atomics.
-    // Built on demand by buildPairTables (the solver skips it on the pure-CG
-    // path, where the entry lists would only waste host+device memory).
-    std::vector<uint32_t> pair_entries;  // 2 per entry
-    std::vector<uint32_t> pair_chunks;   // 2 per chunk: offset, count|flag
+    // 按无序图像对聚合 Schur 项，每个共享点对应一对观测，a==b 为对角项；同对连续存放并分块，计数最高位置位表示需原子累加。
+    // 由 buildPairTables 按需构建，纯 CG 路径跳过以节省主机与设备内存。
+    std::vector<uint32_t> pair_entries;  // 每条目 2 项
+    std::vector<uint32_t> pair_chunks;   // 每块 2 项：偏移、count|flag
     uint32_t num_pair_chunks = 0;
     bool use_pair_schur = false;
 
-    // observations grouped by image (CSR), for the CG path's per-camera
-    // kernels; built on demand by buildCamTables. cam_chunks splits each
-    // camera's list into fixed-size pieces (one warp each; camera blocks are
-    // accumulated with atomics) for occupancy and load balance.
+    // 按图像分组的 CSR 观测表，由 buildCamTables 按需构建；每相机分成固定大小块，每块一 warp，以原子累加改善占用率和负载均衡。
     std::vector<uint32_t> cam_obs_ranges;  // num_images+1
     std::vector<uint32_t> cam_obs;         // num_obs
-    std::vector<uint32_t> cam_chunks;      // 3 per chunk: image, start, count
+    std::vector<uint32_t> cam_chunks;      // 每块 3 项：图像、起点、数量
     uint32_t num_cam_chunks = 0;
 
-    // Block-Jacobi preconditioner blocks for the CG path: a partition of the
-    // n_dim camera columns, 4 uints per block (col0, len0, col1, len1) -- at
-    // most two contiguous ranges, which is all a camera block ever needs (its
-    // pose columns and its group's intrinsics columns). Built by
-    // buildPrecBlocks; see there for why the partition depends on sharing.
+    // CG 的块 Jacobi 预条件器划分相机列；每块四个 uint 表示至多两段连续区间（col0,len0,col1,len1），对应位姿和内参。
+    // 共享参数时的划分由 buildPrecBlocks 决定。
     std::vector<uint32_t> prec_blocks;
     uint32_t num_prec_blocks = 0;
     bool prec_exclusive = true;
 
-    // Column layout: [frame poses | free member extrinsics | free intrinsics].
+    // 列布局：[帧位姿 | 自由成员外参 | 自由内参]。
     uint32_t pose_dim = 0;   // 6 * num_frames
-    uint32_t ext_dim = 0;    // 6 * free members
-    uint32_t total_intr = 0;  // intr.size(): parameters stored (free ones first)
-    uint32_t free_intr = 0;   // of those, the ones with columns
-    uint32_t n_dim = 0;      // camera-side system dimension
+    uint32_t ext_dim = 0;    // 6 × 可优化成员数
+    uint32_t total_intr = 0;  // intr.size()，存储参数总数，自由参数在前
+    uint32_t free_intr = 0;   // 其中占有优化列的参数数
+    uint32_t n_dim = 0;      // 相机侧系统维度
 
     bool hasRigs() const { return num_frames != num_images || ext_dim != 0; }
     uint32_t memberFree(uint32_t img) const {
         const uint32_t m = image_member[img];
         return m == kNoMember ? 0 : members[m].n_free;
     }
-    // A problem built without rigs: every image its own frame.
+    // 无 rig 时，每图像独占一帧。
     void identityFrames() {
         num_frames = num_images;
         image_frame.resize(num_images);
@@ -167,9 +139,7 @@ struct BAProblem {
     }
 };
 
-// No column of the reduced system owned by more than one image, which the
-// pair-Schur kernel requires. A group with no free parameters owns no column;
-// a refined member or a multi-image frame is shared (README.md, "Rigs").
+// pair-Schur 要求各图像独占约化系统列；没有自由内参的组不占列，可优化成员或多图像帧则构成共享。
 inline bool exclusiveGroups(const BAProblem& P) {
     if (P.hasRigs()) return false;
     std::vector<uint32_t> guse(P.groups.size(), 0);
@@ -178,9 +148,7 @@ inline bool exclusiveGroups(const BAProblem& P) {
     return true;
 }
 
-// Preconditioner partition (README.md "Implicit-Schur PCG"): exclusive = one
-// block per image over [pose | intrinsics]; shared = one 6x6 per frame, one per
-// member (index num_frames + m), one per group (num_frames + members + g).
+// 独占参数时每图像一个 [位姿|内参] 块；共享时分别为每帧、每成员、每相机组建立块，顺序为帧、成员、组。
 inline void buildPrecBlocks(BAProblem& P, bool exclusive) {
     P.prec_exclusive = exclusive;
     P.prec_blocks.clear();
@@ -204,8 +172,7 @@ inline void buildPrecBlocks(BAProblem& P, bool exclusive) {
     P.num_prec_blocks = (uint32_t)(P.prec_blocks.size() / 4);
 }
 
-// pair-Schur entry count = sum over points of t(t+1)/2 (cheap; used for VRAM
-// estimates before deciding whether to build the tables at all)
+// pair-Schur 条目数为各点 t(t+1)/2 之和，用于建表前快速估算显存。
 inline uint64_t pairEntryCount(const BAProblem& P) {
     uint64_t total = 0;
     for (uint32_t p = 0; p < P.num_points; p++) {
@@ -215,11 +182,9 @@ inline uint64_t pairEntryCount(const BAProblem& P) {
     return total;
 }
 
-static const uint64_t kMaxPairEntries = 400ull << 20;  // 3.2 GB of entry data
+static const uint64_t kMaxPairEntries = 400ull << 20;  // 约 3.2 GB 条目数据
 
-// Coarse-correction tables (cg.slang). A run is a track's observations in one
-// cluster of k frames (contiguous: tracks are sorted by image); each pair of a
-// point's runs u >= v is one entry, (first obs of u, first obs of v).
+// 粗层校正表：一段为轨迹在 k 帧簇内的连续观测；同一点的每对段 u >= v 对应一个首观测索引对。
 template <class F>
 inline void forCoarseRunPairs(const BAProblem& P, uint32_t k, F&& fn) {
     auto cl = [&](uint32_t o) { return P.image_frame[P.obs_image[o]] / k; };
@@ -242,8 +207,7 @@ inline uint64_t coarseEntryCount(const BAProblem& P, uint32_t k) {
     return n;
 }
 
-// Entries grouped by cluster pair: `key` holds each pair's range, indexed
-// cu (cu + 1) / 2 + cv.
+// 按簇对分组，key 保存各对范围，索引为 cu (cu + 1) / 2 + cv。
 inline void buildCoarseEntries(const BAProblem& P, uint32_t k, std::vector<uint32_t>& ent,
                                std::vector<uint32_t>& key) {
     const uint64_t nc = (P.num_frames + k - 1) / k, nkeys = nc * (nc + 1) / 2;
@@ -259,9 +223,7 @@ inline void buildCoarseEntries(const BAProblem& P, uint32_t k, std::vector<uint3
     });
 }
 
-// Clusters as small as a coarse matrix of `max_dim` allows (7 dofs each), and
-// as large as keeps the entries under two an observation (long tracks span many
-// small clusters). False: fewer than 4 clusters, or SS_SFM_BA_COARSE=0.
+// 每簇 7 自由度，在 max_dim 允许下尽量缩小簇，同时保证条目数不超过观测数两倍；不足 4 簇或 SS_SFM_BA_COARSE=0 时禁用。
 inline bool planCoarse(const BAProblem& P, uint32_t max_dim, uint32_t& k, uint32_t& dim,
                        uint64_t& entries) {
     k = dim = 0;
@@ -281,7 +243,7 @@ inline bool planCoarse(const BAProblem& P, uint32_t max_dim, uint32_t& k, uint32
     return false;
 }
 
-// Group observations by image (CSR) for the CG path's per-camera kernels.
+// 按图像生成 CSR 观测表，供 CG 的逐相机内核使用。
 inline void buildCamTables(BAProblem& P) {
     P.cam_obs_ranges.assign(P.num_images + 1, 0);
     for (uint32_t o = 0; o < P.num_obs; o++) P.cam_obs_ranges[P.obs_image[o] + 1]++;
@@ -301,8 +263,7 @@ inline void buildCamTables(BAProblem& P) {
     P.num_cam_chunks = (uint32_t)(P.cam_chunks.size() / 3);
 }
 
-// The columns one image's observations touch, in Jacobian order:
-// [frame 6 | member extrinsic n_free | group intrinsics n_intr].
+// 单图像观测涉及的列按雅可比顺序为 [帧 6 | 成员外参 n_free | 分组内参 n_intr]。
 inline uint32_t imageColumns(const BAProblem& P, uint32_t img, uint32_t* cols) {
     uint32_t k = 0;
     const uint32_t f = P.image_frame[img];
@@ -315,16 +276,14 @@ inline uint32_t imageColumns(const BAProblem& P, uint32_t img, uint32_t* cols) {
     return k;
 }
 
-// Build per-model obs lists and A_cp offsets from obs/image/group tables.
+// 由观测、图像和分组表生成逐模型观测列表与 A_cp 偏移。
 inline void finalizeTables(BAProblem& P) {
     if (P.image_frame.size() != P.num_images) P.identityFrames();
     if (P.image_member.size() != P.num_images) P.image_member.assign(P.num_images, kNoMember);
     for (uint32_t i = 1; i < P.num_images; i++)
         if (P.image_frame[i] < P.image_frame[i - 1])
             throw std::runtime_error("BA images must be ordered by frame");
-    // Per-image bucket and dof, so the passes below index an array rather than
-    // chase image -> group -> model per observation. Buckets are (model, rig):
-    // a rigged observation runs the kernel that composes the member extrinsic.
+    // 预计算逐图像的（模型，rig）桶与自由度，避免每观测追踪多层索引；rig 桶选择包含外参复合的内核。
     std::vector<uint8_t> img_bucket(P.num_images);
     std::vector<uint8_t> img_dof(P.num_images);
     const int nb = 2 * kNumModels;
@@ -339,8 +298,7 @@ inline void finalizeTables(BAProblem& P) {
         img_dof[i] = (uint8_t)dof;
     }
 
-    // Bucket the observations in one counting pass: indices ascending within
-    // each bucket, buckets in registry order, empty ones omitted.
+    // 一次计数分桶，桶内索引升序，桶按注册表顺序，忽略空桶。
     std::vector<uint32_t> cnt(nb, 0), off(nb, 0);
     for (uint32_t o = 0; o < P.num_obs; o++) cnt[img_bucket[P.obs_image[o]]]++;
     P.model_ranges.clear();
@@ -362,14 +320,10 @@ inline void finalizeTables(BAProblem& P) {
     }
     P.jc_total = acc;
     if (acc > 0xFFFFFFFFull) throw std::runtime_error("Jc pool exceeds 32-bit indexing");
-    // note: the packed-triangle 32-bit limit (n_dim <~ 65k) applies only to
-    // the dense solver and is checked when that path is selected
+    // 压缩三角形的 32 位索引限制约为 n_dim < 65k，仅在选择稠密求解时检查。
 }
 
-// Build the pair-aggregated Schur tables (see BAProblem). Requires exclusive
-// per-image ownership of intrinsics columns (no shared groups); falls back to
-// the per-observation atomic kernel otherwise, or when the entry list would
-// be unreasonably large (very long tracks).
+// pair-Schur 仅适用于图像独占内参列；共享参数或轨迹过长导致条目过大时，回退到逐观测原子内核。
 inline void buildPairTables(BAProblem& P) {
     P.pair_entries.clear();
     P.pair_chunks.clear();
@@ -377,7 +331,7 @@ inline void buildPairTables(BAProblem& P) {
     P.use_pair_schur = false;
     if (P.num_obs == 0) return;
 
-    // exclusivity: each group referenced by at most one image
+    // 独占条件：每相机组最多被一张图像引用
     if (!exclusiveGroups(P)) return;
 
     uint64_t total = pairEntryCount(P);
@@ -387,8 +341,7 @@ inline void buildPairTables(BAProblem& P) {
         return;
     }
 
-    // counting sort by pair key; within a point's track images are strictly
-    // increasing, so obs i >= j implies image_i >= image_j
+    // 按图像对键计数排序；点轨迹的图像索引严格递增，因此观测 i >= j 意味着 image_i >= image_j。
     auto key = [&](uint32_t oi, uint32_t oj) {
         uint64_t a = P.obs_image[oi], b = P.obs_image[oj];
         return a * (a + 1) / 2 + b;
@@ -410,7 +363,7 @@ inline void buildPairTables(BAProblem& P) {
                 P.pair_entries[2 * e + 1] = j;
             }
 
-    // chunk pairs; pairs longer than kChunk are split and flagged for atomics
+    // 超过 kChunk 的图像对分块，并标记需使用原子累加。
     const uint32_t kChunk = 1024;
     for (uint64_t k = 0; k < nkeys; k++) {
         uint32_t off = cnt[k], n = cnt[k + 1] - cnt[k];
@@ -465,7 +418,7 @@ inline BAProblem loadBAL(const std::string& path, int model_id, bool shared_intr
     P.points.resize(3 * (size_t)np);
     for (auto& v : P.points) v = nextDouble();
 
-    // sort observations by (point, image)
+    // 按（点，图像）排序观测
     std::vector<uint32_t> order(no);
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
@@ -485,7 +438,7 @@ inline BAProblem loadBAL(const std::string& path, int model_id, bool shared_intr
     for (uint32_t i = 0; i < no; i++) P.obs_ranges[P.obs_point[i] + 1]++;
     for (uint32_t i = 0; i < np; i++) P.obs_ranges[i + 1] += P.obs_ranges[i];
 
-    // poses + intrinsics; BAL camera = [angle-axis(3), t(3), f, k1, k2]
+    // 位姿与内参；BAL 相机布局为 [轴角(3), t(3), f, k1, k2]
     P.poses.resize(6 * (size_t)nc);
     for (uint32_t c = 0; c < nc; c++)
         for (int j = 0; j < 6; j++) P.poses[6 * (size_t)c + j] = cam9[9 * (size_t)c + j];
@@ -493,7 +446,7 @@ inline BAProblem loadBAL(const std::string& path, int model_id, bool shared_intr
     const uint32_t ni = kModels[model_id].n_intr;  // 3
     auto camIntr = [&](uint32_t c, int j) {
         double v = cam9[9 * (size_t)c + 6 + j];
-        if (model_id == 0 && j == 0) v = std::log(v);  // log-focal parameterization
+        if (model_id == 0 && j == 0) v = std::log(v);  // 对数焦距参数化
         return v;
     };
     if (shared_intrinsics) {
@@ -510,13 +463,13 @@ inline BAProblem loadBAL(const std::string& path, int model_id, bool shared_intr
         for (uint32_t c = 0; c < nc; c++) {
             P.image_group[c] = c;
             for (uint32_t j = 0; j < ni; j++) P.intr[(size_t)ni * c + j] = camIntr(c, j);
-            P.groups[c] = {ni * c, 0 /*fixed below*/, ni, (uint32_t)model_id};
+            P.groups[c] = {ni * c, 0 /* 在下方修正 */, ni, (uint32_t)model_id};
         }
     }
     P.identityFrames();
     P.pose_dim = 6 * nc;
     P.total_intr = (uint32_t)P.intr.size();
-    P.free_intr = P.total_intr;  // the BAL models refine everything they read
+    P.free_intr = P.total_intr;  // BAL 模型优化所读取的全部参数
     P.n_dim = P.pose_dim + P.free_intr;
     for (auto& g : P.groups) g.intr_col = P.pose_dim + g.intr_offset;
 

@@ -1,13 +1,5 @@
-// The host bundle adjustment (sfm/ba/SolverCpu.h) against independent
-// references, on synthetic problems: the dense SPD solver against a textbook
-// Cholesky, the analytic Jacobians against central differences, and the whole
-// Schur assembly plus parameter update against the unreduced normal equations
-// written out in full (dense U/V/W blocks, no packing and no task splitting --
-// nothing the solver's own code path shares).
-//
-//   sfm_ba_cpu_test [--quick]
-//
-// Prints PASS/FAIL per case and returns 0/1. Needs no GPU. See docs/testing.md.
+// CPU BA 对照独立参考：稠密 Cholesky、中心差分雅可比，以及完整未约化正规方程的装配和参数更新。
+// 支持 --quick，不需要 GPU，逐项输出 PASS/FAIL 并返回 0/1。
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -34,9 +26,7 @@ void report(const char* name, double err, double tol) {
     if (!ok) g_fail++;
 }
 
-// ---------------------------------------------------------------------------
-// dense SPD factor + solve
-// ---------------------------------------------------------------------------
+// ---------------- 稠密 SPD 分解与求解 ----------------
 
 void testChol(uint32_t n) {
     std::mt19937 rng(1234);
@@ -61,7 +51,7 @@ void testChol(uint32_t n) {
     std::vector<double> x = b;
     S.factorSolve(x.data(), bacpu::Pool::get(), bacpu::Pool::get().size());
 
-    std::vector<double> L = A;  // textbook Cholesky, unblocked
+    std::vector<double> L = A;  // 标准未分块 Cholesky 参考
     for (uint32_t j = 0; j < n; j++) {
         for (uint32_t k = 0; k < j; k++)
             for (uint32_t i = j; i < n; i++)
@@ -89,9 +79,7 @@ void testChol(uint32_t n) {
     report(name, e / s, 1e-10);
 }
 
-// ---------------------------------------------------------------------------
-// analytic Jacobian vs central differences
-// ---------------------------------------------------------------------------
+// ---------------- 解析雅可比与中心差分 ----------------
 
 template <class M>
 void testJacobianModel(const char* name, const double* intr0, std::mt19937& rng) {
@@ -103,14 +91,14 @@ void testJacobianModel(const char* name, const double* intr0, std::mt19937& rng)
         for (int i = 0; i < 3; i++) pose[i] = 0.3 * unit(rng);
         for (int i = 0; i < 3; i++) pose[3 + i] = 0.5 * unit(rng);
         for (int i = 0; i < 3; i++) X[i] = unit(rng);
-        X[2] = 2.0 + unit(rng);  // in front of a +z camera
+        X[2] = 2.0 + unit(rng);  // 位于 +z 相机前方
         double intr[M::kNumIntr];
         for (int i = 0; i < M::kNumIntr; i++) intr[i] = intr0[i] * (1.0 + 0.01 * unit(rng));
 
         double r[2], Jc[2 * (6 + M::kNumIntr)], Jp[6];
         bacpu::jacobian<M>(pose, intr, X, obs, r, Jc, Jp);
 
-        // central differences over pose, intrinsics and the point
+        // 对位姿、内参与三维点做中心差分
         const int DOF = 6 + M::kNumIntr;
         for (int k = 0; k < DOF + 3; k++) {
             double* p = k < 6 ? &pose[k] : k < DOF ? &intr[k - 6] : &X[k - DOF];
@@ -133,7 +121,7 @@ void testJacobianModel(const char* name, const double* intr0, std::mt19937& rng)
     report(name, worst, 1e-6);
 }
 
-// The rig chain rule -- frame, then extrinsic -- against central differences.
+// rig 的帧到成员链式导数与中心差分比较。
 template <class M>
 void testJacobianRig(const char* name, const double* intr0, std::mt19937& rng) {
     std::uniform_real_distribution<double> unit(-1.0, 1.0);
@@ -174,8 +162,7 @@ void testJacobianRig(const char* name, const double* intr0, std::mt19937& rng) {
     report(name, worst, 1e-6);
 }
 
-// At a zero angle-axis -- the identity every seed pair starts from -- the norm
-// has no derivative. That belongs to the axis columns alone.
+// 零轴角时范数不可导，影响应仅限轴角列，不能污染其他参数导数。
 template <class M>
 void testZeroRotation(const char* name, const double* intr) {
     double pose[6] = {0, 0, 0, 0.1, -0.2, 0.0};
@@ -254,13 +241,11 @@ void testEquirectSeamJacobian() {
     report("equirect seam jacobian", worst, 1e-6);
 }
 
-// ---------------------------------------------------------------------------
-// the unreduced normal equations, written out in full
-// ---------------------------------------------------------------------------
+// ---------------- 完整未约化正规方程 ----------------
 
 struct Reference {
-    std::vector<double> S, g;   // n x n (full), n
-    std::vector<double> dU, dP; // camera step, 3 per point
+    std::vector<double> S, g;   // 完整 n×n 矩阵与 n 维向量
+    std::vector<double> dU, dP; // 相机步长与每点三维步长
 };
 
 Reference referenceSolve(const BAProblem& P, double lambda, double lossParam,
@@ -272,7 +257,7 @@ Reference referenceSolve(const BAProblem& P, double lambda, double lossParam,
     std::vector<double> V(9 * (size_t)P.num_points, 0.0), bp(3 * (size_t)P.num_points, 0.0);
     std::vector<double> Wp((size_t)P.num_points * n * 3, 0.0);
 
-    bacpu::withLoss(loss, [&]([[maybe_unused]] auto L) {  // only decltype(L) is read
+    bacpu::withLoss(loss, [&]([[maybe_unused]] auto L) {  // 仅读取 decltype(L)
         for (uint32_t o = 0; o < P.num_obs; o++) {
             const uint32_t img = P.obs_image[o], pt = P.obs_point[o];
             const BAProblem::Group& gr = P.groups[P.image_group[img]];
@@ -368,7 +353,7 @@ Reference referenceSolve(const BAProblem& P, double lambda, double lossParam,
         }
     }
 
-    // dense solve of S dU = g
+    // 稠密求解 S dU=g
     std::vector<double> L = R.S;
     for (uint32_t j = 0; j < n; j++) {
         for (uint32_t k = 0; k < j; k++)
@@ -410,8 +395,7 @@ double relMax(const double* a, const double* b, size_t n) {
     return d / std::max(s, 1e-300);
 }
 
-// One LM iteration of the solver against the reference: the assembled S and g,
-// and the parameters the step leaves behind.
+// 对照单次 LM 的 S/g 装配及更新后参数。
 void testAgainstReference(uint32_t model, uint32_t groups, const char* loss, bool cg,
                           uint32_t nImg = 9, int nfree = -1, uint32_t rig = 0,
                           bool rig_free = true, uint32_t rig_mask = kExtAll) {
@@ -497,8 +481,7 @@ void testAgainstReference(uint32_t model, uint32_t groups, const char* loss, boo
     report(name, pmax / std::max(psc, 1e-300), cg ? 1e-6 : 1e-9);
 }
 
-// A full solve has to descend, and the two linear solvers have to agree on
-// where it lands.
+// 完整求解必须降低代价，两种线性求解器应收敛到一致结果。
 void testFullSolve(uint32_t model, uint32_t groups, uint32_t rig = 0) {
     BAProblem base = makeProblem(model, 12, 200, groups, 0.3, 31 + model, -1, rig);
     double cost[2];
@@ -534,7 +517,7 @@ void testFullSolve(uint32_t model, uint32_t groups, uint32_t rig = 0) {
     report(name, relMax(poses[0].data(), poses[1].data(), poses[0].size()), 1e-6);
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 int run(int argc, char** argv) {
     bool quick = false;
@@ -576,8 +559,7 @@ int run(int argc, char** argv) {
     testAgainstReference(3, 9, "cauchy", false);
     testAgainstReference(3, 1, "huber", true);
     testAgainstReference(3, 9, "huber", true);
-    // partial free prefixes (a held principal point) and the smallest problem
-    // the mapper ever hands the solver
+    // 测试固定主点的自由前缀，以及建图器交给求解器的最小问题。
     for (int nf : {0, 2, 6}) {
         testAgainstReference(3, 1, "huber", false, 9, nf);
         testAgainstReference(3, 9, "huber", false, 9, nf);
@@ -586,15 +568,14 @@ int run(int argc, char** argv) {
         testAgainstReference(3, 1, "huber", false, nImg, 6);
         testAgainstReference(8, 1, "huber", false, nImg, 10);
     }
-    // Rigs: two and three members per frame, extrinsics refined and held, on
-    // both linear solvers, with the widest camera model (dof 24).
+    // rig 测试每帧两或三成员、外参固定或自由，两种线性求解器均覆盖最宽 24 自由度模型。
     for (uint32_t rig : {2u, 3u}) {
         testAgainstReference(3, 1, "huber", false, 7, 6, rig, true);
         testAgainstReference(3, 1, "huber", false, 7, 6, rig, false);
         testAgainstReference(3, 1, "huber", true, 7, 6, rig, true);
         testAgainstReference(7, 1, "huber", false, 7, -1, rig, true);
         testAgainstReference(6, 1, "cauchy", true, 7, -1, rig, true);
-        // `refine: axial` and `refine: baseline`.
+        // 测试 refine: axial 与 refine: baseline。
         testAgainstReference(6, 1, "huber", false, 7, -1, rig, true, 0x27);
         testAgainstReference(3, 1, "huber", true, 7, 6, rig, true, 0x20);
     }

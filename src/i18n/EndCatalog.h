@@ -1,8 +1,4 @@
-// Closes a catalog opened with BeginCatalog.h. See that file. Not
-// #pragma once, for the same reason.
-//
-// TR in particular MUST be undefined again -- it is two letters and would
-// collide with anything sensible.
+// 撤销 BeginCatalog.h 定义的标签宏；同样不能使用 #pragma once，尤其须清除易冲突的短宏 TR。
 
 #undef SS_I18N_TR
 

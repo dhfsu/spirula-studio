@@ -1,16 +1,7 @@
 #pragma once
 
-// Snapshots of a run in progress, for a front end that is watching it.
-//
-// Off unless `--progress-dir` was given, so an ordinary CLI run writes nothing
-// and pays for nothing. The GUI passes one and polls the files; that is the
-// whole of the channel, because the reconstruction is a child process and its
-// stdout already belongs to the user (SfmRunner.h says why it still is one).
-//
-// Every file is written whole to a `.tmp` and renamed, so a reader never sees
-// half of one, and every write is rate-limited by wall clock -- the mapper
-// registers an image every few milliseconds on a small capture and every few
-// seconds on a large one, and a screen wants the same cadence from both.
+// 供外部前端轮询的进度快照，仅设置 progress-dir 时启用；普通 CLI 不产生额外文件。
+// 快照先完整写临时文件再重命名，并按时间限流；实时匹配另用追加流，读取方处理未完成尾部。
 
 #include "sfm/core/Events.h"
 
@@ -27,77 +18,50 @@ struct Reconstruction;
 
 namespace progress {
 
-// Longest side of the pair matrix, and the point budget of a model snapshot.
-// Both are what a screen can show rather than what the run holds: 512^2 u32 is
-// 1 MB, and 50k points is already more than a preview resolves.
+// 图像对矩阵边长与模型点数预算按屏幕预览需求设置：512² 个 u32 约 1 MB，5 万点已足够预览。
 inline constexpr uint32_t kMatrixBins = 512;
 inline constexpr uint32_t kMaxPoints = 50000;
 
-// Where snapshots go. Empty (the default) disables everything below.
+// 快照目录，空值关闭全部输出。
 void set_dir(const std::string& dir);
 bool enabled();
 
-// What the model's frame is worth, carried into the next model.bin so a front
-// end drawing it can say whether a unit is a metre (sfm/Pipeline.h ModelGauge).
+// 将模型朝向与公制状态带入下一份 model.bin，供前端标明单位。
 void gauge(bool oriented, bool metric);
 
-// model.bin: "VKPM", u32 version=4, flags (1 oriented, 2 metric), images, registered,
-// u64 points; per registered image { u32 id, f32 c2w[12] OpenGL, u32 w, h,
-// colmap_model_id, nparams, f64 params[] }; u32 count, { f32 xyz, u8 rgb }.
+// model.bin：VKPM，u32 版本 4、标志（1 已定向，2 公制）、图像数、已配准数，u64 点数。
+// 每已配准图像含 u32 ID、f32 OpenGL c2w[12]、u32 宽高/模型 ID/参数数与 f64 参数；点区为 u32 数量及 f32 xyz、u8 rgb。
 
-// The model as it stands, subsampled to kMaxPoints. Call it as often as is
-// convenient; it returns immediately until the interval has passed, unless
-// `force` says this is the last word on a stage.
-//
-// `color` fills one point's rgb, and is called only for the points a snapshot
-// actually writes: the mapper colours a model when it finishes one, so without
-// it every preview of a model under construction is neutral grey.
+// 当前模型抽样至 kMaxPoints，未到间隔时立即返回，force 用于阶段最终状态。
+// color 只为实际写出的点计算 RGB，避免重建中尚未统一着色的预览全灰。
 using PointColor = std::function<void(const Point3D&, uint8_t rgb[3])>;
 void model(const Reconstruction& rec, bool force = false,
            const PointColor& color = {});
 
-// pairs.bin: "VKPP", u32 version=2, u32 images, u32 bins, then three
-// bins*bins u32 planes -- summed inliers, candidate pairs, verified pairs.
-// The last two are what tell a cell nothing has reached it yet from a cell
-// pairing was never going to try.
-//
-// Matching is about to verify `pairs` among `n_images` images.
+// pairs.bin：VKPP，u32 版本 2、图像数、桶数，随后为三层 bins*bins 的 u32：内点总数、候选对数、已验证对数。
+// 候选与已验证计数区分尚未处理和从未计划匹配的单元。
 void begin_matching(uint32_t n_images,
                     const std::vector<std::pair<uint32_t, uint32_t>>& pairs);
-// One verified pair, `inliers` of 0 meaning it did not survive verification.
-// Safe to call from the verification workers.
+// 记录一个已验证图像对，内点为 0 表示未通过；支持验证工作线程并发调用。
 void pair(uint32_t image1, uint32_t image2, uint32_t inliers);
 
-// status.bin: "VKPS", u32 version=1, u32 stage, u32 flags (1 finished,
-// 2 partial, 4 metric), i64 done, total, registered, images, points, models,
-// f64 mean_reproj.
-//
-// Where the run is and how it ended, so a front end watching a child reads the
-// same facts an in-process one gets from the event stream instead of parsing
-// the log. Rate-limited like the rest; a stage change or a result forces it.
+// status.bin：VKPS，u32 版本 1、阶段、标志（1 完成，2 部分成功，4 公制），i64 done/total/registered/images/points/models，f64 平均重投影误差。
+// 外部前端读取与进程内事件相同的状态，普通进度限流，阶段切换与结果强制写出。
 void status(const Event& e);
 
-// thumbs/<rel_stem>.jpg: the working copy the extractor has already decoded and
-// downscaled, at kThumbLong on its long side.
-//
-// Without it a screen showing the frames as they are extracted has to decode
-// the source file a second time -- a 24 MP JPEG per frame, on its own thread,
-// which is what made the reel lag the stage it was drawing.
+// thumbs/<rel_stem>.jpg 保存已解码工作图的缩略图，最长边 kThumbLong，避免前端再次解码高分辨率原图而落后于提取进度。
 void thumbnail(const std::string& rel_stem, const uint8_t* rgb, int w, int h);
 inline constexpr int kThumbLong = 640;
 
-// live_matches.bin: a matches.bin whose pair count is `kStreamingPairs`,
-// appended as verification produces each pair, so hovering the match map draws
-// a verified pair instead of nothing until the stage ends.
+// live_matches.bin 使用 kStreamingPairs 对数标记，验证时逐对追加，供匹配图即时预览。
 void live_matches_begin(const std::vector<std::string>& names,
                         const std::vector<uint32_t>& num_features);
 void live_pair(uint32_t a, uint32_t b, int32_t config,
                const uint32_t* idx1, const uint32_t* idx2, size_t stride,
                uint32_t count);
 
-// Write whatever is buffered, whatever the clock says. Call at the end of a
-// stage so the last state on screen is the final one.
+// 无视时间门限立即刷新缓冲，阶段结束时保证屏幕显示最终状态。
 void flush();
 
-}  // namespace progress
-}  // namespace sfm
+}  // 命名空间 progress
+}  // 命名空间 sfm

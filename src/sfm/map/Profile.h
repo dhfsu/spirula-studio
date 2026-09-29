@@ -1,7 +1,4 @@
-// Lightweight wall-clock accumulators for mapper profiling (host-time work,
-// src/sfm/README.md "The mapper is the stage that is left"). Zero-dependency,
-// always compiled; reporting is opt-in via SS_SFM_MAP_PROF=1 so normal runs
-// produce identical output.
+// 轻量主机耗时统计，始终编译，仅 SS_SFM_MAP_PROF=1 时报告，不改变普通运行输出。
 #pragma once
 
 #include <atomic>
@@ -13,12 +10,7 @@
 
 namespace sfm {
 
-// An accumulator several threads may add to. The atom phase reconstructs
-// clusters concurrently (sfm/map/Atoms.h) and every one of them runs the same
-// instrumented code, so a plain `double +=` here is a data race in every
-// bottom-up run. std::atomic<double>::fetch_add is C++20; the compare-exchange
-// loop is what C++17 offers, and it is uncontended in practice -- one add per
-// phase per call, against work measured in milliseconds.
+// 多个原子工作线程共享累加器，C++17 用 CAS 循环实现浮点原子加，避免普通 double+= 的数据竞争；阶段级低频更新几乎无争用。
 class ProfAcc {
 public:
     ProfAcc& operator+=(double v) {
@@ -33,36 +25,34 @@ private:
 };
 
 struct MapProf {
-    // mapper host phases
-    ProfAcc init_seed;   // initialize(): seed search incl. two-view RANSAC
-    ProfAcc seed_geom;   // of which seedGeometry(): the two-view RANSAC itself
-    ProfAcc bootstrap;   // bootstrapFocalLength(), counted inside init_seed
-    ProfAcc choose;      // chooseNextImages(): ranking candidates
-    ProfAcc reg;         // registerImage(): PnP RANSAC + refine + recount
-    ProfAcc tri;         // triangulateForImage() during growth
-    ProfAcc retri;       // completeAndRetriangulate()
-    ProfAcc merge;       // mergeTracks(), inside the above
-    ProfAcc filter;      // sanitizeCameras + filterPoints + filterImages
-    ProfAcc snapshot;    // checkedRefine() reconstruction copy
-    ProfAcc audit_check;  // audit(): poseContradicted over every registered image
-    ProfAcc audit_fix;    // ... and everything after it, incl. the refinement
-    // global BA, split (sfm/map/Bundle.h)
-    ProfAcc ba_build;    // BAProblem assembly from the Reconstruction
-    ProfAcc ba_init;     // BundleSolver ctor + init (device + pipelines + upload)
-    ProfAcc ba_solve;    // solver.solve()
-    ProfAcc ba_write;    // download + writeback
+    // 建图器主机阶段
+    ProfAcc init_seed;   // initialize：种子搜索，含双视图 RANSAC
+    ProfAcc seed_geom;   // 其中 seedGeometry 的双视图 RANSAC 耗时
+    ProfAcc bootstrap;   // 焦距初始化，包含于 init_seed
+    ProfAcc choose;      // 下一图像候选排序
+    ProfAcc reg;         // PnP RANSAC、精化与内点重计数
+    ProfAcc tri;         // 增长期的新点三角化
+    ProfAcc retri;       // 轨迹补全与重三角化
+    ProfAcc merge;       // 其中轨迹合并耗时
+    ProfAcc filter;      // 相机约束、点过滤与图像过滤
+    ProfAcc snapshot;    // 事务式精化的重建备份
+    ProfAcc audit_check;  // 逐已配准图像的位姿审查
+    ProfAcc audit_fix;    // 审查后的修复与精化耗时
+    // 下列字段分别统计全局 BA 的各环节。
+    ProfAcc ba_build;    // 由重建装配 BAProblem
+    ProfAcc ba_init;     // 求解器初始化：设备、流水线与上传
+    ProfAcc ba_solve;    // 求解器迭代
+    ProfAcc ba_write;    // 下载与参数写回
     std::atomic<long> n_ba{0}, n_ba_iters{0}, n_choose{0}, n_reg_try{0}, n_reg_ok{0};
-    std::atomic<long> n_seed_geom{0};  // two-view RANSACs run (cache misses)
-    std::atomic<long> n_merged{0};  // observations absorbed by track merging
+    std::atomic<long> n_seed_geom{0};  // 实际运行的双视图 RANSAC 数，即缓存未命中数
+    std::atomic<long> n_merged{0};  // 轨迹合并吸收的观测数
 
     static bool enabled() {
         static bool e = spirula::env("SFM_MAP_PROF") != nullptr;
         return e;
     }
 
-    // Counters are cumulative, so a caller may report more than once: the
-    // mapper reports its own stage, the CLI reports again once the passes that
-    // assemble its models have finished adding to them. `what` says which.
+    // 计数累计不清零，建图与装配结束后可分别报告，what 标明阶段。
     void report(double total_s, const char* what = "mapper") const {
         if (!enabled()) return;
         const double init_seed = this->init_seed.get(), choose = this->choose.get();
@@ -101,7 +91,7 @@ struct MapProf {
 
 inline MapProf g_map_prof;
 
-// RAII accumulator: adds elapsed seconds to `acc` at scope exit.
+// RAII 计时器，离开作用域时将经过秒数加到 acc。
 class ProfTimer {
 public:
     explicit ProfTimer(ProfAcc& acc)
@@ -115,4 +105,4 @@ private:
     std::chrono::steady_clock::time_point t0_;
 };
 
-}  // namespace sfm
+}  // 命名空间 sfm

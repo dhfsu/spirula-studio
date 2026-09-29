@@ -1,6 +1,4 @@
-// Keypoint masking: uv sampling, mask decode, file discovery (host only).
-//
-// Prints PASS/FAIL and returns 0/1. See docs/testing.md.
+// 纯主机掩码测试，覆盖 UV 采样、解码及文件查找。
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -17,12 +15,7 @@
 
 namespace fs = std::filesystem;
 
-// Do two paths name the same file? Not a string comparison: MaskIndex::find
-// returns a path it composed, and on Windows that legitimately differs from the
-// one the test wrote -- `dir / "x/dup.png"` keeps the embedded '/' next to the
-// native '\', and a case-insensitive filesystem answers `exists()` for
-// "e.jpg.jpeg" when what is on disk is "e.jpg.JPEG". Both open the intended
-// file, which is what the resolver promises.
+// 按文件身份而非字符串比较路径，兼容 Windows 混合分隔符及扩展名大小写差异。
 bool samePath(const std::string& a, const std::string& b) {
     if (a == b) return true;
     std::error_code ec;
@@ -30,18 +23,10 @@ bool samePath(const std::string& a, const std::string& b) {
 }
 using namespace sfm;
 
-// -----------------------------------------------------------------------
-// mask-selftest: keypoint masking (host only, no GPU)
-// -----------------------------------------------------------------------
-//
-// The three things that can silently go wrong (D39): sampling a mask whose
-// resolution differs from the image's, compacting the parallel keypoint /
-// descriptor / color arrays out of step, and picking the wrong file for an
-// image. One case per section, all on data written to a scratch directory.
+// ---------------- 掩码测试 ----------------
+// 覆盖分辨率独立采样、并行特征数组同步压缩及正确文件配对，数据写入临时目录。
 
-// Binary PGM, the one mask format we can *write* without another vendored
-// header. stb_image sniffs content rather than extension, so these stand in
-// for the .png masks a real dataset ships.
+// 用无需额外库即可写出的二进制 PGM 代替 PNG；stb_image 按内容识别格式。
 static void writePgm(const fs::path& p, int w, int h, const std::vector<uint8_t>& px) {
     fs::create_directories(p.parent_path());
     std::ofstream f(p, std::ios::binary);
@@ -49,7 +34,7 @@ static void writePgm(const fs::path& p, int w, int h, const std::vector<uint8_t>
     f.write((const char*)px.data(), (std::streamsize)px.size());
 }
 
-// A mask whose left `keep_frac` of the width is keep (255) and the rest ignore.
+// 左侧 keep_frac 宽度为 255，其余忽略。
 static std::vector<uint8_t> leftHalfMask(int w, int h, double keep_frac) {
     std::vector<uint8_t> px((size_t)w * h, 0);
     for (int y = 0; y < h; y++)
@@ -64,16 +49,12 @@ int cmdMaskSelftest(int, char**) {
     std::error_code ec;
     fs::remove_all(tmp, ec);
 
-    // ---- 1. uv sampling is resolution-independent ----
-    // The same geometric mask at four resolutions must classify the same
-    // keypoints. This is the property COLMAP does not have: it indexes the mask
-    // by integer pixel, so only the resolution that happens to match the source
-    // image is correct and the others silently drop everything out of range.
+    // ---------------- UV 采样与分辨率无关 ----------------
+    // 同几何掩码的四种分辨率应给出一致关键点分类，不能按原图像素直接索引小掩码。
     {
         const int IW = 400, IH = 300;
         const int res[][2] = {{400, 300}, {40, 30}, {1200, 900}, {97, 73}};
-        // Keypoints straddling the boundary, plus the extreme corners (which a
-        // bounds-checking sampler must keep, not delete).
+        // 测试边界两侧与极端角落关键点，内部角点不能因索引钳位而被误删。
         std::vector<Keypoint> kps;
         for (int i = 0; i < 40; i++)
             kps.push_back({(float)(i * 10 + 0.5f), (float)(IH / 2), 2, 0, 0});
@@ -102,10 +83,7 @@ int cmdMaskSelftest(int, char**) {
 
             applyMask(fs, m);
             kept_per_res.push_back(fs.count());
-            // Everything kept must be in the left half, and the descriptor /
-            // color rows must still belong to their keypoint. The boundary is
-            // only resolvable to one mask cell, so a coarse mask gets that much
-            // slack (97 columns over 400 px puts its edge 0.7 px past centre).
+            // 保留点位于左半区，描述子与颜色仍须对应原关键点；边界容许一个掩码单元的量化误差。
             const float tol = (float)IW / r[0];
             for (uint32_t i = 0; i < fs.count(); i++) {
                 if (fs.keypoints[i].x >= IW * 0.5f + tol) {
@@ -125,8 +103,7 @@ int cmdMaskSelftest(int, char**) {
         printf("mask: uv sampling at %dx%d over masks 400x300/40x30/1200x900/97x73 kept "
                "%u/%u/%u/%u of %zu\n", IW, IH, kept_per_res[0], kept_per_res[1], kept_per_res[2],
                kept_per_res[3], kps.size());
-        // The coarsest mask (40x30) quantizes the boundary to 10 image px, so
-        // allow one keypoint of slack there; the rest must agree exactly.
+        // 40×30 掩码将边界量化到十个图像像素，允许一个关键点差异，其余精确一致。
         for (size_t i = 1; i < kept_per_res.size(); i++) {
             uint32_t d = kept_per_res[i] > kept_per_res[0] ? kept_per_res[i] - kept_per_res[0]
                                                            : kept_per_res[0] - kept_per_res[i];
@@ -135,8 +112,7 @@ int cmdMaskSelftest(int, char**) {
                 fails++;
             }
         }
-        // Corners survive: a keypoint inside the image is never deleted for
-        // being unreachable by the sampler.
+        // 图内角点不能因采样不可达而被删除。
         Mask allkeep;
         allkeep.width = allkeep.height = 3;
         allkeep.bits.assign(9, 1);
@@ -147,11 +123,10 @@ int cmdMaskSelftest(int, char**) {
         if (applyMask(fs2, allkeep) != 0) { printf("  FAIL: all-keep mask dropped keypoints\n"); fails++; }
     }
 
-    // ---- 2. decode: formats, binarization, failure ----
+    // ---------------- 解码、二值化与失败 ----------------
     {
         std::vector<uint8_t> px = leftHalfMask(64, 48, 0.25);
-        // A grayscale ramp on the keep side, to check that "nonzero = keep"
-        // holds rather than some threshold at 128.
+        // 保留区采用灰度渐变，验证非零即保留，而非按 128 阈值。
         for (int y = 0; y < 48; y++)
             for (int x = 0; x < 16; x++) px[(size_t)y * 64 + x] = (uint8_t)(1 + (x % 3));
         writePgm(tmp / "decode" / "m.pgm", 64, 48, px);
@@ -164,8 +139,7 @@ int cmdMaskSelftest(int, char**) {
         }
         for (uint8_t b : m.bits)
             if (b > 1) { printf("  FAIL: mask not binarized to 0/1\n"); fails++; break; }
-        // A file that is not an image yields an empty mask (which masks
-        // nothing) rather than throwing -- one bad mask must not lose the run.
+        // 非图像文件返回空掩码，不抛异常、不丢整次运行。
         {
             fs::create_directories(tmp / "decode");
             std::ofstream(tmp / "decode" / "junk.png", std::ios::binary) << "not an image";
@@ -182,19 +156,19 @@ int cmdMaskSelftest(int, char**) {
         }
     }
 
-    // ---- 3. discovery: the naming conventions in the wild ----
+    // ---------------- 常见掩码命名查找 ----------------
     {
         const fs::path md = tmp / "masks";
         std::vector<uint8_t> px = leftHalfMask(8, 8, 0.5);
         struct Case { const char* image; const char* mask; };
         const Case cases[] = {
-            {"cam0/a.jpg", "cam0/a.jpg.png"},      // COLMAP / Spirula Studio / SAM
-            {"cam0/b.jpg", "cam0/b.png"},          // COLMAP's alternate, nerfstudio
-            {"cam0/c.jpg", "cam0/c_mask.png"},     // suffix form
-            {"cam0/d.jpg", "cam0/d.jpg"},          // same name, same extension
-            {"cam1/e.jpg", "cam1/e.jpg.JPEG"},     // upper-case, different container
-            {"cam1/f.jpg", "f.png"},               // flat mask dir, nested images
-            {"cam1/g.png", "cam1/g.png.png"},      // png image, png mask
+            {"cam0/a.jpg", "cam0/a.jpg.png"},      // COLMAP、Spirula Studio 与 SAM 的命名形式
+            {"cam0/b.jpg", "cam0/b.png"},          // COLMAP 备选及 Nerfstudio 命名形式
+            {"cam0/c.jpg", "cam0/c_mask.png"},     // 带 mask 后缀
+            {"cam0/d.jpg", "cam0/d.jpg"},          // 文件名与扩展名相同
+            {"cam1/e.jpg", "cam1/e.jpg.JPEG"},     // 大写扩展名且容器不同
+            {"cam1/f.jpg", "f.png"},               // 平铺掩码目录与嵌套图像目录
+            {"cam1/g.png", "cam1/g.png.png"},      // PNG 图像与 PNG 掩码
         };
         for (const Case& c : cases) writePgm(md / c.mask, 8, 8, px);
         MaskIndex idx(md.string());
@@ -208,14 +182,12 @@ int cmdMaskSelftest(int, char**) {
         }
         printf("mask: resolved %zu naming conventions\n", sizeof(cases) / sizeof(cases[0]));
 
-        // An image with no mask resolves to nothing (rather than to some other
-        // image's mask).
+        // 没有掩码时应返回空，不能误配其他图像掩码。
         if (!idx.find("cam0/nosuch.jpg").empty()) {
             printf("  FAIL: invented a mask for an unmasked image\n");
             fails++;
         }
-        // Ambiguity: two sub-folders both holding `dup.png` must not resolve a
-        // *flat* image name -- but each nested image still resolves its own.
+        // 不同子目录的同名掩码不能匹配歧义平铺名称，但各嵌套图像仍匹配自身文件。
         writePgm(md / "x" / "dup.png", 8, 8, px);
         writePgm(md / "y" / "dup.png", 8, 8, px);
         MaskIndex idx2(md.string());
@@ -227,7 +199,7 @@ int cmdMaskSelftest(int, char**) {
             printf("  FAIL: unambiguous nested name did not resolve\n");
             fails++;
         }
-        // A missing mask directory is inert, not fatal.
+        // 掩码目录缺失时不生效，不作为致命错误。
         if (MaskIndex((tmp / "nope").string()).valid()) {
             printf("  FAIL: missing mask directory reported valid\n");
             fails++;

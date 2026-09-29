@@ -1,9 +1,5 @@
-// Camera-side priors for the bundle adjustment: residuals on the poses alone
-// -- a relative rotation, a gravity direction, a linear constraint on camera
-// centres -- that a sensor states and no observation does. There are
-// O(frames) of them against O(observations) reprojections, so they are
-// evaluated on the host and handed to either solver as sparse 6x6 frame
-// blocks (docs/notes/sensor-priors.md has the algebra).
+// BA 的相机侧传感器先验：相对旋转、重力方向和相机中心线性约束。
+// 先验数量为 O(frames)，少于 O(observations) 重投影，因此在主机求值，再以稀疏 6×6 帧块交给任一求解器。
 #pragma once
 
 #include <algorithm>
@@ -18,23 +14,21 @@
 
 namespace sfm {
 
-// R_j ~ R_ji R_i between two images' camera frames (world -> camera).
+// 两图像相机坐标间满足 R_j ~ R_ji R_i，R 为世界到相机旋转。
 struct PriorRotation {
     uint32_t i = 0, j = 0;
     Mat3 R_ji = mat3Identity();
-    double sigma = 0.01;   // radians
+    double sigma = 0.01;   // 弧度
 };
 
-// R_i up_w ~ u: the world up axis seen from image i's camera frame.
+// R_i up_w ~ u，即世界向上轴在图像 i 相机坐标系中的方向。
 struct PriorUp {
     uint32_t i = 0;
     Vec3 u{0, -1, 0};
-    double sigma = 0.05;   // radians
+    double sigma = 0.05;   // 弧度
 };
 
-// sum_k A_k c_{img_k} ~ b on camera centres, each axis weighted by 1/sigma
-// (0 drops the axis). One term is an absolute position, two a displacement,
-// three the velocity-free inertial triple.
+// 相机中心约束 sum_k A_k c_{img_k} ~ b，各轴按 1/sigma 加权，0 表示忽略；一项为绝对位置，两项为位移，三项为无速度惯性约束。
 struct PriorCentre {
     int n = 0;
     uint32_t img[3] = {0, 0, 0};
@@ -43,11 +37,10 @@ struct PriorCentre {
     Vec3 sigma{1, 1, 1};
 };
 
-// Image indices are whatever the holder says: the mapper fills them with
-// reconstruction image ids, buildBundle remaps them to BA indices.
+// 建图器使用重建图像 ID，buildBundle 将其映射为 BA 索引。
 struct PosePriors {
-    Vec3 up_w{0, 0, 1};    // the world up every PriorUp is measured against
-    double huber = 1.345;  // in sigmas, per factor
+    Vec3 up_w{0, 0, 1};    // 全部 PriorUp 共用的世界向上轴
+    double huber = 1.345;  // 每因子的阈值，以标准差为单位
     std::vector<PriorRotation> rotations;
     std::vector<PriorUp> ups;
     std::vector<PriorCentre> centres;
@@ -55,9 +48,7 @@ struct PosePriors {
     size_t size() const { return rotations.size() + ups.size() + centres.size(); }
 };
 
-// The priors' normal equations as a CSR over frames of 6x6 blocks, both
-// orderings of a pair listed, plus the gradient over pose_dim: block element
-// [6a + b] takes x[6 col + b] into y[6 row + a].
+// 先验正规方程以 6×6 帧块 CSR 保存，双向块均列出；[6a+b] 将 x[6 col+b] 映射到 y[6 row+a]，并附 pose_dim 梯度。
 class PriorAssembler {
 public:
     void init(const BAProblem& P) {
@@ -109,7 +100,7 @@ public:
             fact_.push_back(f);
         }
         nfact_ = fact_.size();
-        // CSR in (row, col) order: std::map iterates that way.
+        // std::map 按 (row, col) 顺序生成 CSR。
         rows_.assign(nframes_ + 1, 0);
         uint32_t e = 0;
         for (auto& kv : id) {
@@ -135,8 +126,7 @@ public:
     const std::vector<double>& blocks() const { return blk_; }
     const std::vector<double>& gradient() const { return g_; }
 
-    // 0.5 sum rho(|r|^2) at the given parameters (poses 6 per frame, exts 6
-    // per member).
+    // 给定参数下的 0.5 sum rho(|r|^2)，每帧 6 个位姿参数、每成员 6 个外参。
     double cost(const BAProblem& P, const double* poses, const double* exts) const {
         double c = 0;
         Eval ev;
@@ -147,8 +137,7 @@ public:
         return c;
     }
 
-    // Blocks and gradient at the given parameters, the diagonal blocks damped
-    // by (1 + damping) as the observation kernels damp theirs. Returns the cost.
+    // 计算块与梯度，对角块按 (1 + damping) 阻尼，与观测内核一致，返回代价。
     double assemble(const BAProblem& P, const double* poses, const double* exts, double damping) {
         std::fill(blk_.begin(), blk_.end(), 0.0);
         std::fill(g_.begin(), g_.end(), 0.0);
@@ -184,8 +173,7 @@ public:
         return c;
     }
 
-    // One factor's residual and Jacobians, for the tests: `frames` are the
-    // frame slots the rows of `J` differentiate against.
+    // 供测试读取单因子的残差与雅可比；frames 为 J 各列对应的帧槽位。
     int debugFactor(const BAProblem& P, const double* poses, const double* exts, size_t k,
                     double r[3], double J[3][3][6], uint32_t frames[3]) const {
         Eval ev;
@@ -201,7 +189,7 @@ public:
 
 private:
     struct Fact {
-        int kind = 0;      // 0 rotation, 1 up, 2 centre
+        int kind = 0;      // 0 为旋转，1 为向上方向，2 为中心
         uint32_t index = 0;
         int nf = 0;
         uint32_t frame[3] = {0, 0, 0};
@@ -219,15 +207,15 @@ private:
     };
     struct Eval {
         double r[3];
-        double J[3][3][6];   // per frame slot, 3 x [angle-axis 3 | t 3]
+        double J[3][3][6];   // 每帧槽位为 3 × [轴角 3 | 平移 3]
     };
 
-    // One image's chain: its frame block and the member on top of it.
+    // 图像的变换链由帧块与成员外参组成。
     struct Cam {
         uint32_t frame = 0;
-        Mat3 Rf, Rm, Rc;   // frame, member, camera = Rm Rf
+        Mat3 Rf, Rm, Rc;   // 帧、成员与相机旋转：camera = Rm Rf
         Vec3 tf, tm;
-        Mat3 Jl;           // left Jacobian of the frame's angle-axis
+        Mat3 Jl;           // 帧轴角的左雅可比
     };
 
     static Cam camOf(const BAProblem& P, const double* poses, const double* exts, uint32_t img) {
@@ -252,8 +240,7 @@ private:
         return c;
     }
 
-    // d r / d delta_cam (rows x 3) into the frame's angle-axis columns:
-    // delta_cam = Rm delta_f and delta_f = Jl(a) da.
+    // 将 d r / d delta_cam（行数 × 3）映射到帧轴角列：delta_cam = Rm delta_f，delta_f = Jl(a) da。
     static void rotCols(const Mat3& D, const Cam& c, double scale, double J[3][6]) {
         const Mat3 M = mul(mul(D, c.Rm), c.Jl);
         for (int m = 0; m < 3; m++)
@@ -307,7 +294,7 @@ private:
         Vec3 sum{0, 0, 0};
         for (int k = 0; k < q.n; k++) {
             const Cam c = camOf(P, poses, exts, q.img[k]);
-            // c = -Rf^T a with a = tf + Rm^T tm: dc/dt = -Rf^T, dc/dd = -Rf^T [a]x.
+            // c=-Rf^T a，其中 a=tf+Rm^T tm；dc/dt=-Rf^T，dc/dd=-Rf^T[a]x。
             const Vec3 a = c.tf + mul(transpose(c.Rm), c.tm);
             const Vec3 centre = mul(transpose(c.Rf), a) * -1.0;
             sum = sum + mul(q.A[k], centre);
@@ -338,4 +325,4 @@ private:
     std::vector<double> blk_, g_;
 };
 
-}  // namespace sfm
+}  // 命名空间 sfm

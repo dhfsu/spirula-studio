@@ -1,14 +1,5 @@
-// Which image pairs to match. Kept separate from the matcher so the pairing
-// strategy and the descriptor-matching algorithm compose independently: any
-// IFeatureMatcher can be driven over any pair list.
-//
-// Exhaustive (all i<j) and sequential (a sliding window over a video) are
-// generated here; Prefilter (GPU pair selection by mini-matching top-scale
-// subsets) needs the features and lives in sfm/feature/PairSelection.h.
-//
-// Sequential and Prefilter each miss what the other finds, so by default each
-// takes the other's list too: `--loop-closure` and `--prefilter-sequential`,
-// see matchFeatureDir.
+// 图像配对与描述子匹配独立；此处生成穷举与时序列表，内容预筛位于 PairSelection.h。
+// loop-closure 与 prefilter-sequential 可互补时序和内容筛选的遗漏。
 #pragma once
 
 #include <algorithm>
@@ -24,9 +15,7 @@ namespace sfm {
 
 enum class PairMode { Exhaustive, Sequential, Prefilter };
 
-// Each image with the next `overlap` of its sequence and, with `quadratic`,
-// the ones 2^k ahead for k < overlap (COLMAP's quadratic_overlap). A window
-// never crosses from one `run` (folder) into another; empty = one sequence.
+// 每图与同序列后 overlap 张配对，可选再加入 i+2^k；窗口不跨文件夹，空分组视为单序列。
 inline std::vector<std::pair<uint32_t, uint32_t>> sequentialPairs(
     uint32_t n, int overlap, bool quadratic, const std::vector<uint32_t>& run = {}) {
     const uint32_t ov = overlap > 0 ? (uint32_t)overlap : 10u;
@@ -52,7 +41,7 @@ inline std::vector<std::pair<uint32_t, uint32_t>> sequentialPairs(
     return pairs;
 }
 
-// The sequence id of each image name: its parent folder.
+// 图像父目录作为序列 ID。
 inline std::vector<uint32_t> folderRuns(const std::vector<std::string>& names) {
     std::map<std::string, uint32_t> ids;
     std::vector<uint32_t> run(names.size());
@@ -64,8 +53,7 @@ inline std::vector<uint32_t> folderRuns(const std::vector<std::string>& names) {
     return run;
 }
 
-// The window along each sequence of a SequenceTable, one chain per member so
-// a rig's lenses each pair with their own; the rig-mate pass links across.
+// SequenceTable 中每成员独立形成时间链，rig 跨镜头连接由伙伴匹配补充。
 inline std::vector<std::pair<uint32_t, uint32_t>> sequenceWindowPairs(const SequenceTable& st,
                                                                        int overlap,
                                                                        bool quadratic) {
@@ -78,8 +66,7 @@ inline std::vector<std::pair<uint32_t, uint32_t>> sequenceWindowPairs(const Sequ
         if (st.member[a] != st.member[b]) return st.member[a] < st.member[b];
         return st.pos[a] != st.pos[b] ? st.pos[a] < st.pos[b] : a < b;
     });
-    // sequentialPairs walks each run in index order, so the chains are laid
-    // out over a renumbering that follows the sequence positions.
+    // 先按序列位置重编号，使按索引遍历的 sequentialPairs 得到正确时序。
     std::vector<uint32_t> chain_of(n, UINT32_MAX);
     for (uint32_t k = 0; k < order.size(); k++) chain_of[order[k]] = k;
     std::vector<uint32_t> runs(order.size());
@@ -98,8 +85,7 @@ inline std::vector<std::pair<uint32_t, uint32_t>> sequenceWindowPairs(const Sequ
     return pairs;
 }
 
-// Every pair for Exhaustive; the plain window (no quadratic links, one
-// sequence) for Sequential.
+// Exhaustive 生成全部图像对，Sequential 生成无指数连接的单序列窗口。
 inline std::vector<std::pair<uint32_t, uint32_t>> generatePairs(uint32_t n, PairMode mode,
                                                                 int overlap = 10) {
     if (mode != PairMode::Exhaustive) return sequentialPairs(n, overlap, false);
@@ -110,4 +96,4 @@ inline std::vector<std::pair<uint32_t, uint32_t>> generatePairs(uint32_t n, Pair
     return pairs;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

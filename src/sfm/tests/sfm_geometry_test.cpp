@@ -1,6 +1,4 @@
-// Two-view geometry: F, H, E, P3P, triangulation, RANSAC (host only).
-//
-// Prints PASS/FAIL and returns 0/1. See docs/testing.md.
+// 纯主机测试基础矩阵、单应性、本质矩阵、P3P、三角化与 RANSAC，输出 PASS/FAIL。
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -22,9 +20,7 @@
 namespace fs = std::filesystem;
 using namespace sfm;
 
-// -----------------------------------------------------------------------
-// geom-selftest: synthetic two-view geometry (host only, no GPU)
-// -----------------------------------------------------------------------
+// ---------------- 无 GPU 的合成双视图几何测试 ----------------
 static Mat3 rotationY(double deg) {
     double a = deg * M_PI / 180.0, c = std::cos(a), s = std::sin(a);
     return {c, 0, s, 0, 1, 0, -s, 0, c};
@@ -36,7 +32,7 @@ static double rotationErrorDeg(const Mat3& A, const Mat3& B) {
 }
 static double vecAngleDeg(const Vec3& a, const Vec3& b) {
     double d = a.normalized().dot(b.normalized());
-    return std::acos(std::min(1.0, std::fabs(d))) * 180.0 / M_PI;  // sign-agnostic
+    return std::acos(std::min(1.0, std::fabs(d))) * 180.0 / M_PI;  // 比较时忽略整体符号
 }
 
 int cmdGeomSelftest(int, char**) {
@@ -57,7 +53,7 @@ int cmdGeomSelftest(int, char**) {
 
     int fails = 0;
 
-    // ---- angle-axis round trip, up to and at 180 degrees ----
+    // ---------------- 轴角往返，覆盖接近和等于 180 度 ----------------
     {
         double worst = 0;
         std::uniform_real_distribution<double> u(-1, 1), ue(1, 16);
@@ -72,10 +68,10 @@ int cmdGeomSelftest(int, char**) {
         if (worst > 1e-12) { printf("  FAIL: angle-axis round trip\n"); fails++; }
     }
 
-    // ---- non-planar scene with noise + outliers ----
+    // ---------------- 带噪声与离群点的非平面场景 ----------------
     {
         std::vector<Vec2> p1, p2;
-        std::vector<char> truth;  // 1 = true inlier
+        std::vector<char> truth;  // 1 表示真实内点
         int N = 300;
         for (int i = 0; i < N; i++) {
             Vec3 X = {ux(rng), ux(rng), uz(rng)};
@@ -88,7 +84,7 @@ int cmdGeomSelftest(int, char**) {
             if (a.x < 0 || a.x > 1280 || b.x < 0 || b.x > 1280) continue;
             p1.push_back(a); p2.push_back(b); truth.push_back(1);
         }
-        // 30% outliers: random p2
+        // 随机替换 p2，生成 30% 离群匹配
         int nOut = (int)(0.3 * p1.size());
         for (int i = 0; i < nOut; i++) {
             p1.push_back({upix(rng), upix(rng)});
@@ -120,11 +116,11 @@ int cmdGeomSelftest(int, char**) {
         if (!ok) { printf("  FAIL: two-view estimation\n"); fails++; }
     }
 
-    // ---- planar scene: homography should win ----
+    // ---------------- 平面场景应选择单应性 ----------------
     {
         std::vector<Vec2> p1, p2;
         for (int i = 0; i < 200; i++) {
-            double X = ux(rng), Y = ux(rng), Z = 6.0 + 0.3 * X - 0.2 * Y;  // a plane
+            double X = ux(rng), Y = ux(rng), Z = 6.0 + 0.3 * X - 0.2 * Y;  // 平面点集
             Vec3 P = {X, Y, Z};
             Vec3 xc2 = mul(Rgt, P) + tgt;
             if (xc2.z <= 0.1) continue;
@@ -143,7 +139,7 @@ int cmdGeomSelftest(int, char**) {
         }
     }
 
-    // ---- PnP with distant points / small baseline (mapper-like) ----
+    // ---------------- 远点、小基线 PnP ----------------
     {
         Mat3 Kp = {777.6, 0, 324, 0, 777.6, 210, 0, 0, 1};
         Camera pc;
@@ -153,9 +149,9 @@ int cmdGeomSelftest(int, char**) {
         std::mt19937 r2(3);
         std::uniform_real_distribution<double> updist(50, 600), depth(12, 35);
         std::vector<Vec3> Xs;
-        std::vector<Vec3> brs;  // observed unit bearings
+        std::vector<Vec3> brs;  // 观测单位视线
         for (int i = 0; i < 80; i++) {
-            // back-project a random pixel at random depth in the reference frame
+            // 按随机像素和深度在参考坐标中反投影
             double u = updist(r2), v = updist(r2), d = depth(r2);
             Vec3 X = {(u - 324) / 777.6 * d, (v - 210) / 777.6 * d, d};
             Vec3 pc3 = mul(Rp, X) + tp;
@@ -175,9 +171,8 @@ int cmdGeomSelftest(int, char**) {
             fails++;
         }
 
-        // ---- nonlinear pose refinement (D36) ----
-        // Perturb the ground-truth pose and refine on all correspondences: the
-        // LM polish must recover it more closely than the perturbation.
+        // ---------------- 非线性位姿精化（D36）----------------
+        // 扰动真值后对全部对应精化，应比扰动初值更接近真值。
         {
             Pose p0;
             p0.R = mul(rotationY(1.5), Rp);
@@ -187,22 +182,18 @@ int cmdGeomSelftest(int, char**) {
             double rr = rotationErrorDeg(p0.R, Rp);
             double tt = (p0.t - tp).norm();
             printf("geom: refinePose 1.50 deg / 0.071 -> %.3f deg / %.4f\n", rr, tt);
-            // 0.4 px observation noise on a short baseline bounds how well the
-            // translation can be recovered; beating both the perturbation and
-            // the unrefined RANSAC pose (0.026) is the requirement.
+            // 短基线与 0.4 px 噪声限制平移精度，要求优于初始扰动及未精化 RANSAC 的 0.026 误差。
             if (!ok || rr > 0.1 || tt > 0.02) { printf("  FAIL: refinePose\n"); fails++; }
         }
 
-        // ---- joint pose+focal refinement (D36) ----
-        // The same observations interpreted with a 25% wrong focal: the joint
-        // refinement must recover the true focal as a scale on the guess.
+        // ---------------- 位姿与焦距联合精化（D36）----------------
+        // 用偏差 25% 的焦距解释同一观测，要求恢复正确比例。
         {
             Camera wrong = pc;
             wrong.setFocal(777.6 * 1.25);
             std::vector<Vec3> brw(Xs.size());
             for (size_t i = 0; i < Xs.size(); i++) {
-                // re-derive the pixel from the true bearing, unproject with the
-                // wrong camera
+                // 从真实视线恢复像素，再用错误相机反投影
                 Vec2 px = pc.project(brs[i]);
                 brw[i] = wrong.bearing(px);
             }
@@ -218,10 +209,8 @@ int cmdGeomSelftest(int, char**) {
         }
     }
 
-    // ---- generalized PnP: a rig posed as one camera (rig constraints) ----
-    //
-    // Rays that miss a common centre, rays that share one, and the case the
-    // mapper needs: ten views on two lenses, none able to pose itself.
+    // ---------------- rig 广义 PnP ----------------
+    // 覆盖不共心、共心射线，以及双镜头十视图各自不足以定位的联合情况。
     {
         std::mt19937 rg(23);
         std::uniform_real_distribution<double> ur(-1.0, 1.0), z01(0.0, 1.0);
@@ -251,8 +240,7 @@ int cmdGeomSelftest(int, char**) {
         printf("geom: gp3p on 400 non-central samples: %d missed, worst %.2e\n", missed, worst);
         if (missed > 8) { printf("  FAIL: gp3p\n"); fails++; }
 
-        // Concurrent rays: the same three bearings through one centre, which
-        // has no baseline to solve with and must come back as P3P does.
+        // 共心三射线无广义基线，结果应与普通 P3P 一致。
         {
             Pose F;
             F.R = rotationY(23.0);
@@ -272,20 +260,18 @@ int cmdGeomSelftest(int, char**) {
             double g_best = 1e9, p_best = 1e9;
             for (const Pose& p : gp3p(rays, Xs))
                 g_best = std::min(g_best, rotationErrorDeg(p.R, F.R) + (p.t - F.t).norm());
-            // P3P sees the same rays from the origin, so its pose is the
-            // rig's shifted by the centre they share.
+            // P3P 从原点观察同样视线，其位姿与 rig 结果相差公共中心平移。
             for (const Pose& p : p3p(bear, Xs))
                 p_best = std::min(p_best,
                                   rotationErrorDeg(p.R, F.R) + (p.t + centre - F.t).norm());
             printf("geom: gp3p on concurrent rays: %.2e (P3P %.2e)\n", g_best, p_best);
-            if (g_best > 1e-6 || p_best > 1e-4) {  // 1e-4: lambdatwist's own floor
+            if (g_best > 1e-6 || p_best > 1e-4) {  // 1e-4 为 Lambda Twist 自身精度下限
                 printf("  FAIL: gp3p concurrent\n");
                 fails++;
             }
         }
 
-        // Ten views, two optical centres, six correspondences each and 60%
-        // of them wrong: no lens can pose itself, the rig can.
+        // 十视图、两个光心，每视图六对应且 60% 错误，单镜头不能定位但 rig 应能联合定位。
         {
             const int kLenses = 2, kViews = 5, kCorr = 6;
             const double baseline = 0.03, outlier = 0.6;
@@ -334,19 +320,15 @@ int cmdGeomSelftest(int, char**) {
         }
     }
 
-    // ---- fisheye two-view: bearings vs pixels (D45) ----
-    //
-    // The claim D45 rests on: on a wide lens, verification on raw pixels loses
-    // the correspondences that carry the field of view, because no fundamental
-    // matrix can explain a ray 100 deg off axis. Same scene, same matches,
-    // same RANSAC -- only the coordinate system differs.
+    // ---------------- 鱼眼视线与像素验证（D45）----------------
+    // 同场景、匹配和 RANSAC 仅改变坐标表示，验证单位视线能保留像素基础矩阵无法解释的宽角对应。
     {
         Camera fc;
         fc.model = CamModel::ThinPrismFisheye;
         fc.width = fc.height = 1920;
         fc.setFocal(520);
         fc.cx = 960; fc.cy = 960;
-        fc.k1 = 0.023; fc.k2 = 0.016; fc.k3 = -0.006;   // Metashape's, for this lens
+        fc.k1 = 0.023; fc.k2 = 0.016; fc.k3 = -0.006;   // 该镜头的 Metashape 参数
 
         Mat3 Rf = rotationY(12.0);
         Vec3 tf = {0.9, 0.05, 0.15};
@@ -359,9 +341,7 @@ int cmdGeomSelftest(int, char**) {
         std::vector<char> truth;
         std::vector<double> theta;
         while (p1.size() < 250) {
-            // Points all around the first camera, out to 100 deg off axis --
-            // the working range of a 200 deg lens, and exactly what a pinhole
-            // model cannot represent.
+            // 点覆盖相机周围离轴至 100 度，模拟 200 度镜头，超出针孔表示范围。
             Vec3 d = {sph(fr), sph(fr), sph(fr)};
             if (d.norm() < 1e-3) continue;
             d = d.normalized();
@@ -381,7 +361,7 @@ int cmdGeomSelftest(int, char**) {
             theta.push_back(th * 180.0 / M_PI);
         }
         size_t nTrue = p1.size();
-        for (size_t i = 0; i < nTrue / 3; i++) {  // 25% outliers
+        for (size_t i = 0; i < nTrue / 3; i++) {  // 25% 离群匹配
             p1.push_back({upx(fr), upx(fr)});
             p2.push_back({upx(fr), upx(fr)});
             truth.push_back(0);
@@ -408,7 +388,7 @@ int cmdGeomSelftest(int, char**) {
 
         TwoViewOptions br_opt;
         br_opt.recover_pose = true;
-        br_opt.ransac.max_error /= 520.0;  // px -> rad
+        br_opt.ransac.max_error /= 520.0;  // 像素 -> 弧度
         TwoViewGeometry gb = estimateTwoViewBearing(b1, b2, br_opt);
 
         double rErr = rotationErrorDeg(gb.pose.R, Rf);
@@ -424,17 +404,14 @@ int cmdGeomSelftest(int, char**) {
                   recallOf(gb, true) > 2.0 * recallOf(gp, true);
         if (!ok) { printf("  FAIL: fisheye two-view on bearings\n"); fails++; }
 
-        // A planar fisheye scene must still be recognised as a homography:
-        // the ray-to-ray H and its angular transfer error are the bearing
-        // path's half of the model selection, and without them every planar
-        // pair would be handed to the mapper as a usable epipolar geometry.
+        // 鱼眼平面仍应选择射线单应性，不能误当作可初始化的非退化极线几何。
         {
             std::vector<Vec3> h1, h2;
             std::mt19937 pr(19);
             std::uniform_real_distribution<double> pu(-4, 4);
             while (h1.size() < 200) {
                 double X = pu(pr), Y = pu(pr);
-                Vec3 P = {X, Y, 6.0 + 0.3 * X - 0.2 * Y};   // a plane
+                Vec3 P = {X, Y, 6.0 + 0.3 * X - 0.2 * Y};   // 平面点集
                 Vec3 xc2 = mul(Rf, P) + tf;
                 Vec2 a = fc.project(P), b = fc.project(xc2);
                 if (a.x < 0 || a.x > 1920 || a.y < 0 || a.y > 1920) continue;
@@ -455,9 +432,7 @@ int cmdGeomSelftest(int, char**) {
             }
         }
 
-        // The focal the bootstrap would pick, on this one synthetic pair. The
-        // search maximizes peripheral inliers over a FOV grid; here the truth
-        // is known, so we can check it lands on it.
+        // 已知真值的合成对用于检查周边内点最大化的焦距搜索能否恢复正确视场。
         {
             FeatureSet fs1, fs2;
             fs1.width = fs2.width = 1920;
@@ -479,7 +454,7 @@ int cmdGeomSelftest(int, char**) {
         }
     }
 
-    // ---- triangulation round-trip ----
+    // ---------------- 三角化往返 ----------------
     {
         Mat34 P1 = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
         Mat34 P2 = {Rgt[0], Rgt[1], Rgt[2], tgt.x, Rgt[3], Rgt[4], Rgt[5], tgt.y,
@@ -488,7 +463,7 @@ int cmdGeomSelftest(int, char**) {
         for (int i = 0; i < 50; i++) {
             Vec3 X = {ux(rng), ux(rng), uz(rng)};
             Vec3 xc2 = mul(Rgt, X) + tgt;
-            Vec3 a = X.normalized(), b = xc2.normalized();  // unit bearings
+            Vec3 a = X.normalized(), b = xc2.normalized();  // 单位视线
             Vec3 Xr = triangulateDLT(P1, P2, a, b);
             maxErr = std::max(maxErr, (Xr - X).norm());
         }
@@ -496,18 +471,13 @@ int cmdGeomSelftest(int, char**) {
         if (maxErr > 1e-6) { printf("  FAIL: triangulation\n"); fails++; }
     }
 
-    // ---- linear algebra the estimators stand on (D24, D25) ----
-    //
-    // These two used to be checked only indirectly, through pose accuracy, which
-    // is how a silently non-orthonormal svd3 survived: it produced a U with a
-    // zero column for every rank-deficient input -- i.e. every essential matrix
-    // -- and the two-view test still passed on the pose it happened to pick.
+    // ---------------- 几何估计的线性代数基础（D24/D25）----------------
+    // 直接验证秩亏 SVD 的正交性，避免只看最终位姿而漏掉 U 零列等内部错误。
     {
         std::mt19937 lrng(11);
         std::uniform_real_distribution<double> lu(-1, 1);
 
-        // Symmetric eigen-decomposition: A v = lambda v, and V orthonormal,
-        // across sizes and a wide range of scales.
+        // 跨矩阵尺寸与数量级检查 A v=lambda v 和 V 正交性。
         double eigErr = 0, orthErr = 0;
         for (int t = 0; t < 300; t++) {
             int n = 3 + (t % 10);
@@ -538,12 +508,11 @@ int cmdGeomSelftest(int, char**) {
         printf("geom: jacobi eigen residual %.2e, orthonormality %.2e\n", eigErr, orthErr);
         if (eigErr > 1e-9 || orthErr > 1e-11) { printf("  FAIL: jacobiEigenSymmetric\n"); fails++; }
 
-        // svd3 on deliberately rank-deficient input: U and V must stay
-        // orthonormal and A = U diag(s) V^T must still hold.
+        // 秩亏输入仍要求 U/V 正交且 A=U diag(s)V^T。
         double recErr = 0, uErr = 0;
         for (int t = 0; t < 300; t++) {
             Mat3 A{};
-            int rank = t % 4;  // 0..3, so ranks 0,1,2 are all exercised
+            int rank = t % 4;  // 覆盖秩 0、1、2、3
             for (int k = 0; k < rank; k++) {
                 Vec3 a{lu(lrng), lu(lrng), lu(lrng)}, b{lu(lrng), lu(lrng), lu(lrng)};
                 for (int i = 0; i < 3; i++)
@@ -564,8 +533,7 @@ int cmdGeomSelftest(int, char**) {
         printf("geom: svd3 (ranks 0-3) reconstruction %.2e, orthonormality %.2e\n", recErr, uErr);
         if (recErr > 1e-12 || uErr > 1e-12) { printf("  FAIL: svd3\n"); fails++; }
 
-        // The case that actually bit: every essential matrix is rank 2, and the
-        // true (R,t) must be among the four decomposition candidates.
+        // 本质矩阵恒为秩二，四个分解候选中必须包含真实 (R,t)。
         int missed = 0;
         for (int t = 0; t < 300; t++) {
             double a = lu(lrng) * 0.6, b = lu(lrng) * 0.6, c = lu(lrng) * 0.6;
@@ -586,12 +554,10 @@ int cmdGeomSelftest(int, char**) {
         printf("geom: essential decomposition recovers truth %d/300\n", 300 - missed);
         if (missed > 0) { printf("  FAIL: decomposeEssential\n"); fails++; }
 
-        // Null spaces of under-determined systems (D27), the RANSAC minimal
-        // solvers' inner loop: the returned basis must satisfy A x = 0 and be
-        // orthonormal, at the shapes the estimators actually use.
+        // 欠定系统零空间须满足 A x=0 且基正交，覆盖最小几何求解器实际使用的矩阵形状（D27）。
         double axErr = 0, nsOrth = 0;
         for (int t = 0; t < 400; t++) {
-            const int m = (t % 2) ? 7 : 8;         // 7-point F, and 4-point H / 8-point F
+            const int m = (t % 2) ? 7 : 8;         // 七点基础矩阵、四点单应性与八点基础矩阵
             const int want = 9 - m;
             const double scale = std::pow(10.0, (t % 5) - 2);
             std::vector<double> A((size_t)m * 9);

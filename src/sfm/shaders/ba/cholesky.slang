@@ -1,30 +1,18 @@
-// Dense SPD solver, written from scratch, operating fully in place on the
-// packed lower-triangular matrix u_S (row-major, row r starts at r*(r+1)/2)
-// and the RHS u_g. No extra matrix storage is allocated.
-//
-// Blocked right-looking Cholesky with block size kBs:
-//   for k in 0..nb-1:  chol_diag(k); chol_panel(k); chol_update(k)
-// then the two triangular solves run blockwise on u_g in place.
-//
-// Push constants: u0 = n (matrix dim), u1 = k (block index),
-//                 u2 = item count for the dispatch (tiles or rows),
-//                 u4 = first tile of a launch split into ranges.
-// Included at the end of ba.slang; shares its bindings and push constants.
+// 原地稠密 SPD 求解，u_S 按行压缩下三角，第 r 行从 r(r+1)/2 开始，右端 u_g，不额外分配矩阵。
+// 分块右看式 Cholesky 后执行前后代；u0=维度，u1=块索引，u2=分派项数，u4=分段首块，共用 ba.slang 绑定。
 
 static const uint kBs = 32;
 
-// Pivot from trailing diagonal x (NaN included): at least 1e-30; with u3 set, one
-// under f0 of the row's original diagonal (in u_y) becomes that diagonal, which
-// bounds the factor however indefinite rounding made it (cg.slang's coarse one).
+// 主元至少 1e-30，包含 NaN 保护；启用 u3 时，低于原对角 f0 比例的主元替换为原值，限制粗矩阵舍入造成的不定性。
 Real pivot(Real x, uint row) {
     if (u3 == 0) return sqrt(x > Real(1e-30) ? x : Real(1e-30));
     Real d = u_y[row];
     return sqrt(x > Real(f0) * d ? x : max(d, Real(1e-30)));
 }
-static const uint kPitch = 33;           // padded shared row pitch (bank-conflict-free)
-static const uint kShV = kSh2 + 32 * 33; // RHS vector slot in the shared pool
+static const uint kPitch = 33;           // 填充共享行距以避免存储体冲突
+static const uint kShV = kSh2 + 32 * 33; // 共享池中的右端向量槽
 
-// Factor diagonal block k in place. One workgroup of kBs threads.
+// 一个 kBs 线程工作组原地分解第 k 对角块。
 [shader("compute")] [numthreads(kBs, 1, 1)]
 void chol_diag(uint3 t : SV_DispatchThreadID) {
     uint r = t.x;
@@ -56,9 +44,7 @@ void chol_diag(uint3 t : SV_DispatchThreadID) {
             u_S[pidx(base + r, base + c)] = g_chol[r * kPitch + c];
 }
 
-// Triangular solve of the panel below diagonal block k:
-// L_ik = A_ik L_kk^-T. One workgroup (kBs threads = kBs rows) per row tile;
-// grid.x = number of row tiles below block k.
+// 对下方块求 L_ik=A_ik L_kk^-T，每行块一个 kBs 线程组，grid.x 为下方行块数。
 [shader("compute")] [numthreads(kBs, 1, 1)]
 void chol_panel(uint3 t : SV_DispatchThreadID, uint3 wg : SV_GroupID, uint gi : SV_GroupIndex) {
     uint n = u0;
@@ -87,12 +73,8 @@ void chol_panel(uint3 t : SV_DispatchThreadID, uint3 wg : SV_GroupID, uint gi : 
             u_S[pidx(gr, base + c)] = g_chol[kSh2 + r * kPitch + c];
 }
 
-// Trailing update: A_ij -= L_ik L_jk^T for all tile pairs k < j <= i.
-// One workgroup (kBs x kBs threads) per tile pair, 1D grid over the
-// triangular tile-pair count (u2), decoded to (i, j). The workgroup that owns
-// the next diagonal tile (ii == jj == 0) exclusively owns its elements, so it
-// additionally factors that tile in place, replacing a standalone chol_diag
-// dispatch per step (chol_diag proper only runs for k = 0).
+// 对 k<j<=i 执行 A_ij-=L_ik L_jk^T，每块对一个 kBs×kBs 工作组。
+// 拥有下一对角块的组同时原地分解它，省去后续独立 chol_diag，仅首块单独分解。
 [shader("compute")] [numthreads(kBs, kBs, 1)]
 void chol_update(uint3 wg : SV_GroupID, uint3 lt : SV_GroupThreadID) {
     uint tid = wg.x + u4;
@@ -104,8 +86,8 @@ void chol_update(uint3 wg : SV_GroupID, uint3 lt : SV_GroupThreadID) {
     while ((ii + 1) * (ii + 2) / 2 <= tid) ii++;
     while (ii * (ii + 1) / 2 > tid) ii--;
     uint jj = tid - ii * (ii + 1) / 2;
-    uint bi = (k + 1 + ii) * kBs; // row tile base
-    uint bj = (k + 1 + jj) * kBs; // col tile base
+    uint bi = (k + 1 + ii) * kBs; // 行块起点
+    uint bj = (k + 1 + jj) * kBs; // 列块起点
     uint bk = k * kBs;
 
     uint r = lt.y, c = lt.x;
@@ -129,7 +111,7 @@ void chol_update(uint3 wg : SV_GroupID, uint3 lt : SV_GroupThreadID) {
         return;
     }
 
-    // diagonal tile of step k+1: apply the update in shared and factor it
+    // 在共享内存更新并分解下一对角块
     uint m2 = min(kBs, n - bi);
     GroupMemoryBarrierWithGroupSync();
     if (live)
@@ -151,17 +133,9 @@ void chol_update(uint3 wg : SV_GroupID, uint3 lt : SV_GroupThreadID) {
         u_S[pidx(gr, gc)] = g_chol[r * kPitch + c];
 }
 
-// ------------- triangular solves, fused one dispatch per block -------------
-//
-// Forward: y = L^-1 b. Step k reads b (u_g, unmodified for block k during the
-// dispatch): every workgroup redundantly solves the 32x32 diagonal system in
-// shared memory (no cross-workgroup ordering exists inside a dispatch), then
-// workgroup 0 writes y_k to the scratch u_y while all threads update their
-// rows of u_g below the block. Backward mirrors it: x_k is solved from u_y,
-// written to u_g (not read by anyone in the backward pass), and rows of u_y
-// above the block are updated. The final solution ends in u_g as before.
-//
-// u0 = n, u1 = k, u2 = update row count (0 for the last/first block).
+// ---------------- 每块一次分派的三角求解 ----------------
+// 前代各组重复解 32×32 对角系统，组 0 写临时 y_k，各线程更新下方右端；后代从 u_y 求 x_k 写入 u_g，再更新上方 u_y，避免跨组同步依赖。
+// u0=维度，u1=块索引，u2=更新行数。
 
 static const uint kTriWg = 256;
 

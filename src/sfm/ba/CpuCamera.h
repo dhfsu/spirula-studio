@@ -1,9 +1,5 @@
-// Host mirror of the bundle-adjustment device math -- the camera models of
-// sfm/shaders/common/camera.slang and the losses of loss.slang -- written once
-// over a scalar template, so the residual evaluates in `double` and the
-// Jacobian in a dual number. Forward mode rather than the device's reverse
-// mode because the widths are small (3 + intrinsics) and it needs no generated
-// code; the derivative is the same up to rounding.
+// BA 设备数学的主机实现，通过标量模板共用相机模型与损失计算；double 求残差，对偶数求雅可比。
+// 参数宽度较小（3 + 内参数量），采用无需生成代码的前向自动微分，除舍入外与设备反向微分一致。
 #pragma once
 
 #include <cmath>
@@ -20,9 +16,7 @@ using std::log;
 using std::sin;
 using std::sqrt;
 
-// ================
-// Forward-mode dual number
-// ================
+// ================ 前向模式对偶数 ================
 
 template <int N>
 struct Jet {
@@ -122,8 +116,7 @@ template <int N> inline Jet<N> cos(const Jet<N>& x) {
     for (int i = 0; i < N; i++) r.d[i] = x.d[i] * k;
     return r;
 }
-// Matches rAtan2's custom derivative in common/real.slang, which is the exact
-// one rather than a differentiation of its Newton loop.
+// 采用 rAtan2 的精确自定义导数，而非对 Newton 迭代过程求导。
 template <int N> inline Jet<N> atan2(const Jet<N>& y, const Jet<N>& x) {
     Jet<N> r;
     r.a = std::atan2(y.a, x.a);
@@ -133,9 +126,7 @@ template <int N> inline Jet<N> atan2(const Jet<N>& y, const Jet<N>& x) {
     return r;
 }
 
-// ================
-// Camera models -- parameter order is packIntrinsics' (sfm/core/Camera.h)
-// ================
+// ================ 相机模型：参数顺序与 Camera.h 的 packIntrinsics 一致 ================
 
 struct SnavelyModel {
     static constexpr int kNumIntr = 3;
@@ -323,7 +314,7 @@ struct EquirectModel {
     }
 };
 
-// Dispatch on the kModels index in sfm/ba/Problem.h.
+// 按 Problem.h 中 kModels 的索引分派。
 template <class Fn> inline void withModel(uint32_t model, Fn&& fn) {
     switch (model) {
         case 0: fn(SnavelyModel{}); return;
@@ -340,9 +331,7 @@ template <class Fn> inline void withModel(uint32_t model, Fn&& fn) {
     throw std::runtime_error("camera model index outside the registry");
 }
 
-// ================
-// Robust losses (s is the squared residual norm)
-// ================
+// ================ 稳健损失，s 为残差范数平方 ================
 
 struct TrivialLoss {
     static double cost(double s, double) { return s; }
@@ -375,11 +364,9 @@ template <class Fn> inline void withLoss(const std::string& loss, Fn&& fn) {
     else fn(TrivialLoss{});
 }
 
-// ================
-// Residual and Jacobian
-// ================
+// ================ 残差与雅可比 ================
 
-// out = R(aa) p, matching camera.slang down to its 1e-15 guard on the norm.
+// out = R(aa) p，与 camera.slang 一致，包括范数的 1e-15 保护。
 template <class T> inline void angleAxisRotate(const T axis[3], const T p[3], T out[3]) {
     T theta = sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
     T inv = T(1.0) / (theta + T(1e-15));
@@ -413,8 +400,7 @@ inline void residual(const double pose[6], const double* intr, const double X[3]
     residualAt<M>(intr, p, obs, r);
 }
 
-// Through a rig: `pose` is the frame's rig_from_world, `ext` the member's
-// cam_from_rig (camera.slang reprojectRig).
+// rig 路径中 pose 为帧的 rig_from_world，ext 为成员的 cam_from_rig，对应 reprojectRig。
 template <class M>
 inline void residualRig(const double pose[6], const double ext[6], const double* intr,
                         const double X[3], const double obs[2], double r[2]) {
@@ -426,8 +412,7 @@ inline void residualRig(const double pose[6], const double ext[6], const double*
     residualAt<M>(intr, p, obs, r);
 }
 
-// ct I + st [a]_x + (1-ct) a a^T: what angleAxisRotate applies, and its
-// derivative in the point.
+// ct I + st [a]_x + (1-ct) a a^T，即 angleAxisRotate 的矩阵及其对点的导数。
 inline void angleAxisMatrix(const double axis[3], double R[9]) {
     const double th = std::sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
     const double inv = 1.0 / (th + 1e-15);
@@ -444,9 +429,7 @@ inline void angleAxisMatrix(const double axis[3], double R[9]) {
     R[8] = ct + w * a2 * a2;
 }
 
-// d(R(aa) p)/d aa as a 3x3 (row-major), by a dual pass over the axis alone:
-// the norm has no derivative at a zero rotation (every seed pair's first image)
-// and this keeps that 0/0 in the axis columns, where isfinite guards drop it.
+// 仅对轴角做对偶数计算，求行主序 3×3 的 d(R(aa) p)/d aa；零旋转处范数不可导，将 0/0 限制在轴角列并由有限性检查过滤。
 inline void angleAxisJacobian(const double axis[3], const double p[3], double J[9], double out[3]) {
     Jet<3> aa[3], pj[3], oj[3];
     for (int i = 0; i < 3; i++) aa[i] = Jet<3>::var(axis[i], i);
@@ -458,8 +441,7 @@ inline void angleAxisJacobian(const double axis[3], const double p[3], double J[
     }
 }
 
-// The projection's derivative in the camera-frame point and the intrinsics:
-// dp[row][k] = dr/dp_cam[k], di[row][i] = dr/dintr[i].
+// 投影对相机坐标点和内参的导数：dp[row][k] = dr/dp_cam[k]，di[row][i] = dr/dintr[i]。
 template <class M>
 inline void projectJacobian(const double* intr, const double p[3], const double obs[2],
                             double r[2], double dp[2][3], double* di) {
@@ -482,7 +464,7 @@ inline void projectJacobian(const double* intr, const double p[3], const double 
     }
 }
 
-// Jc is [row][6 pose | kNumIntr intrinsics], Jp is [row][3].
+// Jc 布局为 [row][6 位姿参数 | kNumIntr 内参]，Jp 为 [row][3]。
 template <class M>
 inline void jacobian(const double pose[6], const double* intr, const double X[3],
                      const double obs[2], double r[2], double* Jc, double* Jp) {
@@ -511,8 +493,7 @@ inline void jacobian(const double pose[6], const double* intr, const double X[3]
     }
 }
 
-// Jc is [row][6 frame | 6 extrinsic | kNumIntr intrinsics]: the frame block is
-// chained through the extrinsic rotation, the point block through both.
+// Jc 为 [row][6 帧参数 | 6 外参 | kNumIntr 内参]；帧块通过外参旋转求链式导数，点块通过两层旋转。
 template <class M>
 inline void jacobianRig(const double pose[6], const double ext[6], const double* intr,
                         const double X[3], const double obs[2], double r[2], double* Jc,
@@ -562,4 +543,4 @@ inline void jacobianRig(const double pose[6], const double ext[6], const double*
     }
 }
 
-}  // namespace bacpu
+}  // 命名空间 bacpu

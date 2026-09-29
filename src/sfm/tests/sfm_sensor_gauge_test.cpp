@@ -1,7 +1,4 @@
-// The sensor gauge on a synthetic capture: a walking trajectory with a
-// known IMU-to-lens rotation, IMU noise, biases, a GPS log, a clock offset
-// and a random model gauge, recovered to a fraction of a degree and a
-// percent. Prints FAIL lines and returns the count.
+// 合成步行传感器规范测试，含已知外参、噪声、偏置、GPS、时钟偏移与任意规范，要求亚度和百分比级恢复。
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -79,7 +76,7 @@ static RunResult runScenario(const Scenario& sc, SensorMode mode = SensorMode::A
     opt.mode = mode;
     out.r = fitSensorGauge(rec, {cap}, opt);
     const SensorGaugeResult& r = out.r;
-    // The recovered T must take model up to +Z and model units to metres.
+    // 恢复 T 必须将向上对齐 +Z，并把模型单位转换为米。
     const Vec3 up_model = mul(transpose(M.R), Vec3{0, 0, 1});
     out.up_err_deg = angleDeg(mul(r.T.R, up_model), Vec3{0, 0, 1});
     out.scale_err = r.T.scale / M.scale - 1.0;
@@ -91,7 +88,7 @@ static RunResult runScenario(const Scenario& sc, SensorMode mode = SensorMode::A
 }
 
 int cmdSensorGaugeTest(int, char**) {
-    // ---- T1: IMU + GPS, the ordinary case -----------------------------------
+    // ---------------- T1：IMU 与 GPS ----------------
     {
         Scenario sc;
         RunResult rr = runScenario(sc);
@@ -110,7 +107,7 @@ int cmdSensorGaugeTest(int, char**) {
         check(!r.groups[0].fit.mirrored, "T1 right-handed");
         check(std::fabs(r.time_offsets[0].offset) < 0.005, "T1 no spurious clock offset");
     }
-    // ---- T2: IMU only, indoor -------------------------------------------------
+    // ---------------- T2：室内仅 IMU ----------------
     {
         Scenario sc;
         sc.gps = false;
@@ -123,7 +120,7 @@ int cmdSensorGaugeTest(int, char**) {
         check(std::fabs(rr.scale_err) < 0.02, "T2 scale within 2%");
         check(std::fabs(r.groups[0].g_norm - 9.81) < 0.3, "T2 gravity norm");
     }
-    // ---- T3: stale GPS, mirrored IMU axes, a clock offset ----------------------
+    // ---------------- T3：陈旧 GPS、镜像 IMU 轴与时钟偏移 ----------------
     {
         Scenario sc;
         sc.stale_gps = true;
@@ -142,7 +139,7 @@ int cmdSensorGaugeTest(int, char**) {
         check(std::fabs(r.time_offsets[0].offset - 0.037) < 0.004, "T3 clock offset recovered");
         check(std::fabs(rr.scale_err) < 0.02, "T3 scale within 2%");
     }
-    // ---- T4: a camera that turns on the spot: up, no scale --------------------
+    // ---------------- T4：原地旋转，仅能确定向上 ----------------
     {
         Scenario sc;
         sc.motion = 0;
@@ -156,7 +153,7 @@ int cmdSensorGaugeTest(int, char**) {
         check(rr.up_err_deg < 1.0, "T4 up within 1 deg without translation");
         check(r.no_scale == SensorNoScale::ImuWeak, "T4 scale refused as weak");
     }
-    // ---- T4b: a camera that never moves at all: nothing to say --------------
+    // ---------------- T4b：完全静止，无有效运动信息 ----------------
     {
         Scenario sc;
         sc.motion = 0;
@@ -168,13 +165,13 @@ int cmdSensorGaugeTest(int, char**) {
         printGroups(rr.r);
         check(!rr.r.applied, "T4b declined");
     }
-    // ---- T5: up only mode ------------------------------------------------------
+    // ---------------- T5：仅向上模式 ----------------
     {
         Scenario sc;
         RunResult rr = runScenario(sc, SensorMode::Up);
         check(rr.r.applied && !rr.r.metric && rr.up_err_deg < 0.5, "T5 up-only mode");
     }
-    // ---- T6: GPS only (no IMU streams) ----------------------------------------
+    // ---------------- T6：仅 GPS，无 IMU ----------------
     {
         Scenario sc;
         RunResult rr;
@@ -199,13 +196,13 @@ int cmdSensorGaugeTest(int, char**) {
         check(r.applied && r.metric && r.scale_from_gps && !r.up_from_imu, "T6 metric from GPS");
         check(std::fabs(r.T.scale / M.scale - 1.0) < 0.03, "T6 scale within 3%");
     }
-    // ---- T7: a fused attitude and one accelerometer reading per frame ---------
+    // ---------------- T7：融合姿态与逐帧加速度 ----------------
     {
         Scenario sc;
         sc.gps = false;
         sc.attitude_only = true;
         sc.accel_rate = 30;
-        sc.accel_noise = 0.06;   // what the DJI's own stream measures at 30 Hz
+        sc.accel_noise = 0.06;   // 对应 DJI 30 Hz 实测噪声
         RunResult rr = runScenario(sc);
         const SensorGaugeResult& r = rr.r;
         std::printf("T7 attitude, 30 Hz accel: up=%.3f deg scale_err=%.4f sigma=%.2f%% "

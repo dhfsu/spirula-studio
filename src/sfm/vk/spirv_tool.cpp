@@ -1,44 +1,6 @@
-// Compiles the Slang shaders and embeds the SPIR-V, natively.
-//
-// A single self-contained C++17 host tool (no dependencies beyond the standard
-// library), so the Vulkan (SS_BACKEND=vulkan) build needs no Python.
-// CMake compiles this once at configure time (try_compile + COPY_FILE) and uses
-// it in two modes:
-//
-//   discover -I <dir>... <source.slang>...
-//       Scan the compute shaders and print, one blob per line to stdout:
-//           <name>\t<source>\t<entry>\t<defines>\t<dep1> <dep2> ...
-//       CMake turns each line into its own slangc custom command (one Ninja
-//       edge per blob, so the build's -j governs how many slangc run at once,
-//       and Ninja prints "[n/m] SPIR-V <name>" as each finishes). <defines> and
-//       <deps> are space-separated (deps = the source's #include closure).
-//
-//   embed <out.cpp> --list <listfile>
-//       Read the compiled .spv blobs named in <listfile>, drop the .noint64
-//       variants whose base does not actually declare the Int64 capability,
-//       verify no capability leaks, and emit the C++ translation unit
-//       consumed by sfm/vk/VkContext.h.
-//
-//   embed --nn <tag> <out.cpp> --list <listfile>
-//       The same embedding format is available for other shader libraries.
-//       The standalone SfM build uses the --sfm mode below.
-//
-//   embed --sfm <out.cpp> --list <listfile>
-//       The same, for the SfM module (cmake/SsSfm.cmake). Its blobs are
-//       whole-module compiles with no feature variants, so the variant gate and
-//       the capability audit -- both statements about the engine's kernels --
-//       are skipped, and the emitted TU is the one sfm/vk/EmbeddedSpirv.h
-//       declares.
-//
-//   nocontract <in.spv> <out.spv>
-//       Decorate every float arithmetic result with NoContraction. slangc does
-//       not emit it and some drivers then contract or rearrange float
-//       expressions, which destroys the error-free transforms the SfM bundle
-//       adjuster's emulated double-float type is built on. Used only by the
-//       SfM `df` blobs; see src/sfm/ba/README.md.
-//
-// backend/vulkan/README.md has the why behind the blob naming, the feature
-// variants and the capability audit.
+// 纯 C++17 的 SPIR-V 扫描、修饰与嵌入工具，构建无需 Python。
+// discover 输出模块名、源、入口、宏与包含依赖，供 CMake 逐模块调用 slangc；embed 生成注册翻译单元，--sfm/--nn 采用对应库格式。
+// nocontract 为浮点结果添加 NoContraction，避免驱动合并表达式破坏 DF 无误差变换；普通嵌入还筛选能力变体并审计能力泄漏。
 
 #include <algorithm>
 #include <cstdint>
@@ -53,17 +15,16 @@
 
 namespace {
 
-// ---- feature variants (canonical suffix order must match kFeatureSuffixes in
-// src/sfm/vk/VkContext.h) --------------------------------
+// ---------------- 功能变体：后缀顺序必须与运行时约定一致 ----------------
 struct Feature { const char* suffix; const char* define; };
 const Feature ATOMIC{".atomicadd", "-DSS_NATIVE_F32_ATOMIC_ADD"};
 const Feature INT8{".int8", "-DSS_NATIVE_INT8"};
 const Feature NOINT64{".noint64", "-DSS_EMULATE_INT64"};
 
-// SPIR-V capability operands (OpCapability = opcode 17).
+// SPIR-V 能力操作数，OpCapability 操作码为 17。
 constexpr uint32_t CAP_INT64 = 11;
 constexpr uint32_t CAP_INT8 = 39;
-constexpr uint32_t CAP_8BIT_STORAGE = 4437;  // StorageBuffer8BitAccess
+constexpr uint32_t CAP_8BIT_STORAGE = 4437;  // StorageBuffer8BitAccess 能力
 
 bool is_ident(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -92,16 +53,15 @@ bool file_exists(const std::string& p) {
     return static_cast<bool>(f);
 }
 
-// ---- shader source scanning ---------------------------------------------
+// ---------------- 着色器源扫描 ----------------
 
-// `[shader("compute")]` ... `void <name>(`, allowing attribute/comment lines in
-// between: take the first `void <name>(` after each compute marker.
+// 在每个 compute 着色器标记后查找首个 void 函数定义，允许中间包含属性和注释。
 bool parse_void_name(const std::string& s, size_t from, std::string* name) {
     const std::string kw = "void";
     while (true) {
         size_t v = s.find(kw, from);
         if (v == std::string::npos) return false;
-        // must be a whole word
+        // 必须匹配完整单词
         bool lok = (v == 0) || !is_ident(s[v - 1]);
         size_t p = v + kw.size();
         if (!lok || p >= s.size() || is_ident(s[p])) { from = v + 1; continue; }
@@ -109,7 +69,7 @@ bool parse_void_name(const std::string& s, size_t from, std::string* name) {
                                 s[p] == '\r')) p++;
         size_t ns = p;
         while (p < s.size() && is_ident(s[p])) p++;
-        if (p == ns) { from = v + 1; continue; }  // no identifier
+        if (p == ns) { from = v + 1; continue; }  // 没有标识符
         std::string id = s.substr(ns, p - ns);
         while (p < s.size() && (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' ||
                                 s[p] == '\r')) p++;
@@ -118,16 +78,14 @@ bool parse_void_name(const std::string& s, size_t from, std::string* name) {
     }
 }
 
-// Discover entry points: `[shader("compute")]`-marked functions and line-initial
-// `DEF_<macro>(<entry>, ...)` instantiations (the literal macro parameter NAME
-// is skipped).
+// 发现 compute 标记函数及行首 DEF_<macro>(<entry>,...) 实例，忽略宏定义中的占位参数 NAME。
 std::vector<std::string> find_entries(const std::string& src) {
     std::vector<std::string> out;
     std::set<std::string> seen;
     auto add = [&](const std::string& n) {
         if (n != "NAME" && seen.insert(n).second) out.push_back(n);
     };
-    // [shader("compute")] ... void NAME(
+    // compute 标记后的 void NAME 形式
     const std::string marker = "[shader(\"compute\")]";
     size_t pos = 0;
     std::vector<std::string> shader_names;
@@ -136,16 +94,16 @@ std::vector<std::string> find_entries(const std::string& src) {
         std::string n;
         if (parse_void_name(src, pos, &n)) shader_names.push_back(n);
     }
-    // line-initial DEF_...(entry, ...)
+    // 行首 DEF_...(entry,...) 形式
     std::vector<std::string> macro_names;
     size_t line_start = 0;
     while (line_start <= src.size()) {
         size_t nl = src.find('\n', line_start);
         size_t end = (nl == std::string::npos) ? src.size() : nl;
-        // line begins with "DEF_"
+        // 行以 DEF_ 开头
         if (end - line_start > 4 && src.compare(line_start, 4, "DEF_") == 0) {
             size_t p = line_start + 4;
-            while (p < end && is_ident(src[p])) p++;  // rest of macro name
+            while (p < end && is_ident(src[p])) p++;  // 宏名称的其余部分
             if (p < end && src[p] == '(') {
                 p++;
                 while (p < end && (src[p] == ' ' || src[p] == '\t')) p++;
@@ -162,7 +120,7 @@ std::vector<std::string> find_entries(const std::string& src) {
     return out;
 }
 
-// Extract `#include "..."` targets (leading whitespace allowed).
+// 提取双引号 include 目标，允许前导空白。
 std::vector<std::string> parse_includes(const std::string& src) {
     std::vector<std::string> out;
     size_t line_start = 0;
@@ -199,8 +157,7 @@ std::string resolve_include(const std::string& inc, const std::string& from_dir,
     return {};
 }
 
-// Transitive #include closure (the source itself first), resolved against the
-// including file's directory and the include dirs.
+// 按当前文件目录与包含目录解析传递包含闭包，源文件本身在首位。
 void include_closure(const std::string& path,
                      const std::vector<std::string>& incdirs,
                      std::vector<std::string>& seen) {
@@ -215,8 +172,7 @@ void include_closure(const std::string& path,
     }
 }
 
-// True when a whole-word `token` immediately followed by `(` (whitespace
-// permitted) occurs in `text`.
+// 检查完整 token 后是否紧接左括号，允许空白。
 bool calls_token(const std::string& text, const std::string& token) {
     size_t pos = 0;
     while ((pos = text.find(token, pos)) != std::string::npos) {
@@ -230,8 +186,7 @@ bool calls_token(const std::string& text, const std::string& token) {
     return false;
 }
 
-// Does the source's include closure call any of `tokens` from `header` (the
-// header's own definitions do not count)?
+// 检查源文件包含闭包是否调用 header 提供的任一 token，头文件自身定义不计。
 bool closure_calls(const std::vector<std::string>& closure,
                    const std::string& header_base,
                    const std::vector<std::string>& tokens) {
@@ -255,14 +210,14 @@ bool closure_has(const std::vector<std::string>& closure,
     return false;
 }
 
-// All subsets of `feats` in canonical order, empty subset first.
+// 按规范顺序枚举全部特性子集，空集优先。
 std::vector<std::pair<std::string, std::vector<std::string>>>
 variant_subsets(const std::vector<Feature>& feats) {
     std::vector<std::pair<std::string, std::vector<std::string>>> out;
     size_t n = feats.size();
-    // Ordered by subset size then canonical index order.
+    // 先按子集大小，再按规范索引顺序。
     for (size_t r = 0; r <= n; r++) {
-        // iterate combinations of size r preserving index order
+        // 保持索引顺序枚举大小为 r 的组合
         std::vector<size_t> idx(r);
         for (size_t i = 0; i < r; i++) idx[i] = i;
         if (r == 0) { out.push_back({"", {}}); continue; }
@@ -274,7 +229,7 @@ variant_subsets(const std::vector<Feature>& feats) {
                 defs.push_back(feats[idx[i]].define);
             }
             out.push_back({suffix, defs});
-            // next combination
+            // 下一个组合
             long i = (long)r - 1;
             while (i >= 0 && idx[i] == n - r + (size_t)i) i--;
             if (i < 0) break;
@@ -285,7 +240,7 @@ variant_subsets(const std::vector<Feature>& feats) {
     return out;
 }
 
-// ---- SPIR-V capability inspection ---------------------------------------
+// ---------------- SPIR-V 能力检查 ----------------
 std::set<uint32_t> spirv_capabilities(const std::string& bytes) {
     std::set<uint32_t> caps;
     if (bytes.size() < 24) return caps;
@@ -302,17 +257,17 @@ std::set<uint32_t> spirv_capabilities(const std::string& bytes) {
         uint32_t opcode = word & 0xffff, count = word >> 16;
         if (count == 0) break;
         if (opcode == 17 && i + 8 <= bytes.size()) {
-            caps.insert(w(i + 4));  // OpCapability
+            caps.insert(w(i + 4));  // OpCapability 指令
         } else if (opcode != 17) {
-            break;  // capabilities lead the module
+            break;  // 能力声明位于模块开头
         }
         i += (size_t)count * 4;
     }
     return caps;
 }
 
-// ---- nocontract mode -----------------------------------------------------
-// SPIR-V opcodes and enums used only here (see the SPIR-V specification).
+// ---------------- NoContraction 模式 ----------------
+// 以下为此模式使用的 SPIR-V 操作码与枚举。
 enum : uint32_t {
     OpExtInstImport = 11,
     OpExtInst = 12,
@@ -341,8 +296,7 @@ bool is_annotation(uint32_t op) {
            op == OpDecorateString || op == OpMemberDecorateString;
 }
 
-// Types, constants and global variables: everything the annotations section
-// must precede. Only used as a fallback when a module has no annotations.
+// 注解必须位于类型、常量和全局变量之前；无现有注解时以此确定插入位置。
 bool is_type_decl(uint32_t op) { return op >= OpTypeVoid && op <= OpTypeForwardPointer; }
 
 int run_nocontract(const std::string& in, const std::string& out) {
@@ -356,19 +310,17 @@ int run_nocontract(const std::string& in, const std::string& out) {
     std::vector<uint32_t> w(bytes.size() / 4);
     std::memcpy(w.data(), bytes.data(), bytes.size());
     if (w.size() < 5 || w[0] != 0x07230203u) {
-        // A byte-swapped module would need swapping on read and write; slangc
-        // emits host order, so treat this as a corrupt input instead.
+        // slangc 输出主机字节序，交换字节序的模块视为损坏输入。
         std::fprintf(stderr, "nocontract: %s is not a host-order SPIR-V module\n",
                      in.c_str());
         return 1;
     }
 
-    // GLSL.std.450 import id, so OpExtInst Fma can be recognized. Modules
-    // importing several sets are handled: only this one's Fma is matched.
+    // 记录 GLSL.std.450 导入 ID，仅识别该指令集的 Fma，兼容同时导入多个扩展集。
     uint32_t glsl_set = 0;
     std::vector<uint32_t> targets;
-    size_t annot_end = 0;    // one past the last annotation instruction
-    size_t types_begin = 0;  // first type declaration
+    size_t annot_end = 0;    // 最后一条注解后的指令位置
+    size_t types_begin = 0;  // 首个类型声明位置
     bool have_types_begin = false;
 
     for (size_t i = 5; i < w.size();) {
@@ -381,7 +333,7 @@ int run_nocontract(const std::string& in, const std::string& out) {
             if (std::strcmp((const char*)&w[i + 2], "GLSL.std.450") == 0) glsl_set = w[i + 1];
         } else if (op == OpFAdd || op == OpFSub || op == OpFMul || op == OpFDiv ||
                    op == OpFNegate) {
-            targets.push_back(w[i + 2]);  // 1 = result type, 2 = result id
+            targets.push_back(w[i + 2]);  // 操作数 1 为结果类型，2 为结果 ID
         } else if (op == OpExtInst && len >= 5 && w[i + 3] == glsl_set &&
                    w[i + 4] == kGlslStd450Fma) {
             targets.push_back(w[i + 2]);
@@ -419,20 +371,19 @@ int run_nocontract(const std::string& in, const std::string& out) {
     return 0;
 }
 
-// ---- discover mode -------------------------------------------------------
+// ---------------- 入口发现模式 ----------------
 int run_discover(const std::vector<std::string>& args) {
     std::vector<std::string> incdirs, sources;
     for (size_t i = 0; i < args.size(); i++) {
         if (args[i] == "-I" && i + 1 < args.size())
-            incdirs.push_back(args[++i]);            // "-I" "dir"
+            incdirs.push_back(args[++i]);            // -I 与目录分开传入
         else if (args[i].rfind("-I", 0) == 0)
-            incdirs.push_back(args[i].substr(2));    // "-Idir"
+            incdirs.push_back(args[i].substr(2));    // -I 与目录连写
         else
             sources.push_back(args[i]);
     }
 
-    // Files pulled in as headers by some source; an entry-less source is only
-    // worth a warning when nothing includes it.
+    // 无入口文件若被其他源包含则正常，仅完全无人包含时警告。
     std::set<std::string> included;
     std::map<std::string, std::vector<std::string>> closures;
     for (auto& s : sources) {
@@ -459,9 +410,7 @@ int run_discover(const std::vector<std::string>& args) {
         if (closure_calls(closure, "int8_compat.slang",
                           {"u8_load", "s8_load", "u8_store"}))
             feats.push_back(INT8);
-        // noint64 candidate: the source can route 64-bit integers through
-        // int64_compat.slang. An over-approximation; the embed step drops
-        // variants whose base turns out to have no Int64.
+        // 保守生成可能经兼容层处理 int64 的 noint64 候选；嵌入时若基础模块无 Int64 能力则删除冗余变体。
         bool noint64_cand = closure_has(closure, "int64_compat.slang");
 
         std::string deps;
@@ -471,7 +420,7 @@ int run_discover(const std::vector<std::string>& args) {
         auto emit = [&](const std::string& entry, const std::string& suffix,
                         const std::vector<std::string>& defs) {
             std::string name = stem + "." + entry + suffix;
-            std::string defstr;  // "-" placeholder keeps the field non-empty
+            std::string defstr;  // 用短横线占位，保持字段非空
             for (size_t i = 0; i < defs.size(); i++)
                 defstr += (i ? " " : "") + defs[i];
             if (defstr.empty()) defstr = "-";
@@ -495,7 +444,7 @@ int run_discover(const std::vector<std::string>& args) {
     return 0;
 }
 
-// ---- embed mode ----------------------------------------------------------
+// ---------------- 模块嵌入模式 ----------------
 std::string strip_feature_suffixes(std::string name) {
     const char* sfx[] = {NOINT64.suffix, INT8.suffix, ATOMIC.suffix};
     bool changed = true;
@@ -527,8 +476,7 @@ int run_embed(const std::vector<std::string>& args) {
         std::fprintf(stderr, "embed: usage: embed <out.cpp> --list <file>\n");
         return 2;
     }
-    // The two module-registry flavours skip the engine's variant gate and
-    // capability audit -- both are statements about the engine's kernels.
+    // SfM 与 NN 注册格式不参与训练引擎的变体门限和能力审计。
     const bool plain = sfm || nn;
 
     std::vector<std::string> paths;
@@ -541,7 +489,7 @@ int run_embed(const std::vector<std::string>& args) {
         }
     }
 
-    // name -> bytes, name -> capabilities
+    // 名称到字节数据及能力集合的映射
     std::map<std::string, std::string> blob_bytes;
     std::map<std::string, std::set<uint32_t>> blob_caps;
     for (auto& p : paths) {
@@ -558,9 +506,7 @@ int run_embed(const std::vector<std::string>& args) {
         blob_caps[name] = spirv_capabilities(data);
     }
 
-    // Keep every base/feature blob; keep a .noint64 variant only when its base
-    // actually declares Int64. The SfM blobs have no feature variants, so the
-    // gate has nothing to say about them.
+    // 保留基础和功能模块，仅基础声明 Int64 时保留 noint64 变体；SfM 无此类功能变体。
     std::vector<std::string> kept;
     for (auto& [name, bytes] : blob_bytes) {
         (void)bytes;
@@ -572,19 +518,17 @@ int run_embed(const std::vector<std::string>& args) {
             std::string base = strip_feature_suffixes(name);
             auto it = blob_caps.find(base);
             if (it == blob_caps.end() || !it->second.count(CAP_INT64))
-                continue;  // base has no Int64 -> no dedicated variant needed
+                continue;  // 基础模块没有 Int64，无需独立回退变体
         }
         kept.push_back(name);
     }
-    // Sort by the ".spv" filename (not the bare name) so the emitted order is
-    // stable and independent of which variant suffixes exist.
+    // 按完整 .spv 文件名排序，使输出顺序不受变体后缀集合影响。
     std::sort(kept.begin(), kept.end(),
               [](const std::string& a, const std::string& b) {
                   return a + ".spv" < b + ".spv";
               });
 
-    // Capability audit. It checks the engine's variant invariants, which the
-    // SfM blobs do not participate in.
+    // 检查引擎变体的能力不变量，SfM 模块不参与。
     bool failed = false;
     for (auto& name : plain ? std::vector<std::string>{} : kept) {
         const auto& caps = blob_caps[name];
@@ -607,7 +551,7 @@ int run_embed(const std::vector<std::string>& args) {
     }
     if (failed) return 1;
 
-    // Emit the translation unit.
+    // 生成嵌入翻译单元。
     std::ostringstream o;
     o << "// GENERATED by shaders/spirv_tool.cpp -- DO NOT EDIT.\n"
          "#include <cstddef>\n#include <cstdint>\n";
@@ -662,9 +606,7 @@ int run_embed(const std::vector<std::string>& args) {
              "}\n\n"
              "}  // namespace sfm\n";
     } else if (nn) {
-        // One table per library; the library registers it itself, so the names
-        // have external linkage and the tag keeps two generated TUs in the
-        // same binary apart. See nn/vk/EmbeddedSpirv.h.
+        // 每库独立表并显式注册，名称使用外部链接，tag 区分同二进制中的多个生成翻译单元。
         o << "\nextern const EmbeddedModule kEmbeddedModules_" << nn_tag << "[];\n"
              "const EmbeddedModule kEmbeddedModules_" << nn_tag << "[] = {\n";
         for (size_t i = 0; i < kept.size(); i++)
@@ -690,8 +632,7 @@ int run_embed(const std::vector<std::string>& args) {
              "}  // namespace vk\n}  // namespace backend\n";
     }
 
-    // Always (re)write: the embed edge only runs when a .spv changed, so the
-    // fresh mtime is what keeps Ninja's output-newer-than-inputs check happy.
+    // 嵌入步骤仅在 SPIR-V 改变时运行，始终重写更新时间，使 Ninja 的输出时间检查通过。
     std::string text = o.str();
     std::ofstream f(out_cpp, std::ios::binary | std::ios::trunc);
     if (!f) {
@@ -702,7 +643,7 @@ int run_embed(const std::vector<std::string>& args) {
     return 0;
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 int main(int argc, char** argv) {
     if (argc < 2) {

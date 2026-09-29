@@ -1,7 +1,4 @@
-// Pairs the GPS proposes: two images taken within a radius of each other are
-// matched whatever they look like, which is loop closure on an outdoor walk
-// without a shortlist having to find it. Only images a source positions
-// take part; the rest of the pair list is untouched.
+// GPS 为半径内拍摄的图像补充匹配，提供户外闭环候选；仅处理有位置的图像，保留原配对列表。
 #pragma once
 
 #include <algorithm>
@@ -13,9 +10,7 @@
 
 namespace sfm {
 
-// Each positioned image's `max_per_image` nearest others within `radius`
-// metres, as unordered (i < j) pairs, sorted and unique. `positioned` gets
-// how many images had a position.
+// 每张有位置图像选择 radius 米内最近的 max_per_image 张，输出排序去重的 i<j 图像对；positioned 返回有位置图像数。
 inline std::vector<std::pair<uint32_t, uint32_t>> gpsProximityPairs(const PriorSource& src,
                                                                     uint32_t num_images,
                                                                     double radius,
@@ -54,4 +49,4 @@ inline std::vector<std::pair<uint32_t, uint32_t>> gpsProximityPairs(const PriorS
     return out;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

@@ -1,15 +1,6 @@
-# The Structure-from-Motion module (src/sfm/), a Vulkan-only
-# subsystem that replaces the COLMAP subprocess. See src/sfm/README.md.
-#
-# Defines:
-#   ss_sfm          static library (SfM pipeline + embedded SPIR-V)
-#   sfm_*_test      one executable per src/sfm/tests/*.cpp
-#
-# The `spirula-sfm` CLI is defined by the standalone app module.
-#
-# This module needs Vulkan and slangc but NOT the compute backend: it carries
-# its own Vulkan context (src/sfm/vk/) and its own SPIR-V blobs, so it builds
-# as a standalone Vulkan module.
+# SfM 模块，独立使用 Vulkan 上下文与嵌入式 SPIR-V；参见 src/sfm/README.md。
+# 定义静态库 ss_sfm，并为 src/sfm/tests/*.cpp 分别生成 sfm_*_test。
+# spirula-sfm CLI 由应用模块定义；本模块依赖 Vulkan 和 slangc，不依赖训练计算后端。
 
 include(SsVulkan)
 ss_vulkan_lib()
@@ -18,11 +9,8 @@ find_package(Threads REQUIRED)
 set(SS_SFM_SRC ${SS_SRC}/sfm)
 set(SS_SFM_SHADERS ${SS_SFM_SRC}/shaders)
 
-# ---------------------------------------------------------------------------
-# Shader variant matrix
-# ---------------------------------------------------------------------------
-# One BA blob per cached (Real, Loss) pair (src/sfm/README.md). slangc aborts
-# on every ba_df_* variant under Windows (docs/build.md), so no df default there.
+# ---------------- 着色器变体矩阵 ----------------
+# 每个缓存的 (Real, Loss) 组合生成一个 BA 模块；Windows 上 slangc 编译 ba_df_* 会中止，因此默认禁用 df。
 if(WIN32)
     set(_sfm_reals_default "float;double")
 else()
@@ -40,8 +28,7 @@ ss_build_spirv_tool(SS_SFM_SPIRV_TOOL)
 set(_sfm_spirv_dir ${CMAKE_CURRENT_BINARY_DIR}/sfm_spirv)
 set(_sfm_embed_cpp ${CMAKE_CURRENT_BINARY_DIR}/sfm_shaders_embedded.cpp)
 
-# -I<shaders> lets a shader reach the shared device math by its shaders-relative
-# path (`#include "common/camera.slang"`), matching the C++ convention.
+# -I<shaders> 允许按相对着色器目录的路径包含共享数学代码，如 common/camera.slang，与 C++ 约定一致。
 set(_sfm_slang_args -target spirv -O2 -fvk-use-entrypoint-name
     -I${SS_SFM_SHADERS})
 
@@ -75,9 +62,7 @@ foreach(real ${SS_SFM_REALS})
         set(_name ba_${real}_${loss})
         set(_out ${_sfm_spirv_dir}/${_name}.spv)
         if(real STREQUAL "df")
-            # Compile to .raw.spv, then decorate. slangc emits no NoContraction
-            # and some drivers then contract float expressions, destroying the
-            # error-free transforms the emulated double-float type is built on.
+            # 先生成 .raw.spv 再添加修饰；slangc 不输出 NoContraction，部分驱动会合并浮点表达式，破坏双浮点模拟所需的无误差变换。
             set(_raw ${_sfm_spirv_dir}/${_name}.raw.spv)
             add_custom_command(OUTPUT ${_out}
                 COMMAND ${SS_SFM_SLANGC} ${SS_SFM_SHADERS}/ba/ba.slang
@@ -98,9 +83,8 @@ foreach(real ${SS_SFM_REALS})
     endforeach()
 endforeach()
 
-# Single-blob stages: blob name, source, the directory the dependency glob
-# watches, comma-separated defines. The matcher is built four times: with and
-# without the integer dot product, at 128- and 256-byte descriptors.
+# 单模块阶段依次指定模块名、源文件、依赖扫描目录和逗号分隔的宏。
+# 匹配器为 128/256 字节描述子分别编译启用、禁用整数点积的版本，共四种。
 foreach(stage sift:sift/sift.slang:sift:none
               match:match/bruteforce.slang:match:none
               match_nodot:match/bruteforce.slang:match:-DNO_DOT4
@@ -132,7 +116,7 @@ list(LENGTH _sfm_blobs _sfm_nblobs)
 message(STATUS "SfM SPIR-V: ${_sfm_nblobs} blobs "
     "(reals: ${SS_SFM_REALS}; losses: ${SS_SFM_LOSSES})")
 
-# List file for the embed step (keeps the command line short).
+# 通过清单传递嵌入输入，避免命令行过长。
 set(_sfm_listfile ${_sfm_spirv_dir}/blobs.txt)
 string(REPLACE ";" "\n" _sfm_listbody "${_sfm_blobs}")
 ss_write_if_different(${_sfm_listfile} "${_sfm_listbody}\n")
@@ -144,9 +128,7 @@ add_custom_command(OUTPUT ${_sfm_embed_cpp}
     COMMENT "Embedding SfM SPIR-V (${_sfm_nblobs} blobs)"
     VERBATIM)
 
-# ---------------------------------------------------------------------------
-# Library
-# ---------------------------------------------------------------------------
+# ---------------- 库 ----------------
 file(GLOB_RECURSE SS_SFM_SOURCES CONFIGURE_DEPENDS ${SS_SFM_SRC}/*.cpp)
 list(FILTER SS_SFM_SOURCES EXCLUDE REGEX "/tests/")
 list(FILTER SS_SFM_SOURCES EXCLUDE REGEX "/vk/spirv_tool\.cpp$")
@@ -154,7 +136,7 @@ list(FILTER SS_SFM_SOURCES EXCLUDE REGEX "/vk/spirv_tool\.cpp$")
 add_library(ss_sfm STATIC
     ${SS_SFM_SOURCES}
     ${_sfm_embed_cpp}
-    # Image and compression implementations are part of this standalone library.
+    # 图像与压缩实现包含在独立库中。
     ${SS_SRC}/external/stb_image_impl.cpp
     ${SS_SRC}/external/stb_image_write_impl.cpp
     ${SS_SRC}/core/ExrImage.cpp
@@ -164,21 +146,18 @@ add_library(ss_sfm STATIC
 target_include_directories(ss_sfm PUBLIC ${SS_SRC})
 target_link_libraries(ss_sfm PUBLIC ss_vulkan Threads::Threads ss_i18n)
 
-# The learned frontends are disabled in this standalone build; their option
-# names remain parseable and report a clear runtime error.
+# 此独立构建禁用学习前端；仍接受其选项名，并在运行时明确报错。
 target_compile_definitions(ss_sfm PUBLIC SS_HAVE_ALIKED=0 SS_HAVE_LOMA=0)
 target_compile_options(ss_sfm PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>
     $<$<COMPILE_LANGUAGE:C>:${SPLAT_C_FLAGS}>)
 set_property(TARGET ss_sfm PROPERTY CXX_STANDARD 17)
 
-# Most of the pipeline is header-only; list headers so IDEs and Ninja see them.
+# 流水线大多仅含头文件；显式列出头文件供 IDE 与 Ninja 识别。
 file(GLOB_RECURSE SS_SFM_HEADERS CONFIGURE_DEPENDS ${SS_SFM_SRC}/*.h)
 target_sources(ss_sfm PRIVATE ${SS_SFM_HEADERS})
 
-# ---------------------------------------------------------------------------
-# Tests -- one executable per file.
-# ---------------------------------------------------------------------------
+# ---------------- 测试：每个文件一个可执行程序 ----------------
 file(GLOB SS_SFM_TESTS CONFIGURE_DEPENDS ${SS_SFM_SRC}/tests/*.cpp)
 foreach(test_src ${SS_SFM_TESTS})
     get_filename_component(test_name ${test_src} NAME_WE)

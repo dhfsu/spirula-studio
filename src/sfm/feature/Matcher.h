@@ -1,12 +1,5 @@
-// Feature matching: a pluggable IFeatureMatcher interface and a GPU
-// brute-force implementation (src/sfm/README.md).
-//
-// The interface is intentionally the whole contract a matcher must satisfy:
-// given two FeatureSets, return the surviving putative correspondences
-// (ratio-tested and, optionally, cross-checked). Nothing here assumes 128-D
-// uint8 above the shader boundary, so a learned matcher (e.g. LightGlue,
-// phase 6) can implement the same interface. Pair selection lives separately in
-// sfm/feature/Pairing.h.
+// 可替换特征匹配接口与 GPU 暴力实现；输入两组特征，输出筛选后的候选对应，不在接口层限定描述子类型或维度。
+// 图像配对策略独立定义，可与任一匹配器组合。
 #pragma once
 
 #include <algorithm>
@@ -30,37 +23,27 @@
 namespace sfm {
 
 struct MatchOptions {
-    float max_ratio = 0.8f;     // Lowe ratio (best_dist < ratio * second_dist)
-    // Absolute cosine similarity a match must reach, for L2-normalized float
-    // descriptors only; 0 disables it. COLMAP's ALIKED defaults are
-    // min_cossim = 0.85 with max_ratio = 1.0 -- i.e. the ratio test off and
-    // this the only filter -- which is a different shape of test from SIFT's
-    // and needs both knobs to exist to be expressible.
+    float max_ratio = 0.8f;     // Lowe 比值：best_dist < ratio*second_dist
+    // 单位浮点描述子还可设绝对余弦阈值，0 禁用；独立保留两选项，以表达仅用余弦筛选等策略。
     float min_similarity = 0.0f;
-    bool cross_check = true;    // keep only mutual nearest neighbours
-    uint32_t max_num_matches = 32768;  // cap per pair (0 = unlimited)
+    bool cross_check = true;    // 仅保留互为最近邻的对应
+    uint32_t max_num_matches = 32768;  // 每图像对匹配上限，0 不限制
     int device = -1;
-    // Canonical uuid:<hex>; wins over the ordinal, "" = shared precedence.
+    // 规范 uuid:<hex> 优先于序号，空值沿用共享选择规则。
     std::string device_selector;
-    // Pairs per GPU submission. One command buffer holds every dispatch in a
-    // batch, so the fence round trip is paid once per batch instead of per
-    // pair; the batch's results are downloaded in one copy (D22).
+    // 每 GPU 提交的图像对数；一批共用命令缓冲与结果回读，将栅栏往返开销摊到整批（D22）。
     int batch_pairs = 64;
-    // VRAM for resident descriptors. 8192 features/image is ~1 MB, so the
-    // default holds ~1500 images; past that the block is recycled and images
-    // are re-uploaded per batch, which is still far better than per pair.
+    // 常驻描述子显存预算；每图 8192 特征约 1 MB，默认约容纳 1500 图，超出后整块回收并按批重新上传。
     size_t descriptor_budget_bytes = 1536ull << 20;
 };
 
 struct IFeatureMatcher {
     virtual ~IFeatureMatcher() = default;
-    // Putative matches between a and b (indices into a/b keypoints).
+    // 候选匹配索引分别指向 a/b 的关键点。
     virtual std::vector<FeatureMatch> match(const FeatureSet& a, const FeatureSet& b) = 0;
     virtual const char* name() const = 0;
 
-    // Match pairs[begin..end) in one go, appending one entry per pair to `out`
-    // in pair order. GPU matchers override this to amortize uploads and
-    // submissions over the batch; the default just loops.
+    // 批量匹配 pairs[begin..end)，按图像对顺序追加结果；GPU 实现可合并上传与提交，默认逐对调用。
     virtual void matchBatch(const std::vector<FeatureSet>& feats,
                             const std::vector<std::pair<uint32_t, uint32_t>>& pairs, size_t begin,
                             size_t end, std::vector<std::vector<FeatureMatch>>& out) {
@@ -70,24 +53,15 @@ struct IFeatureMatcher {
     }
 };
 
-// GPU brute-force matcher.
-//
-// Descriptors for many images stay resident in one device buffer and a whole
-// batch of pairs is dispatched from a single command buffer, so an exhaustive
-// pass uploads each image roughly once rather than once per pair it appears in
-// (at 100 images that is 100 MB instead of 9.9 GB). Distances use the hardware
-// packed uint8x4 dot product; see the shader for why that is exact.
+// GPU 暴力匹配器将多图描述子常驻设备，一批图像对共用命令缓冲。
+// 100 图穷举的上传量约 100 MB，而逐对上传为 9.9 GB；距离使用精确的打包 uint8x4 点积。
 class BruteForceMatcher : public IFeatureMatcher {
 public:
     explicit BruteForceMatcher(const MatchOptions& opt = {}) : opt_(opt) {
-        // DP4A where the device has the instruction, the unpacked equivalent
-        // where it lacks it (Intel Gen11/Gen12) or only emulates it (Apple).
-        // Same integer result either way -- see bruteforce.slang.
+        // 硬件支持时使用 DP4A，否则采用整数等价展开；Intel Gen11/12 缺失、Apple 可能仅模拟。
         dot4_ = VkContext::probeCaps(deviceOnlyOpt(opt.device, opt.device_selector))
                     .intDotProductFast;
-        // SS_SFM_NO_DOT4=1 forces the fallback on a device that has DP4A,
-        // which is how "same integer result" gets checked without the hardware
-        // that lacks it.
+        // SS_SFM_NO_DOT4=1 可在支持设备上强制回退，验证整数结果一致。
         if (spirula::env_on("SFM_NO_DOT4")) dot4_ = false;
         VkContextOptions vo;
         vo.selector = opt.device_selector;
@@ -98,9 +72,9 @@ public:
 
     const char* name() const override { return "brute-force"; }
 
-    // Convenience path (selftests, one-off pairs): a two-image session.
+    // 供自测和单次图像对使用的双图会话。
     std::vector<FeatureMatch> match(const FeatureSet& a, const FeatureSet& b) override {
-        std::vector<FeatureSet> two;  // copies; this path is not the hot one
+        std::vector<FeatureSet> two;  // 此非热点路径允许复制
         two.push_back(a);
         two.push_back(b);
         std::vector<std::pair<uint32_t, uint32_t>> one{{0u, 1u}};
@@ -115,11 +89,7 @@ public:
         matchBatch(asView(feats), pairs, begin, end, out);
     }
 
-    // Pointer view of the feature sets, so a caller whose "images" are drawn
-    // from more than one array (pair selection: query subsets plus the full
-    // sets they were taken from) does not have to concatenate -- and copy --
-    // them into one vector. On a 1200-image capture that copy was a gigabyte
-    // of descriptors duplicated for the duration of the stage.
+    // 以指针视图引用来自不同数组的特征，避免拼接查询子集与完整特征时复制描述子；1200 图数据曾因此额外占用约 1 GB。
     void matchBatch(const std::vector<const FeatureSet*>& feats,
                     const std::vector<std::pair<uint32_t, uint32_t>>& pairs, size_t begin,
                     size_t end, std::vector<std::vector<FeatureMatch>>& out) {
@@ -132,10 +102,7 @@ public:
         }
     }
 
-    // How many matches each pair *would* produce, without building the lists.
-    // Pair selection scores half a million pairs and reads nothing but the
-    // count; materializing a std::vector<FeatureMatch> per pair to then call
-    // .size() on it was the host half of that stage's cost.
+    // 仅统计匹配数而不构造列表，供数十万候选对评分，避免为取 size 创建并丢弃大量向量。
     void countBatch(const std::vector<const FeatureSet*>& feats,
                     const std::vector<std::pair<uint32_t, uint32_t>>& pairs, size_t begin,
                     size_t end, std::vector<uint32_t>& out) {
@@ -149,15 +116,14 @@ public:
     }
 
 private:
-    // Wrap a contiguous array as the pointer view the core path takes. Rebuilt
-    // per call: O(n) pointer writes against a batch of GPU dispatches.
+    // 每次将连续数组包装为指针视图，O(n) 指针写入相对 GPU 批量开销很小。
     const std::vector<const FeatureSet*>& asView(const std::vector<FeatureSet>& feats) {
         view_.resize(feats.size());
         for (size_t i = 0; i < feats.size(); i++) view_[i] = &feats[i];
         return view_;
     }
 
-    // Shared entry checks + one-time sizing. False means "nothing to do".
+    // 共享输入检查与首次定尺寸，false 表示无需处理。
     bool prepare(const std::vector<const FeatureSet*>& feats,
                  const std::vector<std::pair<uint32_t, uint32_t>>& pairs, size_t begin,
                  size_t end) {
@@ -170,9 +136,7 @@ private:
         return true;
     }
 
-    // Grow a chunk by result bytes, not pair count (a scoring pair returns ~32x
-    // less than a full one), and by time: 64 cross-checked 8192^2 pairs are 2.0 s
-    // on a 2-CU RADV iGPU, which is its watchdog. Always at least one pair.
+    // 按结果字节数与耗时分块；双计算单元 RADV 集显执行 64 对 8192² 交叉匹配约 2 s，已达看门狗限制，每块至少一对。
     size_t chunkEnd(const std::vector<const FeatureSet*>& feats,
                     const std::vector<std::pair<uint32_t, uint32_t>>& pairs, size_t b,
                     size_t end) {
@@ -206,23 +170,19 @@ private:
         return e;
     }
 
-    // Descriptor words the shader multiplies for one pair: what the GPU time
-    // of a chunk is proportional to, in SubmitBudget's units.
+    // 按单对需计算的描述子字数估计 GPU 工作量，作为 SubmitBudget 单位。
     double pairWork(uint32_t na, uint32_t nb) const {
         return (double)na * nb * desc_words_;
     }
 
-    // Exactly one of `out` / `counts` is non-null.
+    // out 与 counts 必须恰有一个非空。
     void matchChunk(const std::vector<const FeatureSet*>& feats,
                     const std::vector<std::pair<uint32_t, uint32_t>>& pairs, size_t begin,
                     size_t end, std::vector<std::vector<FeatureMatch>>* out,
                     std::vector<uint32_t>* counts, size_t outBase) {
         ensureResident(feats, pairs, begin, end);
 
-        // Lay out this batch's results: each dispatch writes nQuery uint4s, and
-        // the whole region comes back in one download. The column side (rB) is
-        // only ever read by the cross-check, so without it neither the
-        // reduce_cols dispatch nor its result slots are paid for.
+        // 各分派写 nQuery 个 uint4，整批一次回读；无交叉检查时无需列归约或训练侧结果槽位。
         const bool cc = opt_.cross_check;
         struct Slot { uint32_t a, b, na, nb; uint32_t oa, ob; };
         std::vector<Slot> slots;
@@ -233,13 +193,13 @@ private:
             uint32_t ia = pairs[k].first, ib = pairs[k].second;
             uint32_t na = feats[ia]->count(), nb = feats[ib]->count();
             Slot s{ia, ib, na, nb, (uint32_t)outCount, (uint32_t)(outCount + na)};
-            if (na == 0 || nb == 0) s.na = s.nb = 0;  // nothing to dispatch
+            if (na == 0 || nb == 0) s.na = s.nb = 0;  // 没有待分派任务
             else outCount += (uint64_t)na + (cc ? nb : 0);
             work += pairWork(s.na, s.nb);
             slots.push_back(s);
         }
         if (outCount == 0) return;
-        if (outCount > resultCap_)  // chunking bounds this; a bug if it ever trips
+        if (outCount > resultCap_)  // 分块应保证此界限，触发则是内部错误
             throw std::runtime_error("match result buffer too small for a chunk");
 
         VkCommandBuffer cb = ctx_.begin();
@@ -251,15 +211,10 @@ private:
             ctx_.barrier(cb);
             normDirty_ = {0, 0};
         }
-        // One matrix per pair, then a fold of its column candidates. The two
-        // share colPartial, so they are separated by a barrier and consecutive
-        // pairs are too; each dispatch already fills the GPU, and the fold is
-        // tiny next to the matrix.
+        // 每对先计算距离矩阵再归约列候选，两者及相邻图像对共用 colPartial，必须以屏障隔开。
         for (const Slot& s : slots) {
             if (s.na == 0 || s.nb == 0) continue;
-            // Workgroups for the cross-check path, which is 64 queries wide;
-            // the row-only kernel is kRowThreads wide and gets its own count
-            // below. u6 is read by reduce_cols, so it stays the 64-wide one.
+            // 交叉检查内核宽 64，行内核使用 kRowThreads；reduce_cols 读取的 u6 仍按 64 宽计算。
             uint32_t numWG = (s.na + 63) / 64;
             Push p;
             p.u0 = resident_[s.a];
@@ -270,24 +225,17 @@ private:
             p.u5 = s.ob;
             p.u6 = numWG;
             if (cc) {
-                // colPartial is shared between pairs, so each pair's matrix and
-                // column fold must retire before the next pair starts.
+                // colPartial 跨图像对复用，当前矩阵与列归约完成后才能开始下一对。
                 ctx_.dispatch(cb, "match_pair", numWG, p);
                 ctx_.barrier(cb);
                 ctx_.dispatch(cb, "reduce_cols", (s.nb + 63) / 64, p);
                 ctx_.barrier(cb);
             } else {
-                // Row-only dispatches write disjoint result regions and read
-                // nothing another pair writes: the whole batch runs with no
-                // barriers, which is what keeps thousands of small scoring
-                // dispatches from serializing on pipeline drains.
+                // 仅行匹配写入互斥结果区，批内图像对无数据依赖，可不加屏障，避免大量小评分分派被流水线排空串行化。
                 ctx_.dispatch(cb, "match_rows", (s.na + kRowThreads - 1) / kRowThreads, p);
             }
         }
-        // Readback in the same command buffer as the dispatches: one submit and
-        // one fence per chunk instead of two. Results are read straight out of
-        // the mapped staging buffer, so nothing is copied twice either. A chunk
-        // too large for the staging buffer falls back to the chunked download.
+        // 分派与回读合并到同一命令缓冲，每块只需一次提交和栅栏；直接读映射暂存区，过大时回退分块下载。
         const VkDeviceSize bytes = (VkDeviceSize)outCount * 16;
         const bool fused = bytes <= VkContext::stagingCapacity();
         if (fused) {
@@ -318,21 +266,8 @@ private:
         }
     }
 
-    // Float descriptors reach the GPU as uint8.
-    //
-    // The matching kernel is built around the hardware packed uint8x4 dot
-    // product and a 128-byte descriptor; a float path would quadruple its
-    // groupshared tile and retune it. It does not have to: for a UNIFORM
-    // affine quantization the squared distances all scale by one constant, so
-    // the ordering, the Lowe ratio (a ratio of two of them) and the
-    // max_num_matches sort are preserved exactly. Only an absolute threshold
-    // has to be converted, which is what similarityFromD2 does.
-    //
-    // kQuantHalfRange is the half-range mapped onto the byte. Measured on real
-    // ALIKED descriptors: components are ~N(0, 0.088) with a maximum of 0.392
-    // over an image, so 0.4 clips essentially nothing and spends the byte on
-    // the range that is actually occupied. The residual is ~1% of a unit
-    // descriptor's norm, well under the ratio test's margin.
+    // 浮点描述子归一化后均匀仿射量化为 uint8，复用打包点积；共同缩放保持距离顺序及比值判据，绝对阈值另行换算。
+    // ALIKED 分量约 N(0,0.088)，实测最大 0.392，取半量程 0.4 几乎不截断，量化残差约为单位描述子范数的 1%。
     static constexpr float kQuantHalfRange = 0.4f;
     static constexpr float kQuantSteps = 127.0f;
 
@@ -340,27 +275,18 @@ private:
         const float q = v * (kQuantSteps / kQuantHalfRange) + 128.0f;
         return (uint8_t)std::lround(std::min(255.0f, std::max(0.0f, q)));
     }
-    // Cosine similarity of two unit descriptors from their quantized squared
-    // distance: ||a-b||^2 = 2 - 2 cos, and d2 is that scaled by (steps/range)^2.
+    // 单位描述子满足 ||a-b||^2 = 2 - 2 cos，量化 d2 按 (steps/range)^2 缩放，据此恢复余弦相似度。
     static float similarityFromD2(uint32_t d2) {
         const float k = kQuantHalfRange / kQuantSteps;
         return 1.0f - 0.5f * (float)d2 * k * k;
     }
 
-    // Bytes per descriptor: 128 for SIFT's and ALIKED's, 256 for DeDoDe-G's.
-    // Read off the first FeatureSet with any features in it, and the shader is
-    // built at both widths (cmake/SsSfm.cmake).
+    // SIFT/ALIKED 每描述子 128 字节，DeDoDe-G 为 256；从首个非空 FeatureSet 确定，设备编译两种宽度。
     int descBytes() const { return desc_words_ * 4; }
-    // Workgroup width of the row-only kernel; MUST equal TQR in
-    // sfm/shaders/match/bruteforce.slang. Each workgroup streams the whole
-    // train set through groupshared once, so a pair's train traffic is
-    // ceil(nQuery / this) * nTrain -- dispatching the 64-wide count here would
-    // launch four times the workgroups, each redoing that streaming for
-    // queries that are not even in range.
+    // 行内核工作组宽度须与 bruteforce.slang 的 TQR 一致；训练流量为 ceil(nQuery/宽度)*nTrain，误用 64 会产生四倍冗余工作组。
     static constexpr uint32_t kRowThreads = 256;
 
-    // One byte per component either way: uint8 as SIFT writes them, or f32
-    // normalized and quantized on upload (see kQuantHalfRange).
+    // 每分量一个字节：SIFT 原生 uint8，浮点描述子上传时归一化并量化。
     void checkDescriptors(const FeatureSet& f) {
         if (f.count() == 0) return;
         if (desc_words_ == 0 && (f.dim == 128 || f.dim == 256))
@@ -378,8 +304,7 @@ private:
             throw std::runtime_error("brute-force matcher expects uint8 or f32 descriptors");
     }
 
-    // Lowe ratio + cross-check, exactly as before -- the GPU only changed how
-    // the distances are computed, not what counts as a match.
+    // 按 Lowe 比值与互近邻交叉检查判定匹配，GPU 仅负责距离计算。
     std::vector<FeatureMatch> reduce(const uint32_t* rA, const uint32_t* rB, uint32_t na,
                                      uint32_t nb) const {
         std::vector<FeatureMatch> out;
@@ -404,8 +329,7 @@ private:
         return out;
     }
 
-    // The same acceptance test as reduce(), counted rather than collected. Kept
-    // adjacent so the two cannot drift apart.
+    // 与 reduce 使用相同接受条件，仅统计数量；相邻放置以便保持一致。
     uint32_t countMatches(const uint32_t* rA, const uint32_t* rB, uint32_t na,
                           uint32_t nb) const {
         uint32_t n = 0;
@@ -424,13 +348,9 @@ private:
         return n;
     }
 
-    // All three buffers and the descriptor set must exist before the pipelines
-    // load: createDescriptors is what builds the pipeline layout the compute
-    // pipelines are created against. Everything is sized once, from the whole
-    // feature set, so nothing is reallocated underneath a live pipeline.
+    // 三个缓冲与描述符必须先于流水线创建，布局由 createDescriptors 建立；按完整特征集合一次定尺寸，避免活动流水线下重新分配。
     void ensureSetup(const std::vector<const FeatureSet*>& feats) {
-        // Every image empty: nothing will be matched, but the buffers are still
-        // sized and divided by, so pick the ordinary width.
+        // 全部图像为空时仍需合法缓冲尺寸与除数，采用普通描述子宽度。
         if (desc_words_ == 0) desc_words_ = 32;
         uint64_t total = 0, maxCount = 0;
         for (const FeatureSet* f : feats) {
@@ -438,10 +358,7 @@ private:
             maxCount = std::max<uint64_t>(maxCount, f->count());
         }
         if (setup_) {
-            // Buffers are allocated once and VkContext frees only at destruction
-            // (no per-buffer regrow), so a second feature set that needs more
-            // room cannot be served. Say so instead of overrunning: one
-            // matcher per feature set.
+            // 缓冲仅分配一次，一个匹配器对应一组容量；后续更大特征集合须明确拒绝，避免越界。
             if (maxCount > setupMaxCount_)
                 throw std::runtime_error(
                     "matcher was sized for a smaller feature set; use a fresh BruteForceMatcher");
@@ -449,20 +366,16 @@ private:
         }
         setupMaxCount_ = maxCount;
 
-        // A single batch can reference 2*batch_pairs distinct images, and all of
-        // them must be resident at once, so that is the floor -- otherwise a
-        // matcher first used on a two-image pair could never serve a real batch.
+        // 单批最多引用 2*batch_pairs 张不同图像，常驻容量至少覆盖全部，不能由首次双图调用过度缩小。
         const uint64_t batchFloor =
             (uint64_t)std::max(1, opt_.batch_pairs) * 2 * std::max<uint64_t>(maxCount, 1);
         const uint64_t budget =
             std::max<uint64_t>(opt_.descriptor_budget_bytes / descBytes(), batchFloor);
         descCap_ = (uint32_t)std::min<uint64_t>(std::max<uint64_t>(total, batchFloor), budget);
-        // Worst case a batch can ask for: every pair contributing both images'
-        // results, all at the largest feature count.
+        // 按每对两侧均达到最大特征数估计最坏结果容量。
         resultCap_ = (uint32_t)std::max<uint64_t>(
             1, (uint64_t)std::max(1, opt_.batch_pairs) * 2 * std::max<uint64_t>(maxCount, 1));
-        // One pair's column candidates: ceil(nA/64) workgroups x nB columns.
-        // Reused pair to pair, so it is sized for the largest single pair.
+        // 列候选容量为 ceil(nA/64) × nB，跨对复用，仅按最大单对分配。
         const uint64_t mc = std::max<uint64_t>(maxCount, 1);
         uint64_t colCap = ((mc + 63) / 64) * mc;
 
@@ -483,10 +396,7 @@ private:
         setup_ = true;
     }
 
-    // Make every image this batch touches resident, uploading the newly added
-    // ones as one contiguous block. The allocator bumps; when a batch does not
-    // fit it recycles the whole block (exhaustive order means the working set
-    // is the whole dataset, so partial eviction would buy nothing).
+    // 使本批所有图像常驻，新图像描述子连续上传；容量不足时回收整块，穷举工作集覆盖全部数据，局部淘汰收益有限。
     void ensureResident(const std::vector<const FeatureSet*>& feats,
                         const std::vector<std::pair<uint32_t, uint32_t>>& pairs, size_t begin,
                         size_t end) {
@@ -501,7 +411,7 @@ private:
 
         uint32_t want = 0;
         for (uint32_t img : need) want += feats[img]->count();
-        if (used_ + want > capDesc) {  // recycle
+        if (used_ + want > capDesc) {  // 回收常驻块
             resident_.clear();
             used_ = 0;
             normDirty_ = {0, 0};
@@ -513,13 +423,11 @@ private:
             want = 0;
             for (uint32_t img : need) want += feats[img]->count();
             if (want > capDesc)
-                throw std::runtime_error(  // batchFloor in ensureSetup rules this out
+                throw std::runtime_error(  // ensureSetup 的 batchFloor 应排除此情况
                     "descriptor budget too small for one batch of pairs");
         }
 
-        // Gather into one staging-friendly blob: the new images occupy a
-        // contiguous descriptor range, so this is a single upload and a single
-        // norm dispatch instead of one of each per image.
+        // 新图像描述子汇集为连续块，一次上传并一次计算范数，避免逐图提交。
         const uint32_t first = used_;
         const size_t dsz = (size_t)descBytes();
         blob_.resize((size_t)want * dsz);
@@ -534,9 +442,7 @@ private:
             if (f.dtype == DType::U8) {
                 memcpy(blob + off, f.descriptors.data(), bytes);
             } else {
-                // Float descriptors are L2-normalized on the way in. ALIKED's
-                // already are, so this is a no-op there; DeDoDe's are NOT, and
-                // both the quantization range and similarityFromD2 assume it.
+                // 上传前执行 L2 归一化；ALIKED 已归一化，DeDoDe 未归一化，量化范围与余弦恢复均要求单位范数。
                 const float* src = reinterpret_cast<const float*>(f.descriptors.data());
                 for (uint32_t r = 0; r < f.count(); r++) {
                     const float* row = src + (size_t)r * dsz;
@@ -555,20 +461,20 @@ private:
 
     MatchOptions opt_;
     spirula::SubmitBudget budget_;
-    bool dot4_ = true;  // device has VK_KHR_shader_integer_dot_product
+    bool dot4_ = true;  // 设备支持 VK_KHR_shader_integer_dot_product
     VkContext ctx_;
     GpuBuffer bDesc_, bNorm_, bResult_, bCol_;
     bool setup_ = false;
-    std::vector<const FeatureSet*> view_;      // scratch for the vector<FeatureSet> overload
-    std::vector<uint32_t> stamp_;             // chunkEnd's "seen in this chunk" marks
+    std::vector<const FeatureSet*> view_;      // vector<FeatureSet> 重载使用的指针临时数组
+    std::vector<uint32_t> stamp_;             // chunkEnd 记录本块已出现图像的标记
     uint32_t epoch_ = 0;
-    std::vector<uint32_t> res_;               // download scratch, reused across chunks
-    std::vector<uint8_t> blob_;               // upload scratch, reused across chunks
-    std::map<uint32_t, uint32_t> resident_;   // image index -> first descriptor index
-    std::pair<uint32_t, uint32_t> normDirty_{0, 0};  // descriptor range awaiting ||d||^2
-    int desc_words_ = 0;                      // 32 or 64, from the first FeatureSet
+    std::vector<uint32_t> res_;               // 跨块复用的下载缓冲
+    std::vector<uint8_t> blob_;               // 跨块复用的上传缓冲
+    std::map<uint32_t, uint32_t> resident_;   // 图像索引到首描述子索引的映射
+    std::pair<uint32_t, uint32_t> normDirty_{0, 0};  // 待计算 ||d||^2 的描述子区间
+    int desc_words_ = 0;                      // 从首个特征集确定，32 或 64
     uint32_t used_ = 0, descCap_ = 0, resultCap_ = 0;
-    uint64_t setupMaxCount_ = 0;  // largest feature count the buffers were sized for
+    uint64_t setupMaxCount_ = 0;  // 缓冲支持的最大特征数量
 };
 
-}  // namespace sfm
+}  // 命名空间 sfm

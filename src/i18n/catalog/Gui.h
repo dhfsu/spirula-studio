@@ -1,20 +1,7 @@
 #pragma once
 
-// The application's own copy: menu bar, home screen, trainer, viewport,
-// status strip, modals.
-//
-// Entries still written as SS_MSG_EN are English-only and are the remaining
-// translation work; `bash tools/check_i18n.sh` counts them. Everything else
-// carries all thirteen languages and cannot compile without them.
-//
-// Two rules that are expensive to retrofit, so they are followed from the
-// start (see src/i18n/Message.h):
-//   * never concatenate sentence fragments -- one message per sentence, with
-//     {0} / {1} placeholders, because every language here reorders clauses and
-//     three of them are verb-final;
-//   * no plural-sensitive sentences -- "Objects: 3", not "3 objects", or
-//     Russian needs a three-form plural rule and every counting message
-//     triples.
+// 应用界面文案目录；SS_MSG_EN 表示待翻译条目，其余消息须包含全部 13 种语言。
+// 每个完整句子使用一条消息和位置占位符，禁止拼接片段；数量使用标签形式，避免复数规则。
 
 #include "i18n/BeginCatalog.h"
 
@@ -23,9 +10,7 @@ namespace i18n {
 namespace msg {
 namespace gui {
 
-// ===========================================================================
-// Menu bar
-// ===========================================================================
+// ================ 菜单栏 ================
 
 SS_MSG(menu_file,
     EN("File"),          JA("ファイル"),      ZH_HANS("文件"),     ZH_HANT("檔案"),
@@ -222,9 +207,7 @@ SS_MSG(menu_new_dataset,
     RU("Создать набор данных…"),
     TR("Yeni veri kümesi…"));
 
-// ===========================================================================
-// File dialog titles
-// ===========================================================================
+// ================ 文件对话框标题 ================
 
 SS_MSG(pick_photo_folder,
     EN("Select Photo Folder"),
@@ -316,13 +299,9 @@ SS_MSG(pick_vocab_tree,
     RU("Выбор словарного дерева (.bin)"),
     TR("Sözcük ağacı (.bin) seç"));
 
-// ===========================================================================
-// Language picker
-// ===========================================================================
+// ================ 语言选择器 ================
 
-// Shown under the language list when the FULL face is not installed. Not a
-// warning: the interface and ordinary file names both render already, and what
-// is left is the tail. {0} is the language's own name, {1} the size.
+// 未安装完整字体时显示补充说明；现有字体已能渲染界面与常见文件名，因此不作为警告。{0} 为语言自称，{1} 为大小。
 SS_MSG(font_needed,
     EN("Common {0} file names render already; a rare character can still show "
        "as a box until the full font is installed ({1})."),
@@ -387,7 +366,7 @@ SS_MSG(font_downloading,
     RU("Загрузка шрифта…"),
     TR("Yazı tipi indiriliyor…"));
 
-// {0} is whatever went wrong, from curl. Not translated -- it is a diagnostic.
+// {0} 为 curl 提供的错误诊断，保留原文。
 SS_MSG(font_failed,
     EN("The font could not be downloaded: {0}"),
     JA("フォントをダウンロードできませんでした: {0}"),
@@ -437,9 +416,7 @@ SS_MSG(font_no_fetch,
     TR("Bu sürüm yazı tipi indiremez. Yazı tipi dosyasını programın yanındaki "
        "`fonts` klasörüne koyun veya yerini SS_FONT_DIR ile belirtin."));
 
-// ===========================================================================
-// Home screen
-// ===========================================================================
+// ================ 首页 ================
 
 SS_MSG(home_back_to_training,
     EN("Back to Training"),   JA("学習に戻る"),
@@ -652,9 +629,7 @@ SS_MSG(home_no_engine,
        "burada veri kümesi oluşturulamıyor (var olan bir kümeyi eğitmek yine "
        "de çalışır)."));
 
-// ===========================================================================
-// Train screen
-// ===========================================================================
+// ================ 训练页面 ================
 
 SS_MSG(back_home,
     EN("< Home"),        JA("< ホーム"),      ZH_HANS("< 主页"),  ZH_HANT("< 首頁"),
@@ -770,8 +745,7 @@ SS_MSG(no_dataset_loaded,
     RU("набор данных не загружен"),
     TR("yüklü veri kümesi yok"));
 
-// {0} cameras, {1} views, {2} points ("1.2M"). Counts are labelled rather
-// than inflected -- see the plural rule at the top of this file.
+// {0} 为相机数，{1} 为视图数，{2} 为点数（如 1.2M）；使用标签形式避免复数变化。
 SS_MSG(dataset_summary,
     EN("Cameras: {0} ({1} views) - points: {2}"),
     JA("カメラ: {0}（ビュー {1}）- 点: {2}"),
@@ -900,7 +874,7 @@ SS_MSG(device_auto_help,
     TR("Uygulamanın aygıtları sıralayıp kullanılabilir en iyisini seçmesine izin "
        "ver."));
 
-// {0} device name
+// {0} 为设备名称
 SS_MSG(device_frozen_at,
     EN("GPU fixed for this session: {0}"),
     JA("このセッションの GPU: {0}"),
@@ -953,7 +927,7 @@ SS_MSG(device_restart_required,
        "gerekir. Yerleşik Vulkan işleri bu aygıtta kalır; CUDA eğitimi ve harici "
        "araçlar ayrı ayarlar kullanır."));
 
-// {0} the requested value, {1} the frozen one
+// {0} 为请求值，{1} 为已固定值
 SS_MSG(device_conflict,
     EN("This session already runs on {1}, so {0} cannot be used. Restart the "
        "application to choose another GPU."),
@@ -980,7 +954,7 @@ SS_MSG(device_conflict,
     TR("Bu oturum zaten {1} üzerinde çalışıyor, bu yüzden {0} kullanılamaz. "
        "Başka bir GPU seçmek için uygulamayı yeniden başlatın."));
 
-// {0} the requested value, {1} why it was rejected
+// {0} 为请求值，{1} 为拒绝原因
 SS_MSG(device_error,
     EN("Cannot use GPU \"{0}\": {1}"),
     JA("GPU「{0}」は使えません: {1}"),
@@ -1056,7 +1030,7 @@ SS_MSG(device_detail_no_device,
     RU("используемое устройство Vulkan не найдено"),
     TR("kullanılabilir bir Vulkan aygıtı bulunamadı"));
 
-// {0} the environment's selector
+// {0} 为环境变量指定的选择器
 SS_MSG(device_inherited_env,
     EN("Inherited from SS_VK_DEVICE: {0}"),
     JA("SS_VK_DEVICE から継承: {0}"),
@@ -1145,7 +1119,7 @@ SS_MSG(device_cuda_locked,
     TR("CUDA aygıtı ilk motor işleminde sabitlenir; değiştirmek için uygulamayı "
        "yeniden başlatın. Yerel Vulkan işi kendi seçimini kullanır."));
 
-// ---- basic options ----
+// ---------------- 基本选项 ----------------
 SS_MSG(opt_output_folder,
     EN("Output folder"), JA("出力フォルダ"),   ZH_HANS("输出文件夹"), ZH_HANT("輸出資料夾"),
     KO("출력 폴더"),      DE("Ausgabeordner"), FR("Dossier de sortie"),
@@ -1815,7 +1789,7 @@ SS_MSG(opt_distraction_warn,
        "ve maskelenmediği çekimlerde açın. Temiz bir çekimde ayrıntı "
        "kaybettirir, karşılığında bir şey vermez."));
 
-// ---- controls ----
+// ---------------- 操作控件 ----------------
 SS_MSG(training_complete,
     EN("Training complete."),
     JA("学習が完了しました。"),
@@ -1918,8 +1892,7 @@ SS_MSG(resume,
     PT("Retomar"),       IT("Riprendi"),     NL("Hervatten"),    RU("Продолжить"),
     TR("Sürdür"));
 
-// "&&" is ImGui's escape for a literal ampersand; keep it in every language
-// that keeps the ampersand, and drop it where the conjunction is a word.
+// && 是 ImGui 表示字面量 & 的转义；译文保留 & 时保留转义，改用连接词时移除。
 SS_MSG(stop,
     EN("Stop"),          JA("停止"),          ZH_HANS("停止"),     ZH_HANT("停止"),
     KO("멈춤"),           DE("Anhalten"),     FR("Arrêter"),      ES("Detener"),
@@ -2045,7 +2018,7 @@ SS_MSG(stop_and_save_help,
     TR("Şu anki adımı bitir, bir denetim noktası kaydet ve sonucu görmek için "
        "yüklü bırak."));
 
-// ---- status strip ----
+// ---------------- 状态栏 ----------------
 
 SS_MSG(status_step,
     EN("step {0} / {1}  ({2}%)"), JA("ステップ {0} / {1}  ({2}%)"),
@@ -2154,8 +2127,7 @@ SS_MSG(status_idle,
     PT("ocioso"),        IT("inattivo"),     NL("inactief"),     RU("ожидание"),
     TR("boşta"));
 
-// The metric names are the ones the literature and the logs use; only the
-// labelling around them changes.
+// 指标名称沿用文献与日志，只翻译周围标签。
 SS_MSG(status_metrics,
     EN("splats: {0}   ssim: {1}   loss: {2}"),
     JA("スプラット: {0}   ssim: {1}   損失: {2}"),
@@ -2207,9 +2179,7 @@ SS_MSG(vram_help,
        "/ aygıtın kapasitesi. “?”, arka ucun o değeri sorgulayamadığı "
        "anlamına gelir."));
 
-// ===========================================================================
-// Log panel
-// ===========================================================================
+// ================ 日志面板 ================
 
 SS_MSG(log_details,
     EN("Show Every Line"),
@@ -2287,12 +2257,8 @@ SS_MSG(log_clear,
     TR("Temizle"));
 
 
-// ===========================================================================
-// Stop-training confirmation
-// ===========================================================================
-// Three whole sentences rather than one with a swappable tail: "Stop training
-// and {0}?" cannot be translated into a verb-final language without knowing
-// what {0} is.
+// ================ 停止训练确认 ================
+// 分别使用完整句子，不能用可替换句尾拼接；动词后置语言无法在未知参数含义时正确翻译。
 
 SS_MSG(confirm_title,
     EN("Stop training?"), JA("学習を停止しますか？"), ZH_HANS("要停止训练吗？"),
@@ -2461,9 +2427,7 @@ SS_MSG(confirm_stop,
     RU("Остановить обучение и оставить результат загруженным для просмотра?"),
     TR("Eğitimi durdurup sonucu görüntülemek için yüklü bırakalım mı?"));
 
-// ===========================================================================
-// Viewport
-// ===========================================================================
+// ================ 视口 ================
 
 SS_MSG(viewport_dataset_preview,
     EN("dataset preview"), JA("データセットのプレビュー"), ZH_HANS("数据集预览"),
@@ -2831,11 +2795,7 @@ SS_MSG(viewport_reset_view,
     IT("Reimposta la vista"), NL("Weergave herstellen"), RU("Сбросить вид"),
     TR("Görünümü sıfırla"));
 
-// The four navigation modes and the four projections, as the viewport's two
-// combo boxes name them. Translated, even though the web viewer's own UI is
-// English: a reader of the interface should not have to know English to tell
-// an orbit from a flythrough. viewport_nav_help names them by substitution
-// ({0}..{3}) so the tooltip and the combo cannot drift apart.
+// 导航与投影模式的下拉名称均翻译；viewport_nav_help 通过 {0}..{3} 引用相同名称，防止提示与菜单不一致。
 
 SS_MSG(nav_turntable,
     EN("Turntable"),    JA("ターンテーブル"),  ZH_HANS("转台"),    ZH_HANT("轉台"),
@@ -3091,9 +3051,7 @@ SS_MSG(viewport_render_error,
     RU("ошибка отрисовки: {0}"),
     TR("işleme hatası: {0}"));
 
-// ===========================================================================
-// Config editor (the "All Options" table)
-// ===========================================================================
+// ================ 全部选项编辑器 ================
 
 SS_MSG(cfg_tier_basic,
     EN("Basic"),         JA("基本"),          ZH_HANS("基本"),     ZH_HANT("基本"),
@@ -3223,9 +3181,7 @@ SS_MSG(cfg_unchecked_is_auto,
     RU("без флажка — авто"),
     TR("işaretsiz = otomatik"));
 
-// ===========================================================================
-// File dialog
-// ===========================================================================
+// ================ 文件对话框 ================
 
 SS_MSG(fd_up,
     EN("Up"),            JA("上へ"),          ZH_HANS("上一级"),   ZH_HANT("上一層"),
@@ -3281,7 +3237,7 @@ SS_MSG(fd_select_file,
     ES("Elegir el archivo"), PT("Escolher o arquivo"), IT("Scegli il file"),
     NL("Bestand kiezen"), RU("Выбрать файл"), TR("Dosya seç"));
 
-// {0} is a count. Labelled, not inflected -- see the plural rule above.
+// {0} 为数量，采用标签形式避免复数变化。
 SS_MSG(fd_select_files,
     EN("Select Files ({0})"),
     JA("ファイルを選択（{0} 件）"),
@@ -3345,9 +3301,7 @@ SS_MSG(cancel,
     PT("Cancelar"),      IT("Annulla"),      NL("Annuleren"),    RU("Отмена"),
     TR("İptal"));
 
-// ===========================================================================
-// Viewer screen -- a finished model, open for looking at
-// ===========================================================================
+// ================ 已完成模型的查看页面 ================
 
 SS_MSG(menu_open_splat,
     EN("Open a Splat File..."),
@@ -3939,13 +3893,8 @@ SS_MSG(confirm_open_splat,
     TR("Eğitimi durdurup model dosyasını açalım mı?"));
 
 
-// ===========================================================================
-// Saved presets
-//
-// The built-in presets are code and their labels are translated in
-// i18n/catalog/Train.h. These are the words around the ones the user saves:
-// the save dialog, the picker's two groups, and what comes back afterwards.
-// ===========================================================================
+// ================ 保存的预设 ================
+// 此处定义用户预设的保存对话框、选择器分组与反馈文案；内置预设标签由对应目录定义。
 
 SS_MSG(preset_builtin_group,
     EN("Built-in"),      JA("組み込み"),       ZH_HANS("内置"),     ZH_HANT("內建"),
@@ -4433,9 +4382,7 @@ SS_MSG(preset_delete_failed,
     TR("Hazır ayar silinemedi: {0}"));
 
 
-// ===========================================================================
-// Batch processing
-// ===========================================================================
+// ================ 批处理 ================
 
 SS_MSG(home_batch,
     EN("Batch Processing"),
@@ -4834,9 +4781,7 @@ SS_MSG(batch_no_runnable,
     NL("Er valt niets uit te voeren."),
     RU("Запускать нечего."),
     TR("Çalıştırılacak bir şey yok."));
-// A column heading, so every language is kept to about the width of the
-// English one -- the row under it is a number, and a heading that has to be
-// truncated says less than a short one.
+// 列标题尽量接近英文宽度；下方是数值，简短完整的标题优于被截断的长标题。
 SS_MSG(batch_col_splats,
     EN("Max splats"),
     JA("スプラット上限"),
@@ -4898,8 +4843,7 @@ SS_MSG(batch_dataset_hint,
     NL("pad naar een gereconstrueerde dataset"),
     RU("путь к реконструированному набору данных"),
     TR("yeniden oluşturulmuş bir veri kümesinin yolu"));
-// The three columns that save making a near-identical preset for every
-// combination of the numbers people actually change.
+// 三个可直接调整的数值列，避免为每种组合创建近乎相同的预设。
 SS_MSG(batch_override_hint,
     EN("preset"),        JA("プリセット"),     ZH_HANS("预设"),     ZH_HANT("預設"),
     KO("프리셋"),         DE("Voreinstellung"), FR("préréglage"),  ES("ajuste"),
@@ -5291,8 +5235,7 @@ SS_MSG(batch_log_job_stopped,
     NL("Batchtaak {0} is gestopt."),
     RU("Задача пакета {0} остановлена."),
     TR("Toplu iş {0} durduruldu."));
-// "Not finished" rather than "not run": a row stopped part-way is in there
-// too, and it did run -- it just has no result to report.
+// 使用“未完成”，涵盖中途停止且没有最终结果的任务。
 SS_MSG(batch_log_summary,
     EN("Batch finished. Done: {0}   Failed: {1}   Not finished: {2}"),
     JA("バッチが終了しました。完了: {0}   失敗: {1}   未完了: {2}"),
@@ -5308,9 +5251,8 @@ SS_MSG(batch_log_summary,
     RU("Пакет завершён. Готово: {0}   Сбоев: {1}   Не завершено: {2}"),
     TR("Toplu iş bitti. Biten: {0}   Başarısız: {1}   Tamamlanmayan: {2}"));
 
-// ---- the command a finished queue runs ----
-// The message these hand over goes through gui::safe_arg(), so an apostrophe
-// or a quote in a translation cannot reach the command as syntax.
+// ---------------- 队列完成后执行的命令 ----------------
+// 消息经 gui::safe_arg() 转义，译文中的引号不能成为命令语法。
 SS_MSG(batch_cmd_title,
     EN("When the queue finishes"),
     JA("バッチが終わったら"),
@@ -5409,9 +5351,7 @@ SS_MSG(batch_cmd_test_help,
        "samenvatting."),
     RU("Запускает команду сейчас, подставив пробное сообщение вместо сводки."),
     TR("Komutu şimdi çalıştırır, özet yerine bir deneme iletisi koyarak."));
-// The product name is the localized one where there is one (brand::product):
-// this is in-text copy, not the wordmark, and it is written out per language
-// rather than assembled, exactly as brand::window_title is.
+// 正文使用本地化产品名，各语言独立写出完整句子，不拼接品牌片段。
 SS_MSG(batch_cmd_test_message,
     EN("Spirula Studio: this is a test message."),
     JA("スピルラ・スタジオ: これはテスト用のメッセージです。"),
@@ -5523,7 +5463,7 @@ SS_MSG(batch_cmd_busy,
     RU("Команда завершения уже выполняется; эта не запущена."),
     TR("Bitiş komutu zaten çalışıyor; bu çalıştırılmadı."));
 
-// ---- what a pre-flight can find ----
+// ---------------- 启动前检查结果 ----------------
 SS_MSG(chk_dataset_empty,
     EN("No dataset folder is set."),
     JA("データセットのフォルダーが設定されていません。"),
@@ -5617,9 +5557,7 @@ SS_MSG(chk_dataset_unreadable,
     TR("Bu klasörde eğitimin okuyabileceği bir yeniden oluşturma yok -- ne "
        "transforms.json, ne sparse/ ya da colmap/, ne de bir .ply yanında "
        "Metashape .xml dosyası: {0}"));
-// Two rows on one dataset are ordinary -- comparing presets, or sweeping the
-// splat budget, is what a batch is for. Only rows that would do exactly the
-// same work are worth saying anything about.
+// 同一数据集可有多个不同预设或点数预算任务；仅对会执行完全相同工作的重复项提示。
 SS_MSG(chk_dataset_duplicate,
     EN("Another row trains this dataset with the same settings: {0}"),
     JA("同じ設定でこのデータセットを学習する行が他にもあります: {0}"),
@@ -5819,9 +5757,7 @@ SS_MSG(chk_no_device,
     TR("Kullanılabilir GPU bulunamadı; hiçbir şey eğitilemez."));
 
 
-// ---------------------------------------------------------------------------
-// Mesh: the "create mesh from splats" screen, and viewing a mesh file
-// ---------------------------------------------------------------------------
+// ---------------- 从高斯模型生成网格与查看网格 ----------------
 
 SS_MSG(home_make_mesh,
     EN("Create a mesh from splats"),
@@ -6371,11 +6307,7 @@ SS_MSG(mesh_photos_dir_help,
     RU("Оставьте пустым, чтобы взять папку из config.json запуска."),
     TR("Çalıştırmanın config.json dosyasındaki klasörü kullanmak için boş bırakın."));
 
-// The two warnings the mesh screen shows when the run about to start would
-// have no cameras -- the checkbox is off, or nothing was found to use. Both
-// say the same thing the CLI says (i18n/catalog/Cli.h, mesh_no_cameras): a
-// mesh carved from the photos is a much better mesh, and this is the moment
-// to say so, before three minutes of work produce the worse one.
+// 未启用相机或未找到相机时，在运行前提示；与 CLI 的 mesh_no_cameras 一致，说明利用照片约束可改善网格质量。
 SS_MSG(mesh_no_photos_warn,
     EN("Without the photos the mesh comes from the Gaussian densities alone: "
        "the surface is rougher and the colors are worse. Turn this on for "
@@ -6961,8 +6893,7 @@ SS_MSG(viewer_mesh_count,
     TR("Köşe: {0}   Üçgen: {1}"));
 
 
-// The count drawn over the preview image. Labelled rather than inflected, so
-// no language needs a plural rule for it, and short: it sits on the picture.
+// 预览图上的短数量标签，避免复数变化并减少遮挡。
 SS_MSG(overlay_triangles,
     EN("Triangles: {0}"),
     JA("三角形: {0}"),
@@ -7024,9 +6955,7 @@ SS_MSG(overlay_grid_relative,
     TR("Izgara: {0} (metrik ölçek yok)"));
 
 
-// ===========================================================================
-// Photograph vs render (src/app/gui/ImageCompare.h)
-// ===========================================================================
+// ================ 照片与渲染对比 ================
 
 SS_MSG(preview_mode_3d,
     EN("3D view"),       JA("3Dビュー"),      ZH_HANS("3D 视图"),  ZH_HANT("3D 檢視"),
@@ -7845,11 +7774,8 @@ SS_MSG(compare_at_step,
     RU("на шаге {0}"),
     TR("{0}. adımda"));
 
-// ===========================================================================
-// Crash report
-// ===========================================================================
-// The path follows on its own line rather than interpolated into the
-// sentence: the handler that shows this may not allocate.
+// ================ 崩溃报告 ================
+// 路径单独输出在下一行；崩溃处理器不能为句子插值分配内存。
 
 SS_MSG(crash_report_saved,
     EN("Spirula Studio stopped unexpectedly. A report was saved to the file "
@@ -7878,11 +7804,8 @@ SS_MSG(crash_report_saved,
     TR("Spirula Studio beklenmedik biçimde kapandı. Aşağıdaki dosyaya bir "
        "rapor kaydedildi; hata bildirimine ekleyin."));
 
-// ===========================================================================
-// Run log -- the settings snapshot at the top of <dataset>/logs/*.log
-// ===========================================================================
-// Headings only. The key=value lines under them are config field names and
-// their values, which stay themselves in every language.
+// ================ 运行日志顶部的配置快照 ================
+// 仅翻译标题，后续 key=value 的字段名与值保留原文。
 
 SS_MSG(runlog_section_run,
     EN("Run"),           JA("実行"),          ZH_HANS("运行"),     ZH_HANT("執行"),
@@ -7905,7 +7828,7 @@ SS_MSG(runlog_section_prep,
     RU("Подготовка набора данных"),
     TR("Veri kümesi hazırlığı"));
 
-// {0} is the engine's own name (SfM, COLMAP), which is not translated.
+// {0} 为 SfM、COLMAP 等引擎名称，不翻译。
 SS_MSG(runlog_section_recon,
     EN("Reconstruction ({0})"),
     JA("再構成（{0}）"),
@@ -7936,7 +7859,7 @@ SS_MSG(runlog_section_geometry,
     RU("Геометрия (глубина и нормали)"),
     TR("Geometri (derinlik ve normaller)"));
 
-// {0} is a training section heading -- msg::train::section_label().
+// {0} 为训练配置分组标题，由 msg::train::section_label() 提供。
 SS_MSG(runlog_section_train,
     EN("Training: {0}"),
     JA("学習: {0}"),
@@ -7968,9 +7891,7 @@ SS_MSG(runlog_settings_end,
     TR("Ayarların sonu"));
 
 
-// ===========================================================================
-// Batch processing and the two new kinds of preset
-// ===========================================================================
+// ================ 批处理与预设类型 ================
 
 SS_MSG(batch_stage_dataset,
     EN("Create dataset"),
@@ -9165,9 +9086,7 @@ SS_MSG(batch_plan_mesh_run,
     TR("{0}. {1} ile eğitilen çalıştırmadan ağ oluştur"));
 
 
-// ===========================================================================
-// The navigation gizmo
-// ===========================================================================
+// ================ 导航控件 ================
 
 SS_MSG(gizmo_help,
     EN("Drag to orbit. Click an axis to look along it; click it again for the far side."),
@@ -9246,9 +9165,7 @@ SS_MSG(gizmo_to_perspective,
 
 
 
-// ===========================================================================
-// Saving under a name that gained its extension
-// ===========================================================================
+// ================ 补全扩展名后的保存确认 ================
 
 SS_MSG(fd_replace_title,
     EN("Replace the file?"),
@@ -9296,9 +9213,9 @@ SS_MSG(fd_replace_yes,
     TR("Değiştir"));
 
 
-}  // namespace gui
-}  // namespace msg
-}  // namespace i18n
-}  // namespace spirula
+}  // 命名空间 gui
+}  // 命名空间 msg
+}  // 命名空间 i18n
+}  // 命名空间 spirula
 
 #include "i18n/EndCatalog.h"

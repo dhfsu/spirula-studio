@@ -1,7 +1,4 @@
-// The verified view graph as a graph to cut: one node per image, edge weight
-// the inlier matches a pair kept. The cut itself is core/GraphCut.h, shared
-// with the dataset partitioner; nothing here looks at geometry, so it runs
-// before any reconstruction exists.
+// 验证视图图以图像为节点、内点数为边权，在重建前调用共享 GraphCut 切分，不依赖三维几何。
 #pragma once
 
 #include <cstdint>
@@ -31,9 +28,9 @@ inline std::vector<std::vector<uint32_t>> connectedComponents(
 }
 
 struct PartitionOptions {
-    size_t leaf_max_images = 160;  // split until every part is at most this big
-    size_t overlap = 30;           // images each part borrows from its sibling
-    size_t min_part = 20;          // a part smaller than this is not worth a model
+    size_t leaf_max_images = 160;  // 持续切分直到每部分不超过此大小
+    size_t overlap = 30;           // 每部分从相邻分区借入的图像数
+    size_t min_part = 20;          // 小于此大小不值得单独建模
 };
 
 inline std::vector<std::vector<uint32_t>> bisect(const ViewGraph& g,
@@ -47,4 +44,4 @@ inline std::vector<std::vector<uint32_t>> partitionViewGraph(const ViewGraph& g,
     return spirula::graph::recursive_bisect(g, {opt.leaf_max_images, opt.overlap, opt.min_part});
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

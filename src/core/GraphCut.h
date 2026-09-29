@@ -1,10 +1,7 @@
 #pragma once
 
-// Spectral partitioning of a weighted undirected graph: connected components,
-// the normalized cut of a node set by its Fiedler vector, and the recursive
-// bisection built on it. Standard library only, so the SfM view graph, the
-// covisibility graph of a parsed dataset and any future graph over a
-// reconstruction cut through the same code.
+// 加权无向图的谱划分：连通分量、基于 Fiedler 向量的归一化割及递归二分。
+// 仅依赖标准库，供 SfM 视图图、数据集共视图及其他重建图共用。
 
 #include <algorithm>
 #include <cmath>
@@ -16,11 +13,11 @@
 namespace spirula {
 namespace graph {
 
-// Undirected weighted graph in CSR form.
+// CSR 格式的加权无向图。
 struct WeightedGraph {
     std::vector<uint32_t> offs;   // n+1
-    std::vector<uint32_t> adj;    // neighbours
-    std::vector<double> w;        // parallel to adj
+    std::vector<uint32_t> adj;    // 相邻节点
+    std::vector<double> w;        // 与 adj 一一对应
     size_t n() const { return offs.empty() ? 0 : offs.size() - 1; }
     double degree(uint32_t i) const {
         double d = 0;
@@ -34,8 +31,7 @@ struct Edge {
     double w = 0;
 };
 
-// Symmetric CSR from an edge list. Edges naming the same pair twice add up;
-// self-loops and edges past `n` are dropped.
+// 由边列表构造对称 CSR；重复边权相加，忽略自环与超出 n 的节点。
 inline WeightedGraph build_graph(size_t n, const std::vector<Edge>& edges) {
     WeightedGraph g;
     g.offs.assign(n + 1, 0);
@@ -58,9 +54,7 @@ inline WeightedGraph build_graph(size_t n, const std::vector<Edge>& edges) {
     return g;
 }
 
-// Accumulates pair weights so a graph can be built from many small
-// observations (every pair of images sharing a point) without a quadratic
-// edge list.
+// 累加节点对权重，避免为共享点的所有图像对生成二次规模的临时边列表。
 class EdgeAccumulator {
 public:
     void add(uint32_t a, uint32_t b, double w) {
@@ -76,7 +70,7 @@ public:
         for (const auto& kv : _acc)
             edges.push_back({(uint32_t)(kv.first >> 32), (uint32_t)(kv.first & 0xffffffffu),
                              kv.second});
-        // Hash order is not stable across runs; the cut below must be.
+        // 哈希遍历顺序跨运行不稳定，图划分结果必须稳定。
         std::sort(edges.begin(), edges.end(), [](const Edge& x, const Edge& y) {
             return x.a != y.a ? x.a < y.a : x.b < y.b;
         });
@@ -87,7 +81,7 @@ private:
     std::unordered_map<uint64_t, double> _acc;
 };
 
-// Connected components of the subgraph induced on `nodes`, largest first.
+// nodes 诱导子图的连通分量，按大小降序排列。
 inline std::vector<std::vector<uint32_t>> connected_components(
     const WeightedGraph& g, const std::vector<uint32_t>& nodes) {
     std::vector<char> inside(g.n(), 0), seen(g.n(), 0);
@@ -119,9 +113,8 @@ inline std::vector<std::vector<uint32_t>> connected_components(
 
 namespace detail {
 
-// Fiedler vector of the induced subgraph's normalized Laplacian, by power
-// iteration on M = D^-1/2 W D^-1/2 deflated against its top eigenvector
-// D^1/2 * 1. Per-node values in `nodes` order; empty when it did not converge.
+// 对 M = D^-1/2 W D^-1/2 做幂迭代，并消去主特征向量 D^1/2 * 1，得到归一化拉普拉斯的 Fiedler 向量。
+// 输出按 nodes 顺序排列，未收敛时为空。
 inline std::vector<double> fiedler(const WeightedGraph& g, const std::vector<uint32_t>& nodes,
                                    const std::vector<uint32_t>& local_of, int iters = 300) {
     const size_t m = nodes.size();
@@ -140,8 +133,7 @@ inline std::vector<double> fiedler(const WeightedGraph& g, const std::vector<uin
     n0 = std::sqrt(n0);
     for (double& x : v0) x /= n0;
 
-    // Alternating signs cannot be orthogonal to the Fiedler vector by accident
-    // the way a constant start is.
+    // 交替符号初值避免常量初值偶然与 Fiedler 向量正交的问题。
     std::vector<double> x(m), y(m);
     for (size_t i = 0; i < m; i++) x[i] = (i % 2 ? -1.0 : 1.0) + 1e-3 * (double)(i % 7);
     auto orthonormalize = [&](std::vector<double>& z) {
@@ -158,8 +150,7 @@ inline std::vector<double> fiedler(const WeightedGraph& g, const std::vector<uin
         nz = std::sqrt(nz);
         for (double& q : x) q /= nz;
     }
-    // (M + I)/2 makes the wanted eigenvector the dominant mode of a positive
-    // operator, so the iteration cannot land on the most negative one.
+    // (M + I)/2 使目标特征向量成为正算子的主模态，避免迭代收敛到最负特征值。
     for (int it = 0; it < iters; it++) {
         std::fill(y.begin(), y.end(), 0.0);
         for (size_t i = 0; i < m; i++) {
@@ -183,23 +174,18 @@ inline std::vector<double> fiedler(const WeightedGraph& g, const std::vector<uin
     return x;
 }
 
-}  // namespace detail
+}  // 命名空间 detail
 
 struct BisectOptions {
-    size_t overlap = 0;    // nodes each side borrows from its sibling
-    size_t min_part = 1;   // a side smaller than this is not a cut
-    // Optional per-node cost (parallel to the graph's nodes); the sweep then
-    // scores balance by summed cost rather than by node count. Null = 1 each.
+    size_t overlap = 0;    // 每侧从另一侧借入的节点数
+    size_t min_part = 1;   // 任一侧小于此值则不接受切分
+    // 可选逐节点代价与图节点对应，扫描按总代价平衡；空指针表示每节点代价为 1。
     const double* cost = nullptr;
-    // Each side must hold at least this fraction of the cost. 0 leaves the
-    // normalized cut free to shave off a weakly attached clump, which is right
-    // for SfM atoms and wrong for parts that should be of a size.
+    // 每侧至少占总代价的此比例；0 允许剥离连接较弱的小团，适合 SfM 原子分组，但不适合要求均衡大小的分区。
     double balance = 0.0;
 };
 
-// Split `nodes` in two along the normalized cut, then give each side the
-// `overlap` nodes of the other side best connected to it. {} when the split
-// is not worth making.
+// 沿归一化割二分 nodes，再为每侧加入另一侧连接最强的 overlap 个节点；不值得切分时返回空结果。
 inline std::vector<std::vector<uint32_t>> bisect(const WeightedGraph& g,
                                                  const std::vector<uint32_t>& nodes,
                                                  const BisectOptions& opt) {
@@ -210,16 +196,12 @@ inline std::vector<std::vector<uint32_t>> bisect(const WeightedGraph& g,
     std::vector<double> f = detail::fiedler(g, nodes, local_of);
     std::vector<uint32_t> order(nodes.size());
     std::iota(order.begin(), order.end(), 0u);
-    // No Fiedler vector (disconnected or degenerate): the input order, which
-    // for a video capture is the capture order and is the cut one would draw
-    // by hand.
+    // 不连通或退化导致缺少 Fiedler 向量时采用输入顺序；视频数据通常即拍摄顺序。
     if (!f.empty())
         std::stable_sort(order.begin(), order.end(),
                          [&](uint32_t a, uint32_t b) { return f[a] < f[b]; });
 
-    // cut(S) * (1/vol(S) + 1/vol(V\S)) swept along the order; the running
-    // sums keep it linear in the edge count. Balance uses the caller's cost
-    // when given, so a side is judged by what it will cost to process.
+    // 沿排序扫描 cut(S) * (1/vol(S) + 1/vol(V\S))，增量和使复杂度与边数线性；平衡项优先使用调用方提供的处理代价。
     const size_t m = nodes.size();
     std::vector<uint32_t> rank(m);
     for (size_t i = 0; i < m; i++) rank[order[i]] = (uint32_t)i;
@@ -262,9 +244,7 @@ inline std::vector<std::vector<uint32_t>> bisect(const WeightedGraph& g,
     }
     if (opt.overlap == 0) return parts;
 
-    // The borrow is bounded so a part is always strictly smaller than what it
-    // was cut from; without that a lopsided cut plus the borrow grows a part
-    // past its parent and a size-based recursion never ends.
+    // 借入节点数必须受限，使子分区严格小于父分区，避免偏斜切分叠加重叠后递归无法结束。
     for (int s = 0; s < 2; s++) {
         const size_t room = m - 1 - std::min(m - 1, parts[s].size());
         std::vector<std::pair<double, uint32_t>> cross;
@@ -290,14 +270,12 @@ inline std::vector<std::vector<uint32_t>> bisect(const WeightedGraph& g,
 }
 
 struct RecursiveBisectOptions {
-    size_t leaf_max = 160;   // split until every part is at most this big
-    size_t overlap = 30;     // images each part borrows from its sibling
-    size_t min_part = 20;    // a part smaller than this is not worth a model
+    size_t leaf_max = 160;   // 持续切分，直到每部分不超过此大小
+    size_t overlap = 30;     // 每部分从另一侧借入的图像数
+    size_t min_part = 20;    // 小于此值的分区不值得单独重建
 };
 
-// Recursive bisection down to leaves of at most `leaf_max` (before overlap).
-// Disconnected inputs are separated first: a cut inside a component is
-// meaningful, a cut between two is free and says nothing.
+// 递归二分直到叶节点数不超过 leaf_max，不计重叠；先分离连通分量，再进行有意义的内部切分。
 inline std::vector<std::vector<uint32_t>> recursive_bisect(const WeightedGraph& g,
                                                            const RecursiveBisectOptions& opt) {
     std::vector<uint32_t> all(g.n());
@@ -307,15 +285,13 @@ inline std::vector<std::vector<uint32_t>> recursive_bisect(const WeightedGraph& 
     while (!queue.empty()) {
         std::vector<uint32_t> part = std::move(queue.back());
         queue.pop_back();
-        // Over the leaf size only WITHOUT the borrowed overlap, or the borrow
-        // itself would force another split, and every split borrows again.
+        // 叶大小检查不计借入重叠，否则每次借入都会再次触发切分。
         if (part.size() <= opt.leaf_max + opt.overlap) {
             if (part.size() >= 2) leaves.push_back(std::move(part));
             continue;
         }
         std::vector<std::vector<uint32_t>> halves = bisect(g, part, bo);
-        // bisect bounds the borrow so a half never matches its parent; the
-        // check stays because the cost of being wrong is a hang.
+        // bisect 已限制借入数，仍检查子分区是否等于父分区，防止异常导致死循环。
         if (halves.size() != 2 || halves[0].size() >= part.size() ||
             halves[1].size() >= part.size()) {
             leaves.push_back(std::move(part));
@@ -332,23 +308,20 @@ inline std::vector<std::vector<uint32_t>> recursive_bisect(const WeightedGraph& 
 }
 
 struct LabelCutOptions {
-    // Exactly this many parts when > 0 (the heaviest part is bisected until
-    // the count is reached); otherwise parts of at most `leaf_max` cost.
+    // 大于 0 时持续二分最重分区，直到达到指定分区数；否则限制各部分代价不超过 leaf_max。
     size_t parts = 0;
     double leaf_max = 400;
     size_t min_part = 2;
-    const double* cost = nullptr;   // per node; null = 1 each
-    double balance = 0.3;           // see BisectOptions::balance
-    // A finished part below this many nodes is not worth a model and joins
-    // the part it shares the most with.
+    const double* cost = nullptr;   // 逐节点代价；空指针表示均为 1
+    double balance = 0.3;           // 平衡约束见 BisectOptions::balance
+    // 完成后节点数不足的部分并入连接最强的分区。
     size_t min_final = 2;
     int refine_passes = 3;
 };
 
 namespace detail {
 
-// Weight from `v` into each label among its neighbours; `own` gets the weight
-// staying inside its own label.
+// 累计 v 到邻居各标签的边权；own 保存同标签内部的权重。
 inline void label_links(const WeightedGraph& g, const std::vector<int32_t>& label, uint32_t v,
                         std::vector<double>& into) {
     for (uint32_t k = g.offs[v]; k < g.offs[v + 1]; k++) {
@@ -357,9 +330,7 @@ inline void label_links(const WeightedGraph& g, const std::vector<int32_t>& labe
     }
 }
 
-// A part's pieces beyond its largest connected one move to the label they
-// are best connected to, when at most `max_share` of the part: stranded nodes
-// are repaired, a part that is genuinely two halves is left to be split again.
+// 若零散连通块占比不超过 max_share，则将最大连通块以外的部分移至连接最强的标签；真正分成两大块的分区留待后续切分。
 inline void reconnect_parts(const WeightedGraph& g, std::vector<int32_t>& label, int n_labels,
                             double max_share = 1.0) {
     for (int l = 0; l < n_labels; l++) {
@@ -381,11 +352,9 @@ inline void reconnect_parts(const WeightedGraph& g, std::vector<int32_t>& label,
     }
 }
 
-}  // namespace detail
+}  // 命名空间 detail
 
-// A disjoint partition of every node into dense labels ordered by decreasing
-// part cost. A component too small to cut keeps its own label: an isolated
-// node is a part of its own, not a stray in someone else's.
+// 为全部节点生成互斥且连续的分区标签，按代价降序排列；过小的独立连通分量保留自己的标签。
 inline std::vector<int32_t> cut_labels(const WeightedGraph& g, const LabelCutOptions& opt) {
     auto cost_of = [&](const std::vector<uint32_t>& part) {
         double c = 0;
@@ -398,7 +367,7 @@ inline std::vector<int32_t> cut_labels(const WeightedGraph& g, const LabelCutOpt
     std::vector<char> final_(parts.size(), 0);
     const BisectOptions bo{0, opt.min_part, opt.cost, opt.balance};
     for (;;) {
-        // The part to cut next: the costliest one still cuttable.
+        // 下一次切分仍可二分且代价最大的部分。
         int pick = -1;
         double pick_cost = -1;
         for (size_t i = 0; i < parts.size(); i++) {
@@ -414,9 +383,7 @@ inline std::vector<int32_t> cut_labels(const WeightedGraph& g, const LabelCutOpt
             final_[(size_t)pick] = 1;
             continue;
         }
-        // A half the sweep left in pieces: every piece but the largest goes
-        // to the other half, where its links are. Both halves stay inside the
-        // parent, so the recursion still shrinks.
+        // 切分后零散块移至连接更强的另一侧，仅保留最大连通块；两侧仍包含于父分区，保证递归缩小。
         for (int side = 0; side < 2; side++) {
             std::vector<std::vector<uint32_t>> comps = connected_components(g, halves[side]);
             if (comps.size() < 2) continue;
@@ -441,8 +408,7 @@ inline std::vector<int32_t> cut_labels(const WeightedGraph& g, const LabelCutOpt
         return sz;
     };
 
-    // A boundary node that shares more with another part moves over while
-    // the sizes stay within a quarter of the mean; stranded pieces follow.
+    // 边界节点可移向连接更强的分区，同时保持大小在均值的四分之一偏差内；随后修复孤立碎片。
     for (int pass = 0; pass < opt.refine_passes; pass++) {
         std::vector<double> sz = sizes();
         double mean = 0;
@@ -470,8 +436,7 @@ inline std::vector<int32_t> cut_labels(const WeightedGraph& g, const LabelCutOpt
         detail::reconnect_parts(g, label, n_labels, 0.25);
     }
 
-    // Parts too small to be worth a model join their best-connected neighbour;
-    // an isolated one stays as it is and is the caller's to place.
+    // 过小分区并入连接最强的邻居；孤立部分保留，由调用方决定位置。
     for (;;) {
         std::vector<double> sz = sizes();
         int tiny = -1;
@@ -492,7 +457,7 @@ inline std::vector<int32_t> cut_labels(const WeightedGraph& g, const LabelCutOpt
             if (label[v] == tiny) label[v] = best;
     }
 
-    // Dense labels, costliest part first.
+    // 标签连续编号，代价最大的部分优先。
     std::vector<double> sz = sizes();
     std::vector<int> order((size_t)n_labels);
     std::iota(order.begin(), order.end(), 0);
@@ -507,5 +472,5 @@ inline std::vector<int32_t> cut_labels(const WeightedGraph& g, const LabelCutOpt
     return label;
 }
 
-}  // namespace graph
-}  // namespace spirula
+}  // 命名空间 graph
+}  // 命名空间 spirula

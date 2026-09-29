@@ -1,22 +1,6 @@
-// Incremental Structure-from-Motion mapper (src/sfm/README.md).
-//
-// MVP control flow, ported in spirit from COLMAP's IncrementalMapper:
-//   seed pair -> initialize (relative pose + triangulate)
-//   loop: register-next (2D-3D via the correspondence graph, PnP RANSAC)
-//         -> continue tracks + triangulate new points
-//         -> periodic global BA + reprojection filtering
-//
-// Robustness (D36) follows COLMAP: strict seed acceptance with stepwise
-// relaxation, PnP inlier-count and inlier-ratio gates with nonlinear pose
-// refinement, iterated global BA + filtering (reprojection and triangulation
-// angle) at 10% model growth, and de-registration of images the filtering
-// hollows out -- the mapper's way of undoing a registration that stopped
-// agreeing with the model.
-//
-// Remaining simplifications (src/sfm/README.md / D10): transitive tracks
-// approximated by one-hop correspondences, global BA only (no local BA), no
-// retriangulation/merge pass. Points are colored by averaging the
-// per-keypoint colors sampled at extraction; each has a clear upgrade path.
+// 增量 SfM：从种子对恢复相对位姿并三角化，反复以对应图构造二维、三维匹配，通过 PnP 配准，再补轨迹和三角化。
+// 种子阈值逐步放宽，配准结合内点数、比例和非线性精化；周期全局 BA 与过滤会撤销失去支持的图像（D36）。
+// 点颜色由提取阶段保存的关键点颜色沿轨迹平均。
 #pragma once
 
 #include <algorithm>
@@ -46,9 +30,7 @@
 #include "sfm/map/Bundle.h"
 #include "i18n/catalog/Sfm.h"
 #include "sfm/map/CorrespondenceGraph.h"
-// For alignByStructure: the similarity two models' shared points determine, and
-// the pixel scoring it is judged by, are the merger's (D70). Merge.h does not
-// include this header, so there is no cycle.
+// 结构对齐复用 Merge.h 的相似变换与像素评分；Merge.h 不包含本文件，因此无循环依赖。
 #include "sfm/map/Merge.h"
 #include "sfm/map/Profile.h"
 #include "core/Env.h"
@@ -56,316 +38,125 @@
 namespace sfm {
 
 struct MapperOptions {
-    double focal = 0;                  // 0 = COLMAP default (1.2 * max dim)
-    // Every pixel threshold below is in *extraction* pixels -- the frame the
-    // keypoints were measured in, not the frame they are stored in. They are
-    // the same thing unless the extractor downscaled; Camera::pixel_scale is
-    // the conversion, and it keeps `--max-error 4` meaning one thing across
-    // quality presets and across a mixed-resolution capture (D47).
-    double max_reproj_error = 3.0;     // extraction px (see above; D47)
+    double focal = 0;                  // 0 使用 COLMAP 的 1.2*最大尺寸猜测
+    // 下列像素阈值均以提取分辨率定义，由 Camera::pixel_scale 换算，保证质量预设和混合分辨率下含义一致（D47）。
+    double max_reproj_error = 3.0;     // 提取像素单位（D47）
     double min_tri_angle_deg = 1.5;
-    // Seed acceptance (D36): thresholds are COLMAP's IncrementalMapper
-    // defaults. If no candidate pair passes, initialize() relaxes them
-    // stepwise rather than failing outright.
-    double init_min_tri_angle_deg = 16.0;   // median angle over the seed points
+    // 种子接受阈值参考 COLMAP；无候选通过时 initialize 逐步放宽。
+    double init_min_tri_angle_deg = 16.0;   // 种子点三角化角度的中位数
     int init_min_inliers = 100;
-    double init_max_forward_motion = 0.95;  // |baseline . viewing dir| cap
-    // Registration gates: the ratio is COLMAP's abs_pose_min_inlier_ratio; it
-    // rejects an image whose hundreds of 2D-3D correspondences agree only by
-    // accident. The inlier count stays at 15 (COLMAP uses 30): sparse-match
-    // sets live on 15-25 inlier registrations, and the transactional
-    // refinement now catches the ones that turn out toxic (D36).
+    double init_max_forward_motion = 0.95;  // |基线·视线方向| 的上限
+    // PnP 同时要求内点比例，最少内点保留 15，以支持只有 15–25 内点的稀疏匹配，后续事务式精化负责拒绝有害配准（D36）。
     int min_num_pnp_inliers = 15;
     double min_pnp_inlier_ratio = 0.25;
-    // ... measured over the correspondences the pose could *possibly* explain,
-    // not over every one offered (D69). A correspondence whose 3D point falls
-    // behind the camera or outside the frame is not evidence against the pose;
-    // it is evidence the pool contains points this view does not see, which a
-    // dense capture of one room produces in bulk -- images looking at the far
-    // wall match images looking back, and their points sit behind. Counting
-    // those in the denominator is what makes an entirely sound registration
-    // fail COLMAP's 0.25.
-    //
-    // It is deliberately *not* a licence to ignore competing places: a wrong
-    // pose in a similar-looking room projects its rival's points in front of
-    // the camera and inside the frame, so they stay in the denominator and the
-    // gate still refuses. That is the distinction the raw inlier count could
-    // not make -- admitting on absolute support alone recovered 48 images and 8
-    // points of AUC on a 1146-image room capture and cost 20 points on a
-    // 7620-image capture that is half building interior.
+    // 内点比例分母仅统计位姿可能解释的对应：相机后方或视野外的点不构成反证，重复房间的竞争点仍在前方、视野内（D69）。
+    // 仅靠绝对数量在 1146 图房间多配 48 图、提升 8 分 AUC，却使 7620 图室内混合数据损失 20 分，因此必须保留有效比例判据。
     bool pnp_ratio_visible_only = true;
-    // Off, and measured: absolute support as a *substitute* for the ratio --
-    // admit any consensus of this many correspondences however small a share of
-    // the pool it is -- cannot tell the two reasons a pool is large apart. It
-    // recovered 48 images and 8 points of AUC@10 on a 1146-image room capture
-    // and cost 20 points on a 7620-image capture that is half building
-    // interior, where it walked one incremental model from 2816 to 5379 images
-    // straight through the interior and came back warped (median absolute
-    // rotation error 4.1 deg against 0.6). The rival test below was added to
-    // separate them and did not: it fired 91 times there and the capture got
-    // worse still. What does separate them is the denominator, above.
+    // 默认禁用以绝对支持替代内点比例；7620 图模型曾从 2816 增至 5379 图，却使绝对旋转中位误差从 0.6 增至 4.1 度、AUC 降 20 分。
+    // 竞争位姿检查触发 91 次仍未修复，真正区分冗余与歧义的是可解释对应的分母。
     int strong_pnp_inliers = 0;
-    // ... and that support has to be *unambiguous*, which is the other half of
-    // the same observation. A pool is large for two opposite reasons. A dense
-    // capture of one room offers the same place from twenty views, so the pool
-    // is redundant and the ratio gate is mis-reading it. A building of similar
-    // rooms offers places the image is not, so the pool is ambiguous and the
-    // ratio gate is doing exactly its job. Absolute support cannot tell those
-    // apart, and admitting the second is how a room ends up somewhere else:
-    // measured, a 7620-image capture whose primary model grew from 2816 to 5379
-    // images in one pass and came back with a median absolute rotation error of
-    // 4.1 deg against 0.6, and 20 points less AUC@10.
-    //
-    // What tells them apart is whether a *second* pose explains the
-    // correspondences the winner rejected. In a redundant pool those are noise
-    // and nothing fits them; in an ambiguous one they are the other room. A
-    // rival this large relative to the winner means the image has two plausible
-    // places, and two plausible places is not evidence -- so the ratio gate
-    // stands. 0 skips the test.
+    // 绝对支持还需排除竞争位姿：对最佳解拒绝的对应寻找第二解，若其支持相对最佳解过大，则保留比例限制。
+    // 0 跳过；该检查不足以单独补救绝对支持放行，相关失败测量见上方。
     double strong_pnp_max_rival = 0.5;
-    int max_reg_trials = 3;            // per image, COLMAP's default
-    // Rank the next image by how well its supported features are spread over
-    // the frame (Mapper::pyramidSet) rather than by their raw count. Off is
-    // the pre-existing count ranking.
+    int max_reg_trials = 3;            // 逐图像上限，参考 COLMAP
+    // 下一图按支持特征的金字塔空间分布排序，关闭时仅按数量排序。
     bool rank_by_visibility = true;
-    // A seed retry starts somewhere no earlier attempt reached (D58). Off is
-    // the pre-D58 behaviour, where retries could re-seed inside what the last
-    // attempt registered and rebuild it. Exists to be turned off when
-    // attributing a change: it decides which seed every model is built on, so
-    // it moves results that have nothing to do with the retry loop.
+    // 种子重试避开先前尝试已覆盖区域，减少重复重建；改变种子会影响整条重建轨迹，提供开关便于归因（D58）。
     bool seed_blocking = true;
-    // Focal search when a camera group registers its first image and its focal
-    // is still the 1.2*max_dim guess (D18). COLMAP solves this with a P4Pf
-    // minimal solver; a log-spaced sweep of P3P hypotheses is the cheaper
-    // equivalent, and the ratio bounds are COLMAP's.
-    int min_model_size = 10;           // COLMAP's default; smaller -> retry the seed
-    // Re-decide planar-or-panoramic on a seed candidate's own inliers, rather
-    // than taking verification's verdict (`config`) as it stands.
-    //
-    // It looks redundant -- only pairs verification labelled `Uncalibrated`
-    // are ever offered as seeds (initializeAttempt filters on it) -- and it is
-    // ~90% of the seed search, which was a third of the atom phase. It is not
-    // redundant. Verification judges the *putative* matches; this judges the
-    // inliers that survived, and the two disagree often enough to matter: over
-    // five captures, turning it off cost 2.2 mean AUC@10 and saved nothing
-    // overall (a 1322-image capture fell 9.3 points, an 896-image one 2.3,
-    // while the atom-phase time it saved came back downstream).
+    // 相机组首次配准且焦距仍为几何猜测时，按对数比例扫描 P3P 焦距假设，近似替代 P4Pf，比例范围参考 COLMAP（D18）。
+    int min_model_size = 10;           // 小于此规模时重试种子
+    // 在种子自身内点上重判平面/全景虽占搜索约 90%，但禁用后五组平均损失 2.2 分 AUC@10，1322 图下降 9.3 分，省时被下游抵消，因此保留。
     bool seed_homography = true;
-    // Stop retrying seeds once a model is both >= min_model_size and covers
-    // this fraction of the images. Below that the model is "a" reconstruction
-    // but not "the" reconstruction, and another seed is usually worth the time.
+    // 模型同时达到最小图像数和覆盖比例时停止种子重试，否则其他种子通常值得尝试。
     double min_model_fraction = 0.5;
-    int max_init_trials = 8;           // seed attempts before keeping the best
-    // Multiple models (D41). A capture that does not form one connected view
-    // graph -- two ends of a building with nothing joining them, a sequence
-    // broken by a featureless corridor -- yields several reconstructions, and
-    // there is no correct way to fuse them without knowing the transform
-    // between them. COLMAP's answer is to emit them all as sparse/0, sparse/1,
-    // ... for a later merge step, and this matches it:
-    //   * the primary model is still the best of max_init_trials seed attempts
-    //     (D19) -- unchanged, so a scene that reconstructs as one model behaves
-    //     exactly as before;
-    //   * afterwards, seeds are searched among images no kept model registered
-    //     (COLMAP FindFirstInitialImage's num_registrations == 0 rule) and each
-    //     resulting model is kept if it brings min_model_size images no kept
-    //     model reached;
-    //   * a sub-model may re-register images an earlier model already holds --
-    //     that overlap is what a later merge aligns on -- for as long as it is
-    //     still finding images nothing holds (max_model_overlap and
-    //     model_overlap_ratio below).
-    // max_num_models 1 restores single-model output.
-    int max_num_models = 50;           // COLMAP's default
-    // What a growth pass may take from models already kept. COLMAP stops at an
-    // absolute count because it never merges two models, so everything a second
-    // model re-registers is waste. Here it is the opposite: overlap is the only
-    // evidence a merge has, and a component cut off from its neighbour the
-    // moment it touches it can neither cover its own territory nor align with
-    // anything (D66). So the count is a floor -- what a Sim(3) needs -- and past
-    // it a pass earns one shared image for every `model_overlap_ratio` images
-    // it finds that nothing else holds. Ratio 0 restores COLMAP's rule.
-    //
-    // Measured on a 7620-image capture, where this rule fired 17 times and the
-    // sub-models it stopped averaged 100 images against a region several
-    // hundred wide.
-    int max_model_overlap = 20;        // COLMAP's default
+    int max_init_trials = 8;           // 保留最佳模型前的种子尝试上限
+    // 随后仅在未覆盖图像中播种子模型，允许合并所需重叠但必须带来新增覆盖；各模型独立输出，max_num_models=1 限制单模型（D41）。
+    int max_num_models = 50;           // COLMAP 默认模型数上限
+    // 共享图像预算以绝对数量为下限，新增覆盖可按 model_overlap_ratio 换取额外重叠；7620 图数据纯绝对限制曾停止 17 次，子模型平均仅 100 图（D66）。
+    int max_model_overlap = 20;        // COLMAP 默认值
     double model_overlap_ratio = 1.0;
-    // Total seed attempts the further-models search may spend, counting the
-    // ones discarded for being under min_model_size (COLMAP's init_num_trials,
-    // same role and same default). Without it a dataset whose leftovers are
-    // dust keeps seeding two-image models until the candidate pair list runs
-    // out, which on a 2000-image scene is tens of thousands of attempts.
+    // 后续模型的总种子预算包含因太小而丢弃的尝试；否则残余噪声会不断生成双图模型，千图数据可尝试数万次。
     int max_model_trials = 20;  // 200
-    int focal_search_samples = 15;     // 0 disables the search
+    int focal_search_samples = 15;     // 0 禁用搜索
     double min_focal_ratio = 0.1, max_focal_ratio = 10.0;
-    // Focal bootstrap (D48), for the captures where bundle adjustment cannot
-    // recover the focal from the 1.2*max_dim guess: rotation-degenerate motion
-    // (a dashcam, a dolly, a rail scan) and genuinely wide lenses. See
-    // bootstrapFocalLength. 0 = off; the descent usually stops after 1-2.
+    // 焦距初始化用于旋转退化或真实广角数据，避免 BA 无法摆脱 1.2*max_dim 猜测；0 禁用，通常下降一至两级即停止（D48）。
     int focal_trials = 5;
-    // Relative gain in mutually consistent observations that justifies moving
-    // the focal. The guess is at least a *consistent* place to start and a young
-    // model's observation count is a noisy statistic, so a hypothesis a few
-    // percent ahead of it has shown nothing. Measured separations are far
-    // larger on a few real-world datasets.
+    // 只有共同一致观测的相对增益足够大才改变焦距；年轻模型的观测数噪声较大，几百分点改善不足以支持替换一致初值。
     double focal_min_gain = 0.15;
-    size_t focal_model_size = 20;      // images per trial model
-    // Reported, not a gate: the orientation spread below which the focal is a
-    // free parameter of the reconstruction, so a bad one leaves no trace in the
-    // residual. A straight KITTI drive spans 8.5 deg over 114 frames; the
-    // tightest ordinary capture measured (mip-NeRF 360 garden's first 20 images,
-    // one corner of an object orbit) spans 32.
+    size_t focal_model_size = 20;      // 每个试探模型的图像预算
+    // 姿态离散度仅报告，不作门限；114 帧直行 KITTI 跨 8.5 度，普通 garden 前 20 图仍跨 32 度，体现可观性差别。
     double focal_max_rot_spread_deg = 15.0;
-    // Global-refinement cadence and image filtering (D36; D38). COLMAP's
-    // trigger ratio, kept: D37's 1.25 measured fine on easy sets but cost
-    // registration + pose accuracy on a real-world dataset -- fewer refine rounds
-    // means fewer retriangulation passes, exactly the machinery D36 added for
-    // such sets. Speed comes from convergence-adaptive iterations + the
-    // persistent solver instead (D38).
-    double ba_growth_ratio = 1.1;      // COLMAP ba_global_images_ratio
-    int ba_max_refinements = 5;        // final pass; growth passes use 2
-    double ba_refine_change = 0.0005;  // stop when changed-obs fraction is below
-    // Growth-phase BAs stop when relative cost improvement stays below
-    // ba_growth_rtol for ba_growth_patience accepted steps (D38): iteration
-    // count adapts to convergence -- a shaky young model keeps iterating, a
-    // converged large one stops after a few -- replacing D37's fixed
-    // iteration cap, which starved exactly the models that still needed work.
-    // Final passes keep the solver's tight defaults. 0 = solver default.
+    // 沿用 COLMAP 的全局精化触发频率；增长比例放宽至 1.25 会减少重三角化并损害困难数据覆盖，速度应由自适应收敛与持久上下文获得（D36/D38）。
+    double ba_growth_ratio = 1.1;      // COLMAP 的 ba_global_images_ratio
+    int ba_max_refinements = 5;        // 最终精化轮数，增长阶段使用两轮
+    double ba_refine_change = 0.0005;  // 观测变化比例低于此值时停止精化
+    // 增长 BA 在相对收益连续 ba_growth_patience 次低于 ba_growth_rtol 时停止，最终阶段保持严格，0 表示求解器默认（D38）。
     double ba_growth_rtol = 1e-4;
     int ba_growth_patience = 5;
-    // Whether the *final* refinement is one of those tight passes. It is for a
-    // mapper that owns the answer. It is not for a bottom-up atom: the model it
-    // finishes is re-solved jointly the moment the atom phase ends, and again at
-    // every merge level above it, so converging a forty-image model to the
-    // solver's full tolerance is work thrown away three times over.
+    // 最终结果使用严格精化；原子结束后还会联合及逐层重算，不必在小模型上反复收敛到最高精度。
     bool ba_final_tight = true;
-    // Reprojection acceptance for retriangulation/track completion, as a
-    // fraction of max_reproj_error (the churn hysteresis); 0 disables the
-    // retriangulation pass entirely.
+    // 重三角化与轨迹补全的误差阈值为 max_reproj_error 的比例，形成滞回；0 完全禁用。
     double retri_scale = 0.75;
-    // Fuse two 3D points a correspondence says are the same feature
-    // (Mapper::mergeTracks). Off is the pre-existing behaviour: creation-only
-    // tracks, which fragment wherever a point was triangulated twice before the
-    // pose joining the two halves existed. Measured worth 13 images and 2.4
-    // AUC@5 on a 1146-image capture, at the cost of the solver time longer
-    // tracks bring -- which kMergeMaxTrack is what bounds.
+    // 合并对应关系指向同一特征的重复三维点；1146 图测量多恢复 13 图、提升 2.4 分 AUC@5，轨迹变长的求解成本由 kMergeMaxTrack 限制。
     bool merge_tracks = true;
-    // Auditing an assembled model (D44). An image is put back only when the
-    // structure it did *not* bring supports a competing pose: one that clears
-    // the registration gates, explains `audit_alternative_factor` times as
-    // many of those correspondences as the current pose does, and points
-    // somewhere else. The evidence floor keeps the test off images the model
-    // barely sees, where a lucky RANSAC on 20 stray correspondences would
-    // otherwise unseat a perfectly good pose.
+    // 审查只在图像未参与建立的结构支持明显更强且位置不同的替代位姿时撤销原配准；证据下限防止少量随机对应误移正确相机（D44）。
     int audit_min_evidence = 40;
     int audit_min_alternative = 25;
     double audit_alternative_factor = 3.0;
     double audit_min_rotation_deg = 5.0;
-    // ... or a camera-center shift of this fraction of the model's own scale
-    // (the RMS spread of its camera centers), which is what catches an image
-    // that kept its orientation and moved.
+    // 相机中心位移超过模型 RMS 尺度的此比例也算位姿变化，用于捕获方向相同但位置错误的图像。
     double audit_min_shift_frac = 0.01;
     int audit_ransac_trials = 1000;
-    int min_image_points = 5;          // de-register images that fall below this
-    double max_extra_param = 1.0;      // |distortion param| beyond this = bogus
-    CamModel camera_model = CamModel::Radial;  // distortion model for new cameras (D29)
-    // Starting intrinsics per camera id, built by sfm/core/CameraSetup.h from
-    // --camera-model / --focal / EXIF (D46). A camera with no entry here falls
-    // back to Camera::defaultFor(focal, camera_model), the old behaviour, so
-    // the self-tests and any library caller are unaffected.
+    int min_image_points = 5;          // 图像支持低于此值时撤销配准
+    double max_extra_param = 1.0;      // 畸变参数绝对值超过此值视为异常
+    CamModel camera_model = CamModel::Radial;  // 新相机的畸变模型（D29）
+    // 逐 ID 初始内参来自 CameraSetup，缺项回退 defaultFor，使测试与库调用方保持默认行为（D46）。
     std::map<uint32_t, Camera> initial_cameras;
-    // Cameras whose focal came from a *per-group* prior (EXIF, or a --focal
-    // that named the group) rather than a guess. The registration focal sweep
-    // leaves these alone; a dataset-wide --focal is not in here, deliberately,
-    // because it says nothing about which group it describes (D45/D46).
+    // 组级 EXIF 或显式组焦距先验禁止逐图焦距扫描；全局焦距不归入此集合，因为它未指明适用镜头（D45/D46）。
     std::set<uint32_t> known_focal_cameras;
-    // Cameras whose focal was *supplied* -- a per-group prior, EXIF, or a
-    // dataset-wide --focal (CameraSetup::focal_given). Superset of the above.
-    // The focal bootstrap only searches cameras outside it: a supplied focal may
-    // be worth refining, but it is never worth replacing with a guess (D48).
+    // 所有给定焦距，包括组级、EXIF 和全局值，均跳过初始化替换；可优化给定值，但不能改成几何猜测（D48）。
     std::set<uint32_t> given_focal_cameras;
-    // Cameras whose focal the two-view stage *measured* (D53's epipolar vote,
-    // or the fisheye peripheral-inlier search). Not a prior in the sense above:
-    // the bootstrap still builds its probe model, because the probe's bundle
-    // adjustment refines the value and a refined measurement beats a raw one.
-    // What it does skip is the halving ladder, which exists to escape a guess
-    // that is wrong by a factor and has nothing to offer a measurement.
+    // 双视图测量值仍用试探模型的 BA 精化，但跳过为摆脱成倍错误猜测设计的减半阶梯（D53）。
     std::set<uint32_t> measured_focal_cameras;
-    std::string ba_loss = "huber";     // robust loss for mapping-time BA (D36)
-    // Linear solver for the reduced camera system; see BundleOptions::solver.
+    std::string ba_loss = "huber";     // 建图 BA 的稳健损失（D36）
+    // 约化相机系统线性求解器参见 BundleOptions。
     std::string ba_solver = "auto";
-    double ba_loss_param = 2.0;        // Huber delta / Cauchy c, in extraction px
-    // Let BA move each camera's principal point off the image centre. Off, as
-    // in COLMAP: it is nearly the same parameter as a camera rotation, so on a
-    // rig its per-group drift lands in the relative orientation of the lenses
-    // (D50). See BundleOptions::refine_principal_point.
+    double ba_loss_param = 2.0;        // Huber delta/Cauchy c，提取像素单位
+    // 默认固定主点，避免各相机组主点漂移表现为 rig 镜头相对旋转误差（D50）。
     bool refine_principal_point = false;
-    // Release it for one global bundle adjustment at the very end, when the
-    // model is complete -- COLMAP's documented advice, and a different question
-    // from refining it *during* reconstruction (D51). `Mapper::polish` is what
-    // runs it; the CLI drives that, not the mapper's own loop.
-    size_t pp_min_images = 20;   // ... for groups with at least this many images
-    // Let BA move the distortion coefficients during reconstruction. On, as in
-    // COLMAP; off holds them at the camera setup's value -- zero, or what
-    // --distortion gave them -- and leaves them to the finishing pass (D72).
+    // 最终完整模型可单独释放主点做一次全局 BA，由 CLI 调用 polish，而非增长循环执行（D51）。
+    size_t pp_min_images = 20;   // 释放主点所需的组内最少图像数
+    // 建图默认优化畸变，关闭则固定到初始值并留待收尾（D72）。
     bool refine_extra_params = true;
-    // Scalar the solver computes in (sfm/ba/README.md "Scalar configs"). "df"
-    // is an fp32 pair with a ~49-bit significand, which on hardware whose fp64
-    // rate is a small fraction of its fp32 rate -- every consumer card -- can be
-    // the faster way to the same answer.
+    // 求解器算术类型；df 用两个 fp32 提供约 49 位有效精度，在 fp64 吞吐较低的硬件上可能更快。
     std::string ba_real = "double";
-    // ... and the scalar for solves whose answer is provisional: a growth-phase
-    // refinement, or a merge-tree level that another level will re-solve. Those
-    // only need a step good enough to register and filter against, and fp32
-    // halves the bytes every kernel moves -- worth 25-35% of the mapping stage.
-    //
-    // It is nonetheless **double by default**, because fp32 there costs both
-    // accuracy and reproducibility. The Schur and Jacobian kernels accumulate
-    // with floating-point atomics, whose execution order is arbitrary; at fp64
-    // the resulting perturbation (~1e-16) never crosses a decision threshold
-    // and the whole pipeline is reproducible run to run, while at fp32 (~1e-7)
-    // it crosses them constantly. Measured over three identical runs each: a
-    // 379-image capture scored 96.1 AUC@10 every time in fp64 and 96.5 / 92.3 /
-    // 91.5 in fp32; an 896-image one 88.3 / 87.7 / 88.0 against 85.2 / 87.5 /
-    // 87.1. Not just noisier -- worse on average, by 2.7 and 1.4 points.
+    // 中间求解也默认 double，虽然 fp32 可节省约 25–35% 建图时间，但原子累加约 1e-7 的扰动会越过决策阈值。
+    // 379 图三次 fp64 的 AUC@10 均为 96.1，fp32 为 96.5/92.3/91.5；896 图为 88.3/87.7/88.0 对 85.2/87.5/87.1，平均分别损失 2.7/1.4 分。
     std::string ba_real_coarse = "double";
     int device = -1;
-    // Canonical uuid:<hex>; every BA this mapper runs carries it. "" = shared
-    // precedence.
+    // 各次 BA 共用规范 uuid:<hex>，空值沿用设备选择优先级。
     std::string device_selector;
-    // Host worker threads for the passes that fan out over points
-    // (filterPoints) and for a bundle adjustment that runs on the host.
-    // 0 = hardware_concurrency.
+    // 逐点处理与 CPU BA 的主机线程数，0 使用 hardware_concurrency。
     int threads = 0;
     bool verbose = true;
-    // Whether this mapper speaks for the run: it writes the snapshot a front
-    // end draws and counts its registrations towards the bar. False for an
-    // atom's private mapper, which is neither (sfm/map/Atoms.h).
+    // 是否代表整次运行输出快照与累计进度；原子私有 Mapper 应关闭。
     bool report_progress = true;
-    // Rigs (sfm/core/Rig.h). `use_rigs` off ignores the table entirely;
-    // `refine_rigs` off holds every member extrinsic at its calibration.
+    // use_rigs 关闭时忽略装置表，refine_rigs 关闭时固定已标定外参。
     bool use_rigs = true;
     bool refine_rigs = true;
-    // Register a rig-mate on the rig's word alone when it has too few 2D-3D
-    // correspondences to be judged: a lens on the sky or the operator gets its
-    // pose from the frame, which is the coverage a rig is for.
+    // 成员对应不足时允许仅由 rig 推断位姿，覆盖朝天或朝向操作者等缺少场景特征的镜头。
     bool rig_complete_blind = true;
     RigCalibOptions rig_calib;
-    // Sequences (sfm/core/Sequence.h, D79): two images this many positions
-    // apart along one are neighbours, and a neighbour's correspondences are
-    // trusted before the rest of the model's. The matcher's `--overlap`.
+    // 序列位置距离在此窗口内的图像视为邻居，其对应优先可信；对应匹配 overlap（D79）。
     int sequence_window = 2;
-    // Sensor priors (sfm/core/PriorSource.h): a registration turned more than
-    // this (or three sigma of the prior) off what a placed neighbour and the
-    // gyro predict is re-solved with the rotation fixed, or refused.
+    // 配准旋转偏离已放置邻居与陀螺预测超过阈值或三倍 sigma 时，固定旋转重新求解或拒绝。
     bool use_priors = true;
     double prior_rot_tol_deg = 2.0;
 };
 
 class Mapper {
 public:
-    // `camera_ids[i]` is the (1-based) camera image i belongs to (empty = one
-    // shared camera, D17). `rigs` (sfm/core/Rig.h) and `seqs` (sfm/core/Sequence.h)
-    // are optional, must outlive the mapper, and number images as this database does.
+    // camera_ids 为从 1 开始的相机组 ID，空值表示共享相机；rigs/seqs 使用数据库图像编号且生命周期长于 Mapper。
     Mapper(const MatchesDatabase& db, const std::vector<FeatureSet>& feats, MapperOptions opt,
            std::vector<uint32_t> camera_ids = {}, const RigTable* rigs = nullptr,
            const SequenceTable* seqs = nullptr, PriorSource* priors = nullptr)
@@ -378,13 +169,13 @@ public:
     const SequenceTable* sequences() const { return seq_; }
     PriorSource* priors() const { return priors_; }
 
-    // What the sensors did over the run, for the summary line.
+    // 传感器作用统计，供摘要显示。
     struct PriorStats {
-        uint32_t corrected = 0;   // registrations re-solved with the gyro's rotation
-        uint32_t refused = 0;     // ... refused because that found nothing
-        uint32_t vouched = 0;     // audits the neighbours' rotation settled
-        uint32_t seeds = 0;       // seed pairs posed with the gyro's rotation
-        size_t rotations = 0, ups = 0, centres = 0;   // factors in the last solve
+        uint32_t corrected = 0;   // 使用陀螺旋转重解的配准数
+        uint32_t refused = 0;     // 重解无有效结果而拒绝的数量
+        uint32_t vouched = 0;     // 由邻居旋转决定的审查次数
+        uint32_t seeds = 0;       // 使用陀螺旋转定位的种子对数
+        size_t rotations = 0, ups = 0, centres = 0;   // 最近一次求解的因子数
     };
     PriorStats priorStats() const {
         PriorStats st = prior_stats_;
@@ -393,27 +184,14 @@ public:
         return st;
     }
 
-    // All reconstructions the dataset supports, largest first (by 3D point
-    // count -- COLMAP's ReconstructionManager::Write ordering, so models[0] is
-    // what lands in sparse/0). Never empty in practice: a dataset that seeds at
-    // all yields at least one model, and one that does not yields a single
-    // empty reconstruction so callers have something to report on.
+    // 输出全部模型并按三维点数降序，首项写 sparse/0；即使完全无法播种也返回一个空模型供错误报告。
     std::vector<Reconstruction> run() {
         auto prof_start = std::chrono::steady_clock::now();
         ensureSetup();
         std::vector<Reconstruction> models;
 
-        // ---- phase 1: the primary model, best of max_init_trials seeds ----
-        // A reconstruction is only as good as its seed: the densest verified
-        // pair can sit in a small corner of the view graph, and then the model
-        // stops after a handful of images with no way to notice. COLMAP's
-        // answer is to discard a model smaller than `min_model_size` and start
-        // again from the next candidate seed; we keep the largest attempt (D19)
-        // -- and, since D41, *all* the attempts, because on a fragmented
-        // capture the rejected ones are exactly the other components. They are
-        // admitted below rather than rebuilt from scratch.
-        // Before anything is built on it: is the focal something this capture
-        // can actually determine? (D48; a no-op unless it cannot.)
+        // ---------------- 阶段一：多种子尝试中的主模型 ----------------
+        // 先检查焦距可观性并初始化，再尝试不同种子，保留可带来新增覆盖的结果，避免从头重建已发现的分量（D19/D41/D48）。
         {
             ProfTimer pt(g_map_prof.init_seed);
             ProfTimer pb(g_map_prof.bootstrap);
@@ -422,7 +200,7 @@ public:
 
         std::vector<Reconstruction> attempts;
         size_t seed_from = 0;
-        seeded_.clear();  // seed blocking is a device of this loop alone (D58)
+        seeded_.clear();  // 种子屏蔽仅在此重试循环内有效（D58）
         for (int attempt = 0; attempt < std::max(1, opt_.max_init_trials); attempt++) {
             cancel::check();
             resetModel();
@@ -435,7 +213,7 @@ public:
                 if (opt_.verbose && attempt == 0) reportInitFailure();
                 break;
             }
-            globalRefine(false);  // COLMAP's two-view BA before any growth
+            globalRefine(false);  // 增长前执行双视图 BA，与 COLMAP 一致
             grow();
             uint32_t reg = rec_.numRegistered();
             if (reg) {
@@ -451,20 +229,13 @@ public:
         }
         seeded_.clear();
         if (attempts.empty()) {
-            // Nothing seeded at all. Hand back one empty reconstruction so the
-            // caller has a model to report on, as before D41.
+            // 无法播种时返回空重建，供调用方报告失败。
             resetModel();
             models.push_back(snapshotModel());
             return finishRun(models, prof_start);
         }
 
-        // Largest attempt first, so the primary model is the one D19 would have
-        // returned; each further attempt is admitted only if it brings images the
-        // ones before it did not. Seeds land in the same component all the time,
-        // and writing three views of one component as three models would be worse
-        // than useless -- but an attempt that *overlaps* one already kept and
-        // still covers new ground is the other half of a capture, not a copy of
-        // this one, and admitModel keeps it (D66).
+        // 最大的尝试作为主模型，其余仅在新增覆盖足够时接纳；允许有助于后续合并的重叠，拒绝纯副本（D66）。
         std::stable_sort(attempts.begin(), attempts.end(),
                          [](const Reconstruction& a, const Reconstruction& b) {
                              return a.numRegistered() > b.numRegistered();
@@ -482,49 +253,23 @@ public:
             models.push_back(std::move(attempts[i]));
         }
 
-        // ---- phase 2: further models from whatever is still unclaimed ----
-        // Seeds come only from images no kept model registered, so this does
-        // nothing at all when the primary model covers the dataset -- a
-        // single-component capture takes the pre-D41 path exactly.
+        // ---------------- 阶段二：未覆盖区域的附加模型 ----------------
+        // 仅从尚未被保留模型配准的图像播种，全部覆盖时不执行。
         seedFurtherModels(models);
         return finishRun(models, prof_start);
     }
 
-    // ---- the engine, driven from outside (D44) ----------------------------
-    //
-    // run() is one policy over these; the assembler (sfm/map/Assemble.h) is
-    // another, and a bottom-up hierarchical mapper would be a third. They all
-    // need the same three operations on an *existing* model, which is why they
-    // are public: keep growing it, refine it, or look for more models beside
-    // it. Every one of them starts by adopting the model into `rec_`, so the
-    // mapper never has to have built it itself -- it may equally have come off
-    // disk or out of a merge.
+    // ---------------- 外部调度接口（D44）----------------
+    // 对已有模型提供增长、精化与继续播种，先将其接入 rec_；模型可来自磁盘、合并或其他调度器。
 
     struct GrowStats {
         uint32_t before = 0, after = 0;
-        uint32_t registered = 0;   // images this pass brought in
-        bool refined = false;      // whether a final refinement ran
+        uint32_t registered = 0;   // 本轮新配准图像数
+        bool refined = false;      // 是否运行最终精化
     };
 
-    // Adopt `m` and keep registering into it until nothing else fits. An image
-    // another model holds is a legitimate target here -- the overlap it creates
-    // is what lets the two models merge afterwards (D43) -- bounded by
-    // `overlapBudget`, so the pass may keep taking them while it is still
-    // finding images of its own. Pass the other models in `others` to get that
-    // bound; with `others` empty the pass is unbounded, and on a fragmented
-    // capture that means every model re-registers the whole dataset before the
-    // redundant ones are dropped again, which is several full reconstructions'
-    // worth of work for nothing.
-    //
-    // A pass that registers nothing returns `m` untouched -- not a re-refined
-    // copy of it. That is what makes the manager's grow round free on a
-    // dataset it cannot help: no BA runs, no numbers move.
-    // `max_reg` caps the size the model may reach (0 = grow until nothing
-    // registers). The overlap bound above only limits images *another model*
-    // holds; images nothing covers are unbounded, so a model beside a large
-    // uncovered region grows into all of it. That is a full reconstruction, and
-    // a caller that wanted a bridge rather than a reconstruction needs to say
-    // so.
+    // 接入模型后继续增长，others 提供已有覆盖以限制重复配准，同时允许建立合并所需重叠；为空则不设重叠边界。
+    // max_reg 另限模型总大小，0 不限制；没有新增配准时原样返回，不执行无收益 BA。
     Reconstruction continueFrom(const Reconstruction& m, GrowStats* out = nullptr,
                                 const std::vector<const Reconstruction*>& others = {},
                                 uint32_t max_reg = 0) {
@@ -550,26 +295,10 @@ public:
         return snapshotModel();
     }
 
-    // ---- aligning two models that share no image (D70) --------------------
-    //
-    // A building walked room by room reconstructs as a model per room, and two
-    // of them can see the same doorway without either registering a single
-    // image the other did: alignReconstructions has nothing to fit, and the
-    // pair is never even proposed as a merge candidate. Measured on a
-    // 7620-image capture half of which is a building interior, the two largest
-    // models -- 5474 and 474 images -- shared fewer than three.
-    //
-    // The correspondence graph knows better. Two images matched and were
-    // verified long before any model existed; if one model triangulated the
-    // matched feature on one side and the other model triangulated it on the
-    // other, that is one 3D point expressed in two gauges. Enough of them
-    // determine the similarity between the gauges, and the merge that follows
-    // is the ordinary one, judged by every ordinary test.
+    // ---------------- 无共同图像的模型对齐（D70）----------------
+    // 两个模型可从不同图像看到同一结构，如 7620 图数据的 5474/474 图模型共同图像不足三张；对应图中的匹配三维点可提供跨规范的相似变换。
 
-    // Model pairs the correspondence graph joins, most evidence first, counted
-    // in matched features rather than pairs: what the alignment consumes is
-    // correspondences, and two images with 400 matches are worth more than ten
-    // with twenty.
+    // 按连接模型的特征对应数排序候选，而非按图像对数量，反映对齐实际使用的证据。
     struct StructureLink {
         size_t a = 0, b = 0;
         size_t matches = 0;
@@ -596,7 +325,7 @@ public:
             if (kv.second < min_matches) continue;
             out.push_back({(size_t)(kv.first >> 32), (size_t)(kv.first & 0xffffffffu), kv.second});
         }
-        // Deterministic: the hash order is unspecified, so a total order first.
+        // 先构造全序，消除哈希遍历顺序的不确定性。
         std::sort(out.begin(), out.end(), [](const StructureLink& x, const StructureLink& y) {
             return x.a != y.a ? x.a < y.a : x.b < y.b;
         });
@@ -607,19 +336,16 @@ public:
         return out;
     }
 
-    // The similarity taking `src`'s world onto `dst`'s, fitted to points both
-    // triangulated. Scored in pixels like every other alignment here: the src
-    // point is carried into dst's gauge and has to reproject where dst's own
-    // image saw its partner, which is a test the fit itself never used.
+    // 由两模型三角化的对应点拟合 src 到 dst 相似变换，再按目标观测重投影像素评分。
     AlignmentResult alignByStructure(const Reconstruction& dst, const Reconstruction& src,
                                      const MergeOptions& opt, size_t max_corr = 6000) const {
         AlignmentResult r;
         struct Corr {
-            Vec3 d, s;             // the point in each model's gauge
-            uint32_t img, feat;    // the dst observation that scores it
+            Vec3 d, s;             // 各模型自身规范中的点
+            uint32_t img, feat;    // 用于评分的目标观测
         };
         std::vector<Corr> corr;
-        std::set<std::pair<uint64_t, uint64_t>> seen;  // one vote per point pair
+        std::set<std::pair<uint64_t, uint64_t>> seen;  // 每个点对仅投一票
         for (const TwoViewMatches& p : db_.pairs) {
             for (int flip = 0; flip < 2; flip++) {
                 const uint32_t ia = flip ? p.image2 : p.image1;
@@ -653,10 +379,7 @@ public:
                        " point(s) triangulated by both models";
             return r;
         }
-        // A long walk can produce hundreds of thousands of these, and RANSAC
-        // scores every one of them on every trial. Thinning keeps the spread --
-        // the sample is strided, not truncated, so it is not one end of the
-        // seam.
+        // 候选可达数十万，RANSAC 用跨列表等间隔采样降低评分成本，不能只截取接缝一端。
         if (corr.size() > max_corr) {
             std::vector<Corr> thin;
             thin.reserve(max_corr);
@@ -694,9 +417,7 @@ public:
                        std::to_string(n) + " consistent point(s)";
             return r;
         }
-        // The same inlier-ratio bar the pose alignment applies, on the same
-        // reasoning: a handful of agreeing points out of thousands is a
-        // coincidence between two similar places, not a transform.
+        // 采用与位姿对齐相同的内点比例要求，避免从大量匹配中少量偶合误认相似场景。
         if ((double)rep.num_inliers < opt.min_inlier_ratio * (double)n) {
             r.reason = "only " + std::to_string(rep.num_inliers) + "/" + std::to_string(n) +
                        " shared points agree";
@@ -713,22 +434,8 @@ public:
         return r;
     }
 
-    // Register what this model can still take, by PnP alone (D57).
-    //
-    // No bundle adjustment, no refinement, and it stops as soon as one would be
-    // due. The caller is expected to follow a whole round of these with one
-    // joint refinement over every model (jointRefine), and that is the point: a
-    // level that grows twenty models pays for one solve instead of twenty.
-    // Bundle adjustments on small components were most of what a bottom-up run
-    // spent -- growing 37 models through `continueFrom` cost 8000 solves,
-    // because each refines on its own growth schedule and then audits, and the
-    // audit refines again.
-    //
-    // Only what this pass registered is checked, and a contradicted image is
-    // de-registered rather than repaired: the rest of the model was audited
-    // when it was built or merged, and moving a pose needs exactly the
-    // refinement this call exists to avoid. Dropping an image costs nothing --
-    // a later pass can register it again.
+    // 仅用 PnP 增长，到需要 BA 时立即停止，由调用方对整轮模型执行一次联合优化；37 模型分别完整增长曾耗费 8000 次求解。
+    // 仅检查本轮新增位姿，矛盾者撤销而不现场修复，避免引入本接口要省去的额外精化（D57）。
     Reconstruction growByPnP(const Reconstruction& m, GrowStats* out,
                              const std::vector<const Reconstruction*>& others, uint32_t max_reg,
                              uint32_t* rejected = nullptr) {
@@ -743,7 +450,7 @@ public:
         st.before = rec_.numRegistered();
         st.registered = growLoop(max_reg, /*stop_at_ba=*/true);
         if (st.registered) {
-            modelScale();  // warm the lazy cache poseContradicted reads
+            modelScale();  // 预热 poseContradicted 使用的延迟缓存
             const std::vector<uint32_t> fresh = recent_regs_;
             uint32_t bad = 0;
             for (uint32_t img : fresh) {
@@ -757,28 +464,17 @@ public:
         }
         st.after = rec_.numRegistered();
         if (out) *out = st;
-        if (!st.registered) return m;  // unchanged: hand back the original
+        if (!st.registered) return m;  // 没有变化，返回原模型
         return snapshotModel();
     }
 
-    // Choose the starting intrinsics before any model is built (D48). Part of
-    // run(); public so a bottom-up schedule can do it once over the whole
-    // database, instead of leaving the choice to whichever small piece of the
-    // capture it happens to reconstruct first.
+    // 建模前统一确定初始内参，公开供 bottom-up 在完整数据库上执行，避免由首个小原子决定全局焦距（D48）。
     void bootstrapCameras() {
         ensureSetup();
         bootstrapFocalLength();
     }
 
-    // Adopt and bundle-adjust, with the mapper's own filtering and
-    // de-registration rules. This is what a merged model needs: two halves
-    // glued along a seam that has never been optimized as one.
-    //
-    // `coarse` runs the growth-phase schedule instead of the final one -- two
-    // refinement rounds at the loose tolerance rather than five at the tight
-    // one. For a caller asking a yes/no question about the result (can this
-    // seam be reconciled at all?) the last digits of convergence decide
-    // nothing, and something else optimizes the model properly afterwards.
+    // 接入模型后执行 BA、过滤与撤销配准，以共同优化合并接缝；coarse 使用增长阶段两轮宽松精化，供可修复性判断，最终结果另行严格求解。
     Reconstruction refine(const Reconstruction& m, bool coarse = false) {
         ensureSetup();
         resetModel();
@@ -791,11 +487,7 @@ public:
         return snapshotModel();
     }
 
-    // The same, in place, for a caller that is asking a question rather than
-    // producing an answer: false means the solve did not fit the device and
-    // `m` is untouched. A single model's bundle adjustment cannot be split the
-    // way a joint one can (D65) -- its points are shared across all of it --
-    // so "it does not fit" is a real verdict and the caller has to have one.
+    // 原地试探精化，超设备预算则返回 false 并保持 m 不变；单模型共享点无法像联合问题那样分批。
     bool refineIfItFits(Reconstruction& m, bool coarse = false) {
         ba_over_budget_throws_ = true;
         try {
@@ -812,26 +504,20 @@ public:
         return true;
     }
 
-    // One more global bundle adjustment on a *finished* model, with what the
-    // mapper held now released: the principal point (D51) and the distortion
-    // coefficients (D72). See src/sfm/README.md, "The finishing passes".
+    // 完整模型的额外全局 BA，释放建图期间固定的主点与畸变，见 README 的收尾说明（D51/D72）。
     Reconstruction polish(const Reconstruction& m, bool free_pp = true, bool free_extra = false) {
-        // This run's grouping, not the model's ids: a model read back from disk
-        // carries one camera per frame size (splitCamerasBySize).
+        // 使用本次运行的相机分组；磁盘模型因按尺寸拆分，不能直接用其相机 ID 判断组数。
         std::set<uint32_t> groups;
         for (const auto& kv : m.images)
             if (kv.second.registered)
                 groups.insert(kv.first < cam_ids_.size() ? cam_ids_[kv.first]
                                                         : kv.second.camera_id);
-        // Two groups or more and each principal point drifts its own way; the
-        // difference is a real error in their relative orientation, which on a
-        // dual-fisheye rig cost 21 points of AUC (D51).
+        // 多组主点各自漂移会形成真实相对旋转误差，双鱼眼测量曾因此损失 21 分 AUC（D51）。
         const bool pp = free_pp && groups.size() == 1;
         if (free_pp && !pp && opt_.verbose)
             slog::err(slog::Tag::Map, spirula::i18n::msg::sfm::map_pp_skipped,
                       {(long long)groups.size()});
-        // Releasing what mapping was already refining is a solve that ends
-        // where it started.
+        // 已在建图中优化的参数无需再次释放。
         const bool extra = free_extra && !opt_.refine_extra_params;
         if (!pp && !extra) return m;
         ensureSetup();
@@ -856,9 +542,7 @@ public:
         return snapshotModel();
     }
 
-    // The same finished model with every image on its own intrinsics (D73).
-    // Sharing a camera is what makes a focal observable while the model is
-    // being built; only a complete one can pay for each frame to depart.
+    // 仅完整模型才允许逐图像独立内参；增长阶段共享相机是焦距可观性的来源（D73）。
     Reconstruction perImageIntrinsics(const Reconstruction& m, bool free_extra = true) {
         if (m.numRegistered() < 2) return m;
         ensureSetup();
@@ -873,9 +557,7 @@ public:
         return snapshotModel();
     }
 
-    // One tight refinement of a finished model with every image on its own
-    // pose, the rig calibration set aside: a lens that fired late, or a mount
-    // that flexed, gets to settle where its own observations say.
+    // 最终严格精化可解除 rig 约束，让各图像按自身观测调整，以吸收曝光不同步或支架形变。
     Reconstruction releaseRigs(const Reconstruction& m) {
         if (!rigs_ || m.numRegistered() < 2) return m;
         ensureSetup();
@@ -892,61 +574,26 @@ public:
         uint32_t checked = 0, deregistered = 0, unsupported = 0, reregistered = 0;
     };
 
-    // Ask the correspondence graph whether every image in `m` belongs where
-    // `m` says it does, and move the ones that do not (D44).
-    //
-    // A model assembled from parts -- merged (D43), or stacked up by a
-    // hierarchical mapper -- can place an image somewhere its own observations
-    // still support, because those observations came along with it. What it
-    // cannot fake is the rest of the model: if the structure the image did
-    // *not* bring supports a different pose decisively better (see
-    // poseContradicted), the image is in the wrong place, and no amount of
-    // bundle adjustment will walk it back.
-    //
-    // A contradicted image is moved to the pose that won and re-triangulated
-    // there, rather than deleted. Deleting was tried first and cost 60 images
-    // on one a merge on a dataset: re-registration applies the full
-    // registration gates, including an inlier *ratio* that a misplaced image's
-    // huge junk-dominated correspondence pool cannot meet, so the ones the
-    // audit unseated could not come back. The evidence that selected the new
-    // pose is weaker than registration demands but decisively stronger than
-    // what the old pose had, and the refinement that follows -- BA, filtering,
-    // de-registration of anything hollow -- judges the result under the
-    // ordinary rules.
-    //
-    // Measured on the same dataset: without this, merging models that have
-    // each drifted along a long walk left ~7% of the rig frames (which share
-    // a pose by construction) tens of degrees apart.
-    // `max_reg` caps the size the repair may grow the model to (0 = uncapped).
-    // The repair re-registers the images it moved, and images that could not
-    // register before may be able to now -- but with nothing bounding it that
-    // bonus is a full incremental growth pass hiding inside a repair, at the
-    // repair's cadence rather than the caller's. Measured, one took a model
-    // from 1752 to 3933 images.
+    // 根据图像未参与建立的外部结构寻找明显更好的替代位姿，修复合并或重复结构导致的错位；仅检查自身轨迹无法揭示这种错误（D44）。
+    // 直接移动到胜出位姿并重新关联、三角化，再按普通 BA 和过滤判定；先删除再完整重注册曾损失 60 图，因巨大噪声池无法满足比例门限。
+    // 无审查时某长序列约 7% rig 帧相差数十度；max_reg 限制修复额外增长，避免曾出现的 1752->3933 图隐藏重建。
     Reconstruction audit(const Reconstruction& m, AuditStats* out = nullptr,
                          uint32_t max_reg = 0) {
         ensureSetup();
         resetModel();
         adopt(m);
-        // As in continueFrom: this is not a sub-model being built beside the
-        // others, so the claim bookkeeping (and the overlap break it drives)
-        // must not stop the re-registration loop below.
+        // 这是已有模型修复，不应被子模型已认领集合的重叠限制阻断。
         model_count_.clear();
         rebuildScores();
         AuditStats st;
         std::vector<std::pair<uint32_t, Pose>> repairs;
-        // One RANSAC per registered image at audit_ransac_trials trials is what
-        // a manage round spends its time on, and the test is read-only --
-        // poseContradicted() only looks at the finished model -- so it fans
-        // out. Verdicts are collected by index and applied in image order, so
-        // `repairs` is what the serial loop produced. The dump path stays
-        // serial to keep its per-image lines in order.
+        // 逐图审查只读，可并行运行 RANSAC，再按图像顺序应用修复以保持确定性；逐图诊断输出路径仍串行。
         std::vector<uint32_t> ids;
         for (const auto& kv : rec_.images)
             if (kv.second.registered) ids.push_back(kv.first);
         st.checked = (uint32_t)ids.size();
         auto audit_t0 = std::chrono::steady_clock::now();
-        modelScale();  // warm the lazy cache before any worker reads it
+        modelScale();  // 工作线程读取前预热延迟缓存
         std::vector<char> hit(ids.size(), 0);
         std::vector<Pose> alts(ids.size());
         const unsigned hc = std::thread::hardware_concurrency();
@@ -977,8 +624,7 @@ public:
                 slog::diag(slog::Tag::Map,
                            "[map] audit: %u/%u image(s) sit where the rest of the model "
                            "contradicts them; moving", st.unsupported, st.checked);
-            // Detach first, all of them: their old observations are evidence
-            // for the old pose and must not survive it.
+            // 先全部解除旧观测，避免它们继续支持已判错的位姿。
             for (const auto& r : repairs) deregisterImage(r.first);
             for (const auto& r : repairs) {
                 Image& im = rec_.images[r.first];
@@ -986,18 +632,11 @@ public:
                 im.registered = true;
             }
             rebuildScores();
-            // Attach to what the new pose can see, then triangulate what
-            // nothing sees yet -- registration's two steps, for a pose that
-            // came from outside instead of from PnP. Without the first, a
-            // repaired image owns no observations at all (everything it looks
-            // at is already triangulated, so there is nothing to *create*) and
-            // the next filtering pass de-registers it as hollow.
+            // 新位姿先连接已有三维点，再创建新点；若仅三角化，已有结构会导致修复图像没有观测而被过滤为无效。
             for (const auto& r : repairs) attachExisting(r.first);
             for (const auto& r : repairs) triangulateForImage(r.first);
             rebuildScores();
-            // Images that could not register before may be able to now, both
-            // because the model changed and because their trial budget is
-            // reset; that is a bonus, not a side effect to design around.
+            // 模型变化并重置试验预算后，先前失败的图像可能获得配准机会。
             reg_trials_.assign(db_.images.size(), 0);
             growLoop(max_reg);
         }
@@ -1009,23 +648,12 @@ public:
         return snapshotModel();
     }
 
-    // Seed and grow further models among images that `models` does not cover,
-    // appending each admitted one. `restart_relaxation` re-arms the seed
-    // threshold ladder, which a later pass needs: the first pass leaves it
-    // exhausted, but by then the claimed set has changed and pairs that were
-    // ineligible are not any more.
+    // 在未覆盖图像中继续播种；restart_relaxation 重置种子阈值阶梯，因为已认领集合变化可能使旧无资格图像对重新可用。
     void seedFurtherModels(std::vector<Reconstruction>& models, bool restart_relaxation = false) {
         ensureSetup();
         if (restart_relaxation) init_relax_ = seed_phase_ = 0;
         int trials = 0;
-        // Not `unclaimedImages() > 0`: admitModel keeps a sub-model only if at
-        // least min_model_size of its images are ones no kept model covers, and
-        // an unclaimed image is exactly that -- so with fewer than that many
-        // left, every attempt is *guaranteed* to be discarded. Each of them is a
-        // seed plus an unbounded grow plus the refinements along the way, i.e. a
-        // reconstruction of the neighbourhood, thrown away. A bottom-up atom
-        // ends with a handful of images its primary model missed, so it paid
-        // this several times over per atom.
+        // 未覆盖图像少于 min_model_size 时不再尝试，每个结果都必定因新增覆盖不足而丢弃，继续播种只会浪费完整增长与优化。
         const size_t need = (size_t)std::max(1, opt_.min_model_size);
         while ((int)models.size() < std::max(1, opt_.max_num_models) &&
                unclaimedImages() >= need) {
@@ -1044,15 +672,13 @@ public:
                 ProfTimer pt(g_map_prof.init_seed);
                 seeded = initialize(from);
             }
-            if (!seeded) break;  // nothing left that can seed a model
+            if (!seeded) break;  // 没有可建立模型的剩余种子
             globalRefine(false);
             grow();
             Reconstruction sub = snapshotModel();
             std::string why;
             if (!admitModel(sub, why)) {
-                // Not worth a directory of its own, and claiming its images
-                // would only starve later passes. Leave them for the next seed;
-                // `used_seeds_` stops this pair being tried again.
+                // 过小模型不认领图像，留给后续种子；used_seeds_ 防止重复使用同一对。
                 if (opt_.verbose)
                     slog::diag(slog::Tag::Map, "[map] sub-model discarded: %s", why.c_str());
                 continue;
@@ -1069,18 +695,13 @@ public:
         }
     }
 
-    // Record `models` as the claimed set, replacing whatever was there.
+    // 用当前模型集合替换已认领图像记录。
     void claimAll(const std::vector<Reconstruction>& models) {
         model_count_.assign(db_.images.size(), 0);
         for (const Reconstruction& m : models) claimImages(m);
     }
 
-    // Images some seed attempt has already reached (D58). Distinct from the
-    // claimed set on purpose: a claim also bounds *growth*, and a retry has to
-    // keep growing without a bound -- the whole point of retrying is that a
-    // better seed can reach further than the last one did, through the same
-    // images. What must not repeat is starting in the same place, because the
-    // reconstruction that follows is then the one already built.
+    // 种子屏蔽与已认领集合分开：重试不能在原区域重新起步，但仍须允许穿过相同图像增长到更远区域（D58）。
     void blockSeeds(const Reconstruction& m) {
         if (seeded_.size() != db_.images.size()) seeded_.assign(db_.images.size(), 0);
         for (const auto& kv : m.images)
@@ -1095,26 +716,11 @@ public:
         return n;
     }
 
-    // ---- does a model agree with the two-view geometries it was built from? --
-    //
-    // Every acceptance test the merger can run by itself is computed from the
-    // same evidence the alignment used: the images the two models share, and
-    // the points they both triangulated. A capture that walks past the same
-    // facade twice can satisfy all of it and still be glued together wrongly,
-    // because the repeated structure is genuinely consistent -- locally.
-    //
-    // The correspondence graph knows something the models do not. Two images
-    // were matched and verified long before any model existed, and their
-    // two-view geometry does not care where a merge, or a registration, later
-    // put them. So: compute the relative pose the model implies for a verified
-    // pair and ask how much of that pair's own evidence it still explains. A
-    // correct model reproduces those geometries; a wrong one cannot, and no
-    // amount of internal self-consistency will save it.
-    //
-    // Bearings throughout, so this is meaningful for a fisheye (D45).
+    // ---------------- 模型与独立双视图几何的一致性 ----------------
+    // 合并自身使用的共享位姿、三维点可能因重复结构而错误自洽；检查模型相对位姿能解释多少预先验证匹配，提供独立证据。
+    // 全程使用单位视线，兼容鱼眼（D45）。
 
-    // Fraction of a verified pair's matches the model's relative pose explains,
-    // or -1 when the pair cannot be judged (an image missing, no camera).
+    // 返回模型相对位姿解释的验证匹配比例，缺图像或相机等无法判断时为 -1。
     double pairAgreement(const Reconstruction& m, const TwoViewMatches& p, double max_error_px,
                          double model_scale) const {
         auto ia = m.images.find(p.image1);
@@ -1126,7 +732,7 @@ public:
         if (ca == m.cameras.end() || cb == m.cameras.end()) return -1;
         Mat3 R = mul(ib->second.pose.R, transpose(ia->second.pose.R));
         Vec3 t = ib->second.pose.t - mul(R, ia->second.pose.t);
-        // px -> rad, in the frame the keypoints were measured in (D47).
+        // 提取像素阈值换算为弧度（D47）。
         const double thr =
             0.5 * (ca->second.errRad(max_error_px) + cb->second.errRad(max_error_px));
         const bool wide_baseline = model_scale > 0 && t.norm() > 1e-3 * model_scale;
@@ -1139,8 +745,7 @@ public:
             if (wide_baseline) {
                 err2 = sampsonSqBearing(E, b1, b2);
             } else {
-                // No baseline to speak of: the epipolar constraint is vacuous,
-                // so compare the rays directly through R.
+                // 基线近零时极线约束无信息，直接用 R 比较视线。
                 Vec3 pred = mul(R, b1);
                 Vec3 c = pred.cross(b2);
                 double ang = std::atan2(c.norm(), pred.dot(b2));
@@ -1152,20 +757,14 @@ public:
     }
 
     struct SeamCheck {
-        size_t cross_pairs = 0;    // verified pairs found across the seam
-        size_t tested = 0;         // ... of which were actually evaluated
+        size_t cross_pairs = 0;    // 跨接缝的已验证图像对数
+        size_t tested = 0;         // 实际参与评估的图像对数
         size_t agree = 0;
-        double median_frac = 0;    // median per-pair fraction of matches explained
+        double median_frac = 0;    // 逐对匹配解释比例的中位数
     };
 
-    // `crossing` false asks the same question of the pairs that do *not* cross
-    // the seam: how well does this capture's own two-view geometry agree with a
-    // reconstruction it is already part of? That is the reference the seam has
-    // to be read against. It is not a constant -- a well-textured outdoor
-    // capture answers 0.95 and a repetitive interior far less, because there
-    // some verified pairs are themselves wrong (two corridors that look alike),
-    // and a fixed bar then refuses correct merges for failing a test its
-    // evidence could never pass (D68).
+    // crossing=false 评估接缝内部图像对，作为该数据自身可达到的一致性基线。
+    // 纹理良好室外可达 0.95，重复室内可能较低；固定高门限会用数据自身也达不到的标准拒绝正确合并（D68）。
     SeamCheck checkSeam(const Reconstruction& m, const std::set<uint32_t>& src_side,
                         double max_error_px = 8.0, double min_pair_frac = 0.5,
                         size_t max_pairs = 600, bool crossing = true) const {
@@ -1181,9 +780,7 @@ public:
         }
         sc.cross_pairs = cross.size();
         if (cross.empty()) return sc;
-        // Prefer the pairs with the most evidence, then spread the sample over
-        // them: a seam is only as good as its strongest links, and a few
-        // hundred are plenty to tell a good merge from a bad one.
+        // 优先证据最多的图像对，再分散取样，数百个强连接足以判断接缝。
         std::stable_sort(cross.begin(), cross.end(), [](const TwoViewMatches* a,
                                                         const TwoViewMatches* b) {
             return a->matches.size() > b->matches.size();
@@ -1206,29 +803,15 @@ public:
         return sc;
     }
 
-    // ---- split a model along the geometries it violates (D45) --------------
-    //
-    // The same measurement, applied to every verified pair inside one model,
-    // says more than pass/fail: it says *where* the model stops being true.
-    // Keep only the pairs the model reproduces, and the images fall into
-    // connected groups. One group means the model is coherent. Two large ones
-    // joined by nothing means two pieces of the capture were welded at the
-    // wrong relative pose -- by a merge, or by a chain of registrations through
-    // repeated structure -- and no bundle adjustment will ever pull them apart,
-    // because each piece is internally perfect.
-    //
-    // Splitting is the honest response: the pieces are real reconstructions,
-    // and once separated they can be re-merged (this time against the seam
-    // test) or grown independently. Images in groups too small to keep are
-    // simply de-registered; growth will offer them a place again.
+    // ---------------- 沿违反的几何关系拆分模型（D45）----------------
+    // 只保留模型能重现的验证边；若形成两个大连通组，则可能以错误位姿拼接，即使各自内部完美，BA 也无法分离。
+    // 拆分后可重新合并或独立增长，过小组撤销配准留待后续处理。
     struct SplitStats {
         size_t pairs_tested = 0, pairs_agree = 0;
-        size_t groups = 0;          // connected groups of agreeing images
+        size_t groups = 0;          // 相互一致图像的连通组
         size_t largest = 0;
-        size_t dropped_images = 0;  // in groups too small to keep
-        // Per-pair fraction explained, sorted. A model with a real problem has
-        // a bimodal distribution -- most pairs near 1, a tail near 0 -- while a
-        // threshold that is merely too tight shows a smooth spread.
+        size_t dropped_images = 0;  // 过小组中被丢弃的图像数
+        // 排序后的逐对解释比例可区分真实冲突的双峰分布与门限偏紧的平滑离散。
         std::vector<double> fractions;
         double percentile(double q) const {
             if (fractions.empty()) return 0;
@@ -1268,9 +851,7 @@ public:
             size_t ra = find(a->second), rb = find(b->second);
             if (ra != rb) parent[ra] = rb;
         }
-        // A calibrated rig holds a frame's images at one relative pose, which ties
-        // them as surely as an agreeing pair: back-to-back fisheyes share no
-        // matches, and a 4000-image capture split into its lenses and merged back.
+        // 已标定 rig 同帧图像由固定外参连接，即使背靠背鱼眼无共同匹配也不能拆开；4000 图数据曾因此按镜头分裂后又合并。
         if (rigs_) {
             std::map<std::pair<uint32_t, uint32_t>, size_t> frame_of;
             for (size_t i = 0; i < ids.size(); i++) {
@@ -1309,9 +890,7 @@ public:
         return parts;
     }
 
-    // "Were these two images matched to each other with real support?" -- the
-    // question findDuplicateStructure needs the correspondence graph for
-    // (D45). Built once per call over the verified pair list.
+    // 为重复结构检查提供有足够匹配支持的图像对查询，每次调用从验证列表构建一次。
     MatchedFn matchedPredicate(int min_matches = 15) const {
         auto index = std::make_shared<std::set<std::pair<uint32_t, uint32_t>>>();
         for (const TwoViewMatches& p : db_.pairs) {
@@ -1326,17 +905,7 @@ public:
         };
     }
 
-    // Bundle-adjust every component at once with one shared set of intrinsics
-    // per camera group (D45; runJointBA). Cheaper than it sounds -- it is one
-    // solve instead of N -- and it is the only place where a small component's
-    // intrinsics are constrained by the big component's evidence. Each model is
-    // then filtered and re-refined through the ordinary path, so the same
-    // observation and image gates apply as after any other BA.
-    // `coarse` runs the solve to the growth-phase tolerance instead of the
-    // solver's full one. A merge tree's intermediate levels are each followed
-    // by more merges, more growth and another joint solve, so converging one
-    // tightly is work the next level throws away; the passes that make
-    // kill-or-keep decisions (audit, refine) are tight, and they run last.
+    // 跨模型联合 BA 按相机组共享内参，使小分量获得大分量约束；中间层可用 coarse 容差，最终审查与精化保持严格。
     void jointRefine(std::vector<Reconstruction>& models, bool coarse = false) {
         ensureSetup();
         size_t live = 0;
@@ -1371,18 +940,8 @@ public:
                 pfs[i] = priorFactors(models[i]);
                 pp[i] = &pfs[i];
             }
-        // One problem if it fits, and the device decides whether it does. A
-        // capture cut into hundreds of atoms puts every atom's images in the
-        // solve at once -- 5356 images arrive as 11564 image-instances at 2.2x
-        // cover -- and on an 8 GB card that is over the budget before the tree
-        // has merged anything. There is nothing below CG to fall back to, so
-        // the answer has to be a smaller problem (D65).
-        //
-        // Splitting is sound because the models are coupled only through the
-        // intrinsics: no 3D point is shared between two of them. So a batch is
-        // a self-contained bundle adjustment, and the only thing that must not
-        // vary between batches is what they conclude about the cameras -- see
-        // below.
+        // 先尝试整问题，超预算则按模型分批；5356 图在 2.2 倍重叠覆盖下形成 11564 图像实例，可超过 8 GB 显存。
+        // 模型间只共享内参、不共享三维点，因此可以分批，但各批必须统一最终相机参数（D65）。
         for (int batches = 1;; ) {
             try {
                 jointRefineBatched(models, bo, batches, pp);
@@ -1398,28 +957,13 @@ public:
                 batches = want;
             }
         }
-        // Deliberately no per-model refine afterwards: that would re-fit each
-        // component's intrinsics to its own observations and undo the sharing
-        // this pass exists for. Observations the shared solution no longer
-        // explains are dropped by the next audit or growth pass, which refine
-        // through the ordinary gates.
+        // 联合求解后不立即逐模型重新拟合内参，避免抵消共享效果；不再解释的观测由后续审查或增长过滤。
         clearCameraConsensus();
         for (const Reconstruction& m : models) recordCameras(m);
     }
 
 private:
-    // `batches` solves over disjoint groups of models, dealt round-robin from
-    // largest to smallest so every group is a representative sample of the
-    // capture -- each one has to determine the intrinsics on its own evidence,
-    // and a group of only the small models could not.
-    //
-    // The first group's cameras are then the answer for all of them. Letting
-    // each group keep its own would reintroduce exactly what the joint solve
-    // exists to prevent: components in different gauges, judged by merge tests
-    // measured in pixels. The first group holds the largest models, so it has
-    // the most to say; the later groups optimize their poses and points against
-    // intrinsics seeded from it and differ from it by far less than the
-    // tolerances downstream.
+    // 按模型从大到小轮流分批，使各批具有代表性；首批含最大模型，其内参作为全部批次最终答案，后续批以此初始化位姿和点优化。
     void jointRefineBatched(std::vector<Reconstruction>& models, const BundleOptions& bo,
                             int batches, const std::vector<const PosePriors*>& pp) {
         if (batches <= 1) {
@@ -1440,8 +984,7 @@ private:
         std::map<uint32_t, Camera> shared;
         for (size_t b = 0; b < group.size(); b++) {
             if (group[b].size() < 2) continue;
-            // Seed this group with what the first one settled on, so it starts
-            // where the others are rather than where its own atoms left it.
+            // 用首批确定的内参初始化当前批，避免从各原子旧值重新分歧。
             if (b)
                 for (Reconstruction* m : group[b])
                     for (auto& kv : m->cameras) {
@@ -1462,19 +1005,8 @@ private:
 
 public:
 
-    // ---- camera consensus across sub-models (D45) -------------------------
-    //
-    // Physically, one camera group is one lens: the same intrinsics whichever
-    // component an image ended up in. The mapper used to forget that between
-    // models -- every new sub-model started its cameras from the geometric
-    // default and ran its own focal search, on a handful of images with almost
-    // no parallax.
-    //
-    // So: a model that is admitted publishes its intrinsics, weighted by how
-    // many images constrain them, and every later model starts from the best
-    // set published so far instead of from the default. Weight, not recency,
-    // decides -- the primary model is built first and is nearly always the
-    // best-constrained, and a 12-image component never overwrites it.
+    // ---------------- 子模型间相机共识（D45）----------------
+    // 已接纳模型按支持图像数量发布内参，后续子模型继承最佳约束结果；不能让最新的小模型覆盖大模型的可靠参数。
     void recordCameras(const Reconstruction& m) {
         std::map<uint32_t, double> weight;
         for (const auto& kv : m.images)
@@ -1488,43 +1020,21 @@ public:
         }
     }
 
-    // Drop what earlier models published (the manager re-publishes from the
-    // current set, so a model that has since been split or repaired does not
-    // keep voting).
+    // 清空旧发布结果，再由当前模型集合重建，避免已拆分或修复模型继续投票。
     void clearCameraConsensus() { cam_consensus_.clear(); }
 
-    // The intrinsics a fresh model would start from, for reporting.
+    // 新模型将采用的初始内参，供报告使用。
     const std::map<uint32_t, std::pair<Camera, double>>& cameraConsensus() const {
         return cam_consensus_;
     }
 
-    // Does the rest of the model support a *different* pose for this image
-    // than the one it has?
-    //
-    // Asking whether the current pose is "supported" does not work, and the
-    // measurement says why: only the features that carry no 3D point of their
-    // own are evidence (an image that was moved wrongly kept its own tracks,
-    // which reproject perfectly wherever it went), and that pool is mostly
-    // junk -- one-hop graph approximations and matches an earlier filter
-    // already rejected.
-    //
-    // Posing it as a competition does separate. Run the ordinary PnP RANSAC on
-    // exactly that pool: if the outside structure has a pose for this image
-    // that clears the registration gates and is somewhere else entirely, the
-    // image is in the wrong place, and no amount of bundle adjustment will
-    // walk it back. If the pool is noise, RANSAC finds nothing and the image
-    // is left alone -- which is the common case and costs one failed RANSAC.
-    //
-    // On a hit, `alternative` is the pose that won, and the caller moves the
-    // image there rather than throwing it away: this evidence is by
-    // construction weaker than registration demands, but it is decisively
-    // better than the pose in place, and the refinement that follows filters
-    // the result honestly.
+    // 用图像未参与构造的三维结构寻找明显更强且位置不同的替代位姿；现有轨迹会随错误图像一起移动，不能作为独立证据。
+    // 噪声池无法产生可靠替代时保留原位姿；找到后返回 alternative，由调用方移动并通过精化过滤，而非直接删除。
     bool poseContradicted(uint32_t img, Pose& alternative) const {
         std::vector<Vec3> X, br;
         const Image& im = rec_.images.at(img);
         for (uint32_t f = 0; f < feats_[img].count(); f++) {
-            if (im.point3D_ids[f] != kInvalidPoint3D) continue;  // evidence it brought itself
+            if (im.point3D_ids[f] != kInvalidPoint3D) continue;  // 图像自身带来的证据
             for (const Correspondence& c : graph_.at(img, f)) {
                 if (c.image_id == img) continue;
                 const Image& oi = rec_.images.at(c.image_id);
@@ -1539,23 +1049,16 @@ public:
             }
         }
         const int n = (int)X.size();
-        if (n < opt_.audit_min_evidence) return false;  // nothing to contradict it with
+        if (n < opt_.audit_min_evidence) return false;  // 没有足够外部证据反驳
 
-        // How well the current pose explains that pool, for comparison.
+        // 统计当前位姿对同一证据池的解释能力。
         const double thr = camOf(img).errRad(opt_.max_reproj_error);
         const double thr2 = thr * thr;
         int cur = 0;
         for (int k = 0; k < n; k++) cur += pnpResidualSq(im.pose, X[k], br[k]) < thr2 ? 1 : 0;
 
-        // The RANSAC below can return at most `n` inliers, so once the pose in
-        // place explains enough of the pool that no alternative could clear the
-        // dominance bar, there is nothing to find and the search is skipped.
-        // Exact, not a heuristic -- the verdict is identical either way -- and
-        // it is most of the pass: an image that sits where it belongs explains
-        // its own correspondences, so on a settled model almost every image
-        // takes this exit. Measured on a 7620-image capture, where the audit
-        // ran a RANSAC over 5107 images to move 6 of them, and was the single
-        // largest line in the finishing bill on every large capture.
+        // 若当前支持已使任何替代解都不可能达到优势比例，则精确跳过 RANSAC，不改变判定。
+        // 7620 图审查曾对 5107 图运行 RANSAC 却只移动 6 图，此提前退出可省去大部分稳定模型审查。
         if (n <= (int)(opt_.audit_alternative_factor * cur) || n < opt_.audit_min_alternative) {
             if (audit_dump_)
                 slog::diag(slog::Tag::Map,
@@ -1568,30 +1071,19 @@ public:
                                 opt_.audit_ransac_trials);
         bool contradicted = false;
         double rot_deg = 0, shift = 0;
-        // Note what is *not* required: a fraction of the pool. The pool of an
-        // image that was placed wrongly is enormous precisely because none of
-        // it was spliced, so a ratio gate hides the very case this exists for.
-        // Absolute support, and dominance over the pose in place, are the honest tests.
+        // 审查不要求整个池的内点比例；错误图像的未拼接噪声池很大，应比较绝对支持及相对当前位姿的优势。
         if (r.success && r.num_inliers >= opt_.audit_min_alternative &&
             r.num_inliers > (int)(opt_.audit_alternative_factor * cur)) {
-            // A pose is only "different" if it is different: the alternative
-            // usually *is* the current pose, recovered from the same geometry,
-            // and finding it again is a confirmation rather than a problem.
-            //
-            // Both halves have to be tested. An image put down in the wrong
-            // *place* -- a repeated facade, the same corridor one floor up --
-            // keeps its orientation and only moves, which is precisely the
-            // failure that survived a rotation-only test on a dataset.
+            // 替代位姿必须真的不同，同时检查旋转与中心位移；重复立面或楼层可能仅位置错而朝向相同。
             Mat3 D = mul(r.pose.R, transpose(im.pose.R));
             double tr = std::max(-1.0, std::min(1.0, (D[0] + D[4] + D[8] - 1) * 0.5));
             rot_deg = std::acos(tr) * 180.0 / M_PI;
             shift = (cameraCenter(r.pose) - cameraCenter(im.pose)).norm() / modelScale();
             contradicted =
                 rot_deg > opt_.audit_min_rotation_deg || shift > opt_.audit_min_shift_frac;
-            // The sequence neighbours vouch for the pose in place: what a
-            // duplicate elsewhere explains does not unseat what they see (D79).
+            // 序列邻居更支持当前位姿时，其他位置的重复结构不能将其替换（D79）。
             if (contradicted && seq_ && nearVouches(img, im.pose, r.pose)) contradicted = false;
-            // So does the gyro: a pose that turns as the sensor says it did.
+            // 陀螺同样可支持符合实测转动的当前位姿。
             if (contradicted && priors_ && priorVouches(img, im.pose, r.pose)) {
                 contradicted = false;
                 prior_vouched_++;
@@ -1607,8 +1099,7 @@ public:
         return contradicted;
     }
 
-    // Whether `cur` explains at least min_num_pnp_inliers of the image's
-    // correspondences to its sequence neighbours' points, and more than `alt`.
+    // 检查当前位姿对序列邻居三维点的支持是否至少达到最少 PnP 内点且多于替代位姿。
     bool nearVouches(uint32_t img, const Pose& cur, const Pose& alt) const {
         const double thr = camOf(img).errRad(opt_.max_reproj_error);
         const double thr2 = thr * thr;
@@ -1630,7 +1121,7 @@ public:
         return n_cur >= opt_.min_num_pnp_inliers && n_cur > n_alt;
     }
 
-    // ---- sensor priors (sfm/core/PriorSource.h) ---------------------------
+    // ---------------- 传感器先验 ----------------
 
     std::vector<PosedImage> posedImages(const Reconstruction& rec) const {
         std::vector<PosedImage> out;
@@ -1645,7 +1136,7 @@ public:
         return out;
     }
 
-    // The factors a solve over `rec` takes, in rec's own gauge.
+    // 在 rec 自身坐标规范中构建求解因子。
     PosePriors priorFactors(const Reconstruction& rec) {
         if (!priors_) return PosePriors{};
         PosePriors pf = priors_->factors(posedImages(rec));
@@ -1655,8 +1146,7 @@ public:
         return pf;
     }
 
-    // The camera rotation a placed neighbour and the gyro predict for `img`,
-    // from the neighbour whose prior is tightest. False without one.
+    // 选择最紧旋转先验的已放置邻居，预测 img 的旋转；无可用邻居时失败。
     bool priorRotation(uint32_t img, Mat3& R, double& sigma_deg) const {
         if (!priors_) return false;
         bool have = false;
@@ -1679,7 +1169,7 @@ public:
         return std::max(opt_.prior_rot_tol_deg, 3.0 * sigma_deg);
     }
 
-    // Whether `cur` turns as the gyro says and `alt` does not.
+    // 检查当前旋转符合陀螺而替代旋转不符合。
     bool priorVouches(uint32_t img, const Pose& cur, const Pose& alt) const {
         Mat3 Rp;
         double sig;
@@ -1689,9 +1179,7 @@ public:
                rotationAngleDeg(mul(alt.R, transpose(Rp))) > tol;
     }
 
-    // Hold a PnP pose to the gyro's rotation: one that turned the wrong way is
-    // re-solved with the rotation fixed (replacing `r`), and the registration
-    // refused (false) when that finds too little.
+    // PnP 旋转偏离陀螺时固定旋转重解，替换 r；支持不足返回 false 并拒绝配准。
     bool priorCheckPose(uint32_t img, const std::vector<Vec3>& X, const std::vector<Vec3>& br,
                         PnPResult& r, bool& constrained) {
         constrained = false;
@@ -1700,9 +1188,7 @@ public:
         if (!priorRotation(img, Rp, sig)) return true;
         const double tol = priorTolDeg(sig);
         if (rotationAngleDeg(mul(r.pose.R, transpose(Rp))) <= tol) return true;
-        // The prediction is good to a degree, not a pixel: the translation
-        // under a radius widened by the tolerance, a free refinement from
-        // there kept within it, and the image's own radius to judge.
+        // 先验仅角度级精度，先放宽半径求平移，再在先验容差内自由精化，最终仍按图像自身半径判定。
         const Camera& cam = camOf(img);
         const double loose_px = std::max(errPx(img), tol * M_PI / 180.0 * cam.focal());
         PnPResult k = ransacPnPKnownRotation(X, br, Rp, cam.focal(), loose_px);
@@ -1729,10 +1215,7 @@ public:
         return true;
     }
 
-    // A length to measure pose differences against, since a reconstruction has
-    // no units: the RMS distance of the registered camera centers from their
-    // centroid. Cached per adopted model -- the audit asks for it once per
-    // image and the model does not move underneath it.
+    // 以已配准相机中心到均值的 RMS 作为无单位模型尺度；按接入模型缓存，避免审查逐图重复计算。
     double modelScale() const {
         if (scale_cache_ > 0) return scale_cache_;
         Vec3 c{0, 0, 0};
@@ -1750,8 +1233,7 @@ public:
         return scale_cache_ = std::max(1e-12, std::sqrt(s / (double)n));
     }
 
-    // The same scale for a model the mapper has not adopted (checkSeam works
-    // on a candidate merge, which is nobody's `rec_` yet).
+    // 为尚未接入 rec_ 的候选合并模型计算相同尺度。
     static double modelScaleOf(const Reconstruction& m) {
         Vec3 c{0, 0, 0};
         size_t n = 0;
@@ -1768,21 +1250,15 @@ public:
         return std::max(1e-12, std::sqrt(s / (double)n));
     }
 
-    // Restrict every seed and every registration to a subset of the database
-    // (empty = the whole thing). This is what lets one Mapper reconstruct a
-    // *cluster* without copying the graph, the features or the match database:
-    // a hierarchical run partitions the images and reconstructs each part with
-    // the same object and the same memoized two-view geometry.
+    // 将种子与配准限制到数据库子集，空值表示全部；复用对应图、特征和双视图缓存。
     void restrictTo(const std::vector<uint32_t>& images) {
         ensureSetup();
-        // A new subset is a new problem: the seed ladder and the used-seed set
-        // belong to the last one and would otherwise carry over, starting the
-        // next cluster at whatever relaxation the previous one had to reach.
+        // 切换子集时重置种子阶梯与已用种子，避免继承前一问题的放宽程度。
         used_seeds_.clear();
         init_relax_ = seed_phase_ = 0;
         seed_pair_ = nullptr;
         seeded_.clear();
-        seed_cand_valid_ = false;  // it is filtered by `allowed`
+        seed_cand_valid_ = false;  // 由 allowed 过滤
         if (images.empty()) {
             allow_.clear();
             allow_count_ = db_.images.size();
@@ -1794,27 +1270,16 @@ public:
         allow_count_ = images.size();
     }
     bool allowed(uint32_t img) const { return allow_.empty() || allow_[img]; }
-    // Images the mapper may touch: the restriction, or the whole database.
+    // 当前允许处理的图像集合，未限制时为整个数据库。
     size_t allowedCount() const { return allow_.empty() ? db_.images.size() : allow_count_; }
 
-    // Bundle-adjust on a context this mapper does not own. Creating a Vulkan
-    // device costs far more than reconstructing one atom, so the atom workers
-    // (sfm/map/Atoms.h) create a short-lived Mapper per atom over a per-atom
-    // sub-database and hand every one of them the worker's own context. Must
-    // be set before the first bundle adjustment; a context is not shareable
-    // across threads, so one per worker, never one for all of them.
+    // 首次 BA 前可指定调用方上下文；原子工作线程复用各自设备，不能跨线程共享，避免每原子重复昂贵设备创建。
     void useBaContext(VkContext* ctx) { ext_ba_ctx_ = ctx; }
 
-    // The per-group starting intrinsics, after any focal bootstrap. A forty-
-    // image atom cannot determine its own focal and must not search for one
-    // (D48), so the atom workers are handed these and told the focal is
-    // measured -- which is what the shared mapper's cam_consensus_ did for
-    // every atom after the first, only now it holds for the first one too.
+    // 返回全局焦距初始化后的组内参，原子直接继承并禁止自行搜索，避免少量图像决定焦距（D48）。
     const std::map<uint32_t, Camera>& startingCameras() const { return default_cams_; }
 
-    // Per image, the camera group it belongs to. Filled by setup(), so it is
-    // the resolved answer rather than the constructor argument, which may be
-    // empty for "one camera for everything".
+    // setup 后解析出的逐图像相机组，比可能为空的构造参数更明确。
     const std::vector<uint32_t>& cameraIds() const { return cam_ids_; }
 
     size_t unclaimed() const { return unclaimedImages(); }
@@ -1823,9 +1288,7 @@ public:
     MapperOptions& options() { return opt_; }
 
 private:
-    // Load an existing model into `rec_`: its poses, its cameras (whose focals
-    // are then facts, not guesses), and its points re-added as fresh tracks.
-    // Images the model does not hold keep the cleared state resetModel() left.
+    // 接入已有模型位姿、相机与三维点，重新建立轨迹；未包含图像保持 resetModel 的未配准状态。
     void adopt(const Reconstruction& m) {
         size_t missing = 0, name_mismatch = 0, count_mismatch = 0;
         if (rigs_) {
@@ -1833,13 +1296,9 @@ private:
             rec_.rig_detached = m.rig_detached;
             initRigCalib(rec_);
         }
-        // point2D_idx is an index into this run's feature arrays, so a model
-        // whose image holds a different number of keypoints indexes different
-        // features -- what --compact-unused-features does on one side only.
+        // point2D_idx 必须对应本次特征数组，关键点数量不同意味着压缩策略或输入不一致，不能直接恢复。
         std::set<uint32_t> reindexed;
-        // The file holds one camera per frame size; this run's grouping says what
-        // shares intrinsics, so the parameters land on the camera it gives the
-        // image. Frame and pixel_scale stay -- cameras.bin carries neither (D47).
+        // 按本次分组接收磁盘相机参数，保留当前图像尺寸与 pixel_scale；后者不存于 cameras.bin（D47）。
         std::set<uint32_t> adopted;
         for (const auto& kv : m.images) {
             if (!kv.second.registered) continue;
@@ -1862,10 +1321,7 @@ private:
             if (!kv.second.registered) continue;
             auto it = rec_.images.find(kv.first);
             if (it == rec_.images.end()) { missing++; continue; }
-            // Image ids are positions in this database. A model from a
-            // *different* database would adopt cleanly and silently reconstruct
-            // nonsense, so the names are checked (the model's carry an
-            // extension, the database's do not).
+            // 图像 ID 是当前数据库位置，必须核对名称以拒绝其他数据库模型；磁盘名带扩展名，内部名不带。
             if (!kv.second.name.empty()) {
                 const std::string& want = it->second.name;
                 if (kv.second.name.compare(0, want.size(), want) != 0 ||
@@ -1917,19 +1373,16 @@ private:
     }
 
 
-    // Sort, report and return. Split out only because run() has two exits.
+    // 统一排序、报告与返回，供 run 的多个出口使用。
     std::vector<Reconstruction> finishRun(std::vector<Reconstruction>& models,
                                           std::chrono::steady_clock::time_point prof_start) {
-        // COLMAP orders the written models by 3D point count, descending
-        // (ReconstructionManager::Write); sparse/0 is therefore the model with
-        // the most structure, not the first one found.
+        // 按三维点数降序写出，sparse/0 为结构最多的模型，而非最先发现者。
         std::stable_sort(models.begin(), models.end(),
                          [](const Reconstruction& a, const Reconstruction& b) {
                              return a.points3D.size() > b.points3D.size();
                          });
         if (opt_.verbose) {
-            // Distinct, not the sum: models overlap by design (up to
-            // max_model_overlap), so summing would double-count the joins.
+            // 按不同图像统计，模型间重叠不能重复计数。
             std::set<uint32_t> covered;
             for (const Reconstruction& m : models)
                 for (const auto& kv : m.images)
@@ -1941,10 +1394,7 @@ private:
                 slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_model_line,
                          {(long long)i, (long long)models[i].numRegistered(),
                           (long long)models[i].points3D.size()});
-            // Why the rest did not come in. The four counts call for different
-            // fixes -- too few 2D-3D candidates is a matching or coverage
-            // problem, a low inlier *ratio* is usually the image being
-            // genuinely somewhere else -- so they are worth separating.
+            // 分别报告配准失败类型：候选不足通常是匹配或覆盖问题，比例低常表示位置歧义，所需修复不同。
             if (rigs_)
                 slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_rig_summary,
                          {(long long)reg_by_rig_, (long long)reg_rig_word_});
@@ -1973,23 +1423,14 @@ private:
     }
 
 private:
-    // ---- multi-model bookkeeping (D41) ----
-    // `rec_` as a standalone reconstruction: its registered images only, the
-    // cameras they use, points colored. `rec_` itself keeps every image --
-    // resetModel() reuses those records for the next attempt, so the pruning
-    // happens on the copy.
-    //
-    // Pruning is what makes keeping several models affordable: `rec_.images`
-    // carries a points2D / point3D_ids pair for *every* image in the dataset
-    // (~200 kB each at 8192 features), so an unpruned 2000-image model costs
-    // ~400 MB whether it registered 2000 images or 20.
+    // ---------------- 多模型记录（D41）----------------
+    // 快照仅保留已配准图像、所用相机和着色点；rec_ 本身复用全数据库记录。
+    // 每图 8192 特征约 200 KB，未裁剪的 2000 图模型即使只配准 20 图也占约 400 MB。
     Reconstruction snapshotModel() const {
         Reconstruction m = rec_;
         for (auto it = m.images.begin(); it != m.images.end();)
             it = it->second.registered ? std::next(it) : m.images.erase(it);
-        // Cameras that ended with no registered image (an unused resolution
-        // bucket, or a group whose images were all rejected) would be written
-        // to cameras.bin with their default-guess intrinsics -- drop them.
+        // 删除没有已配准图像使用的相机，避免把无依据的默认内参写入 cameras.bin。
         std::set<uint32_t> used;
         for (const auto& kv : m.images) used.insert(kv.second.camera_id);
         for (auto it = m.cameras.begin(); it != m.cameras.end();)
@@ -1998,9 +1439,7 @@ private:
         return m;
     }
 
-    // Record the images a kept model registered. They stop being seed
-    // candidates; a later model may still re-register them, within
-    // overlapBudget, which is the overlap a merge step aligns on.
+    // 记录保留模型已配准图像以阻止重复播种，但允许在重叠预算内重新配准，供后续合并。
     void claimImages(const Reconstruction& m) {
         if (model_count_.size() != db_.images.size()) model_count_.assign(db_.images.size(), 0);
         for (const auto& kv : m.images)
@@ -2017,17 +1456,13 @@ private:
         return img < model_count_.size() && model_count_[img] > 0;
     }
 
-    // Images another model already holds that one growth pass may take, given
-    // how many it has found that nothing holds. See max_model_overlap: the
-    // count is the floor and the ratio is what the pass earns on top of it, so
-    // a pass still discovering territory is never cut off, and one that has run
-    // out of its own stops as soon as it has a Sim(3)'s worth of overlap.
+    // 共享图像预算由绝对下限加新增覆盖收益决定；仍发现新区域时允许继续，耗尽新区域后仅保留足够 Sim(3) 对齐的重叠。
     size_t overlapBudget(size_t fresh) const {
         const double floor_v = (double)std::max(1, opt_.max_model_overlap);
         return (size_t)std::max(floor_v, opt_.model_overlap_ratio * (double)fresh);
     }
 
-    // How many of `m`'s images some already-kept model also holds.
+    // 统计 m 中已被其他保留模型覆盖的图像数。
     size_t overlapWithKept(const Reconstruction& m) const {
         if (model_count_.empty()) return 0;
         size_t n = 0;
@@ -2036,17 +1471,8 @@ private:
         return n;
     }
 
-    // Is `m` worth a directory of its own, given what is already kept? One
-    // question, and it is about what `m` *adds*: enough images no kept model
-    // reached. What it re-registers is not held against it, however much of it
-    // there is -- that overlap is what a merge aligns on, and a model refused
-    // for having it is a model whose images have to be found again from a worse
-    // seed (D66).
-    //
-    // It used to be refused, on COLMAP's max_model_overlap, and on a 7620-image
-    // capture that discarded two attempts of 2751 and 1751 images for sharing
-    // 212 and 27 with the one already kept -- 4502 images of finished
-    // reconstruction, of which the search that followed recovered 1188.
+    // 只按新增覆盖判断子模型是否值得保留，不因有用重叠惩罚它。
+    // 7620 图数据按绝对重叠拒绝曾丢弃 2751/1751 图模型，仅因共享 212/27 图；后续仅恢复其中 1188 图（D66）。
     bool admitModel(const Reconstruction& m, std::string& why) const {
         const uint32_t reg = m.numRegistered();
         const size_t fresh = reg - overlapWithKept(m);
@@ -2059,9 +1485,7 @@ private:
         return true;
     }
 
-    // Same question for the model under construction. Free during the primary
-    // model (nothing is claimed yet); a linear scan afterwards, which is noise
-    // next to the PnP it gates.
+    // 对正在构建的模型做相同判断；主模型尚无认领记录，检查近乎零成本。
     size_t sharedRegistered() const {
         if (model_count_.empty()) return 0;
         size_t n = 0;
@@ -2070,10 +1494,7 @@ private:
         return n;
     }
 
-    // The mean of one point's observations' keypoint colors (COLMAP's
-    // ExtractColorsForAllImages, but the samples were taken once at extraction
-    // so no image is decoded again here). `rgb` is left alone -- the neutral
-    // gray a Point3D starts with -- when no observation carries a color.
+    // 按轨迹平均提取阶段保存的颜色，无需重新解码图像；无有效颜色时保持默认中性灰。
     void pointColor(const Point3D& p, uint8_t rgb[3]) const {
         uint32_t acc[3] = {0, 0, 0}, n = 0;
         for (const TrackElement& e : p.track) {
@@ -2090,45 +1511,26 @@ private:
         for (auto& kv : rec.points3D) pointColor(kv.second, kv.second.rgb);
     }
 
-    // Grow the current model until nothing else registers, or until it has
-    // spent its overlapBudget on images a previously-kept model already holds
-    // (D41, D66). During the primary model nothing is claimed yet, so the
-    // overlap test is inert and this is the pre-D41 loop exactly.
+    // 持续增长直到无图可配准或耗尽本轮共享图像预算；主模型阶段没有认领限制（D41/D66）。
     void grow() {
         growLoop();
         checkedRefine(true);
     }
 
-    // The registration loop alone, returning how many images it brought in.
-    // Split from grow() so a continuation pass can skip the final refinement
-    // when it registered nothing -- refining a model that did not change is
-    // both wasted time and a silent perturbation of a finished result.
-    // `max_reg` caps the model's size (0 = grow until nothing registers); the
-    // focal bootstrap uses it to build a model just big enough to score.
-    // `stop_at_ba` returns instead of refining when the model has grown enough
-    // to trigger one. The caller is then responsible for the optimization --
-    // see growByPnP, where a whole level's worth of growth is paid for by a
-    // single joint bundle adjustment rather than one per model.
+    // 单独增长循环返回新增数量，max_reg 限制总规模，stop_at_ba 在需要优化时返回交由调用方联合求解。
+    // 无新增时跳过最终精化，避免无谓开销和数值扰动。
     uint32_t growLoop(uint32_t max_reg = 0, bool stop_at_ba = false) {
         uint32_t registered_here = 0;
-        // Relative to what the model already holds, not absolute. 3 is right
-        // for a two-image seed and wrong for every continuation: an adopted
-        // 200-image model satisfies `>= 3` on its first registration, so it
-        // refined after every single image -- and with stop_at_ba it stopped
-        // after one, which is why a growth pass over 33 models registered 23
-        // images between them.
+        // BA 触发数量相对当前模型规模设置，不能使用固定 3 图门槛，否则接入大模型后会每新增一图就精化或停止。
         double next_ba = std::max(3.0, std::ceil(rec_.numRegistered() * opt_.ba_growth_ratio));
         recent_regs_.clear();
         rebuildScores();
-        // The overlap budget is spent by *this* pass. A continuation of a model
-        // that already shares images with another (a merge just gave it some)
-        // would otherwise be over budget before it registered anything.
+        // 重叠预算只计算本轮新增共享，不能把模型原本重叠计入。
         const size_t shared_at_entry = sharedRegistered();
         while (true) {
             cancel::check();
             if (max_reg && rec_.numRegistered() >= max_reg) break;
-            // Both counts are of *this* pass, and both can be nudged by a
-            // de-registration mid-pass, so neither subtraction may wrap.
+            // 两项均为本轮增量，途中撤销配准可能减少计数，减法须防止无符号回绕。
             const size_t shared_now = sharedRegistered();
             const size_t shared_here = shared_now > shared_at_entry ? shared_now - shared_at_entry : 0;
             const size_t fresh_here = registered_here > shared_here ? registered_here - shared_here : 0;
@@ -2139,10 +1541,7 @@ private:
                                "against %zu of its own; stopping it", shared_here, fresh_here);
                 break;
             }
-            // COLMAP's shape: rank all candidates, try them in order until one
-            // registers, and only then recompute the ranking. A single failure
-            // must not retire an image -- it usually just means not enough of
-            // the scene is triangulated *yet* (see D15).
+            // 按候选排序逐个尝试，成功配准一图后再重排；一次失败不永久排除图像，后续三维结构可能提供更多支持（D15）。
             std::vector<uint32_t> cands;
             {
                 ProfTimer pt(g_map_prof.choose);
@@ -2173,42 +1572,27 @@ private:
                     break;
                 }
             }
-            if (!registered) break;  // nothing in the ranking can be registered
+            if (!registered) break;  // 排序中的所有候选均无法配准
             if (rec_.numRegistered() >= next_ba) {
                 if (stop_at_ba) break;
                 checkedRefine(false);
-                // Refinement mutates observations wholesale (filtering,
-                // retriangulation, de-registration, possibly a snapshot
-                // restore), so the incremental score cache starts over.
+                // 精化可能整体改变观测、轨迹或恢复快照，须重建增量评分缓存。
                 rebuildScores();
                 registered_here += completeRigFrames();
-                // De-registration may have shrunk the model; the next trigger
-                // is always relative to what actually survived.
+                // 撤销配准可能缩小模型，下次 BA 门槛按实际保留规模更新。
                 next_ba = std::ceil(rec_.numRegistered() * opt_.ba_growth_ratio);
             }
         }
         return registered_here;
     }
 
-    // Transactional global refinement (D36): one toxic registration reaching a
-    // trivial-loss global BA can bend a small model so far that the filters
-    // shred it, seed included. Snapshot first; if refinement collapses the
-    // model, restore the snapshot and de-register the images added since the
-    // last refinement -- the suspects -- instead of keeping the wreckage. This
-    // is the mapper "going back": the registrations are undone, the images
-    // keep their remaining trials, and growth continues from known-good state.
-    // Undo state for a transactional refine. Copying the whole Reconstruction
-    // is O(database), not O(model): `rec_` carries an entry for every image the
-    // database has (resetModel builds them all), each with a point3D_ids vector
-    // as long as that image's feature list, and refinement can only touch the
-    // registered ones. Unregistered images are all-invalid by invariant --
-    // deregisterImage clears them -- so they restore without being copied. On a
-    // 40-image cluster of a 5400-image capture that is 135x less per refine.
+    // 事务式全局精化先备份，若模型崩塌则恢复并撤销上次精化后新增的可疑图像，保留剩余重试预算（D36）。
+    // 仅备份已配准图像，未配准记录按不变量全为空；5400 图中的 40 图原子可减少约 135 倍复制。
     struct Snapshot {
         std::map<uint32_t, Camera> cameras;
         std::map<uint64_t, Point3D> points3D;
         uint64_t next_point3D_id = 1;
-        std::vector<std::pair<uint32_t, Image>> images;  // registered only
+        std::vector<std::pair<uint32_t, Image>> images;  // 仅已配准图像
         std::set<uint32_t> focal_known;
         std::vector<RigCalib> rigs;
         std::set<uint32_t> rig_detached;
@@ -2236,8 +1620,7 @@ private:
         rec_.rig_detached = std::move(s.rig_detached);
         std::set<uint32_t> was;
         for (const auto& kv : s.images) was.insert(kv.first);
-        // Refinement only ever de-registers, so this loop is normally empty;
-        // it is here so the restore does not depend on that staying true.
+        // 通常精化只会撤销图像，此循环为空；仍保留处理以免恢复依赖该假设。
         for (auto& kv : rec_.images) {
             if (!kv.second.registered || was.count(kv.first)) continue;
             kv.second.registered = false;
@@ -2256,10 +1639,7 @@ private:
             snap = takeSnapshot();
         }
         globalRefine(final_pass);
-        // Collapse = losing half the registered images. Observation loss alone
-        // is NOT a collapse: shredding most of a junk-heavy image's points
-        // while every pose survives is the filters working as intended, and
-        // vegetation-grade bootstraps routinely shed 2/3 of their observations.
+        // 丢失一半已配准图像才算崩塌；仅丢大量噪声观测不算，植被初始模型正常过滤可丢三分之二观测。
         bool collapsed = 2 * rec_.numRegistered() < reg_before;
         if (collapsed && !recent_regs_.empty()) {
             if (opt_.verbose)
@@ -2274,24 +1654,18 @@ private:
         recent_regs_.clear();
     }
 
-    // ---- helpers ----
+    // ---------------- 辅助函数 ----------------
     Vec2 kp(uint32_t img, uint32_t f) const {
         const Keypoint& k = feats_[img].keypoints[f];
         return {k.x, k.y};
     }
-    // Images may have different intrinsics *and* different resolutions, so
-    // every projection has to go through the image's own camera.
+    // 图像内参与尺寸可不同，每次投影须使用该图像自己的相机。
     const Camera& camOf(uint32_t img) const {
         return rec_.cameras.at(rec_.images.at(img).camera_id);
     }
-    // A pixel threshold in image `img`'s own pixels. Thresholds are given in
-    // extraction pixels, where feature noise lives; this is the only place that
-    // knows the difference (D47, Camera::pixel_scale).
+    // 统一把提取像素阈值换为 img 的源图像素，使用 Camera::pixel_scale（D47）。
     double errPx(uint32_t img) const { return camOf(img).errPx(opt_.max_reproj_error); }
-    // The same conversion for a whole-problem scalar the GPU solver can only
-    // take one of: the median over the registered cameras. Exact on the common
-    // case (one extraction scale for the capture) and a compromise only when a
-    // dataset mixes resolutions *and* crosses --max-image-size in one run.
+    // GPU 全问题只接受单个尺度时，取已配准相机尺度中位数；同提取尺度时精确，混合分辨率时为折中。
     double medianPixelScale() const {
         std::vector<double> v;
         for (const auto& kv : rec_.images)
@@ -2303,19 +1677,14 @@ private:
         std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
         return v[v.size() / 2];
     }
-    // Unit viewing ray for feature f of image img (the geometry core's
-    // interchange type, D31; fisheye-ready, unlike z=1 normalized coords).
+    // 图像 img 特征 f 的单位视线，几何核心统一使用，兼容鱼眼（D31）。
     Vec3 bearing(uint32_t img, uint32_t f) const { return camOf(img).bearing(kp(img, f)); }
     Mat34 Pmat(uint32_t img) const {
         const Pose& p = rec_.images.at(img).pose;
         return {p.R[0], p.R[1], p.R[2], p.t.x, p.R[3], p.R[4], p.R[5], p.t.y,
                 p.R[6], p.R[7], p.R[8], p.t.z};
     }
-    // A point is "in front" of a camera if it lies along the viewing ray. For
-    // the pinhole family that is p.z > 0 (kept bit-identical); a wide-FOV camera
-    // sees past 90 deg, where p.z < 0 is still valid, so the test becomes the
-    // sign of p . bearing (D33). `b` is the observation's unit bearing (already
-    // computed by the caller for the geometry, so this adds no unprojection).
+    // 普通针孔沿用 p.z>0，宽角使用 p·bearing>0 判断点是否沿观测射线前向，避免拒绝合法的负 z 鱼眼点（D33）。
     static bool inFront(const Camera& cam, const Vec3& pc, const Vec3& b, double zmin) {
         return cam.wideFov() ? pc.dot(b) > 0 : pc.z >= zmin;
     }
@@ -2323,10 +1692,7 @@ private:
         const Pose& p = rec_.images.at(img).pose;
         const Camera& cam = camOf(img);
         Vec3 pc = mul(p.R, X) + p.t;
-        // Cheirality: pinhole path stays exactly `pc.z < 1e-8` (no bearing cost);
-        // a wide-FOV camera sees past 90 deg, so it tests the sign along the ray
-        // (D33). For a spherical camera every direction is in view, and the dot
-        // test costs nothing beyond the bearing it already needs.
+        // 针孔保持 pc.z<1e-8 的原判据；宽角沿视线判断正深度，球面任意方向均可见，复用已有视线即可（D33）。
         if (cam.wideFov()) {
             if (pc.dot(cam.bearing(kp(img, f))) <= 0) return 1e30;
         } else if (pc.z < 1e-8) {
@@ -2337,28 +1703,13 @@ private:
         return std::hypot(px.x - o.x, px.y - o.y);
     }
 
-    // ---- flat model index -------------------------------------------------
-    //
-    // rec_.images and rec_.cameras are std::maps, and the geometry helpers
-    // above look up two or three of them per call -- reprojErr() alone does
-    // three. That is more work than the projection itself once a pass walks
-    // millions of observations, and the filter/triangulate passes do exactly
-    // that on every global-refinement round. Image ids are dense positions in
-    // the database, so a vector answers the same question in one load.
-    //
-    // Only valid while nothing is inserted into or erased from rec_.images /
-    // rec_.cameras, which is why it is built by the pass that uses it and never
-    // stored. Mutating an existing entry (poses, point3D_ids, intrinsics) is
-    // fine: std::map never moves its nodes.
-    //
-    // It carries pixel_scale rather than a finished threshold so that each call
-    // site can keep writing the expression it wrote before: `errPx(x)` is
-    // `x * pixel_scale`, and re-associating a product of doubles can move the
-    // last bit and with it a borderline accept/reject.
+    // ---------------- 模型平铺索引 ----------------
+    // 将稠密图像 ID 映射为指针数组，避免每观测多次 std::map 查找；仅在图像、相机集合不增删时有效，修改已有节点字段无妨。
+    // 保留 pixel_scale 而非预乘阈值，使调用处浮点乘法结合顺序不变，避免末位差异改变边界判定。
     struct ModelIndex {
-        std::vector<Image*> img;          // by image id, null if absent
-        std::vector<Camera*> cam;         // that image's camera
-        std::vector<double> pixel_scale;  // Camera::pixel_scale (D47)
+        std::vector<Image*> img;          // 按图像 ID，缺失时为空
+        std::vector<Camera*> cam;         // 该图像的相机
+        std::vector<double> pixel_scale;  // Camera::pixel_scale，提取到源图比例（D47）
     };
 
     ModelIndex indexModel() {
@@ -2379,14 +1730,12 @@ private:
         return mi;
     }
 
-    // reprojErr() against the index. Same arithmetic, same cheirality rules.
+    // 通过索引计算重投影误差，保持算术与正深度规则一致。
     double reprojErrAt(const ModelIndex& mi, uint32_t img, uint32_t f, const Vec3& X) const {
         const Camera& cam = *mi.cam[img];
         return reprojErrAt(mi, img, f, X, cam.wideFov() ? cam.bearing(kp(img, f)) : Vec3{});
     }
-    // ... given the feature's bearing, which only a wide lens's cheirality reads.
-    // A fisheye bearing is an iterative inversion, and retriangulating an
-    // every-frame video asked for the same ones millions of times a pass.
+    // 允许传入已算视线，避免鱼眼重三角化中数百万次重复 Newton 反解。
     double reprojErrAt(const ModelIndex& mi, uint32_t img, uint32_t f, const Vec3& X,
                        const Vec3& bearing) const {
         const Pose& p = mi.img[img]->pose;
@@ -2402,7 +1751,7 @@ private:
         return std::hypot(px.x - o.x, px.y - o.y);
     }
 
-    // triangulatePair() against the index.
+    // 通过平铺索引执行 triangulatePair。
     bool triangulatePairAt(const ModelIndex& mi, uint32_t a, uint32_t fa, uint32_t b, uint32_t fb,
                            Vec3& X, double err_scale = 1.0) const {
         return triangulatePairAt(mi, a, fa, mi.cam[a]->bearing(kp(a, fa)), b, fb,
@@ -2432,11 +1781,7 @@ private:
         return true;
     }
 
-    // Triangulate the correspondence (a,fa)<->(b,fb); accept on cheirality,
-    // angle and reprojection. Returns true and fills X on success.
-    // `err_scale` tightens the reprojection acceptance (< 1 during
-    // retriangulation, so re-created points must beat the filter's kill
-    // threshold with margin -- the churn hysteresis, see D36).
+    // 三角化 (a,fa)<->(b,fb)，检查正深度、角度和重投影；重三角化用 err_scale<1 收紧接受阈值，避免删除后立即重建的反复震荡（D36）。
     bool triangulatePair(uint32_t a, uint32_t fa, uint32_t b, uint32_t fb, Vec3& X,
                          double err_scale = 1.0) const {
         Vec3 ba = bearing(a, fa), bb = bearing(b, fb);
@@ -2452,9 +1797,7 @@ private:
         return true;
     }
 
-    // Idempotent: every public entry point calls it, and only the first does
-    // anything. The graph and the per-image records are properties of the
-    // database, not of a particular model.
+    // 初始化幂等，图与逐图记录属于数据库而非具体模型，所有公共入口均可调用。
     void ensureSetup() {
         if (!setup_done_) {
             setup();
@@ -2464,9 +1807,7 @@ private:
 
     void setup() {
         if (cam_ids_.size() != db_.images.size()) cam_ids_.assign(db_.images.size(), 1);
-        // One Camera per distinct id, sized from the first image that uses it.
-        // The pristine default is kept so a camera whose images all get
-        // de-registered can start over instead of retrying from bad intrinsics.
+        // 每相机 ID 从首张使用图像确定尺寸，保留原始默认值，便于全部配准被撤销后摆脱错误内参重新开始。
         for (uint32_t i = 0; i < db_.images.size(); i++) {
             uint32_t cid = cam_ids_[i];
             if (rec_.cameras.count(cid)) continue;
@@ -2478,14 +1819,14 @@ private:
             rec_.cameras[cid].id = cid;
             default_cams_[cid] = rec_.cameras[cid];
         }
-        // Priors survive every reset; see MapperOptions::known_focal_cameras.
+        // 所有重置均保留焦距先验集合。
         for (uint32_t cid : opt_.known_focal_cameras)
             if (rec_.cameras.count(cid)) focal_known_.insert(cid);
         for (uint32_t i = 0; i < db_.images.size(); i++) {
             Image im;
             im.id = i;
             im.camera_id = cam_ids_[i];
-            im.name = db_.images[i].name;  // feature stem; CLI resolves the real filename
+            im.name = db_.images[i].name;  // 特征主干名，真实文件名由 CLI 恢复
             im.exif_orientation = feats_[i].exif_orientation;
             im.points2D.resize(feats_[i].count());
             im.point3D_ids.assign(feats_[i].count(), kInvalidPoint3D);
@@ -2499,15 +1840,11 @@ private:
         }());
         reg_trials_.assign(db_.images.size(), 0);
         if (rigs_) initRigCalib(rec_);
-        // Size the score bookkeeping now: attachObservation can run before the
-        // first grow() (the post-seed globalRefine retriangulates), and must
-        // never index unallocated rows. Values there are throwaway -- grow()
-        // rebuilds before the first ranking.
+        // 首次 grow 前就可能由种子 BA 的重三角化添加观测，因此先分配评分记录；具体值由首次排序前重建。
         rebuildScores();
     }
 
-    // Wipe everything a previous seed attempt built, so the next attempt starts
-    // from the same state setup() left behind.
+    // 清空前一种子尝试的模型状态，使下一尝试从初始化状态开始。
     void resetModel() {
         scale_cache_ = 0;
         rig_refined_at_ = 0;
@@ -2522,10 +1859,7 @@ private:
         for (uint32_t i = 0; i < db_.images.size(); i++) {
             uint32_t cid = cam_ids_[i];
             if (!rec_.cameras.count(cid)) {
-                // An earlier model's refined intrinsics if there are any, and
-                // then the focal search stays off: those parameters were fitted
-                // on hundreds of images, and a new model's first registration
-                // has no business overwriting them (D45).
+                // 优先继承先前模型充分约束的内参并关闭焦距搜索，禁止新小模型的单图匹配覆盖大模型结果（D45）。
                 auto cons = cam_consensus_.find(cid);
                 if (cons != cam_consensus_.end()) {
                     rec_.cameras[cid] = cons->second.first;
@@ -2542,18 +1876,13 @@ private:
         reg_trials_.assign(db_.images.size(), 0);
     }
 
-    // ---- initialization ----
-    // Why every candidate seed was turned down. "initialization failed" on its
-    // own tells a user nothing they can act on, and the reasons call for
-    // opposite responses: `few_inliers` means the matcher or the pair selection
-    // came up short, `low_angle` means the capture has no wide baseline to
-    // start from, `forward` means it is a dolly/driving shot. Printed once when
-    // initialize() gives up.
+    // ---------------- 初始化 ----------------
+    // 分别报告内点不足、低视差与前向运动等种子拒绝原因，便于判断应改善匹配、基线还是运动方式。
     struct InitTally {
         size_t candidates = 0, no_pose = 0, config = 0, few_inliers = 0, forward = 0,
                few_points = 0, low_angle = 0;
-        double best_angle = 0;      // best median angle any candidate reached
-        double best_forward = 2.0;  // most sideways motion any candidate had
+        double best_angle = 0;      // 候选达到的最大角度中位数
+        double best_forward = 2.0;  // 候选达到的最大侧向运动量
     };
 
     void reportInitFailure() const {
@@ -2573,26 +1902,14 @@ private:
         }
     }
 
-    // ---- focal bootstrap for rotation-degenerate captures (D48) ----
-    // The largest angle between any two registered cameras' orientations. This
-    // is the quantity that decides whether a self-calibrating bundle adjustment
-    // can see the focal length at all: for a set of cameras that all point the
-    // same way, stretching the scene along the viewing axis and scaling the
-    // focal to match reproduces every image exactly, so the focal is a free
-    // parameter of the reconstruction (the classical critical motion sequence
-    // -- pure translation -- and it does not matter whether the translation is
-    // forwards or sideways). Only the distortion terms, whose radial
-    // polynomial is not scale-covariant, break the tie, and they break it
-    // weakly.
-    //   Measured: a straight KITTI drive spans 8.5 deg, while all 18 benchmark
-    // scenes span 180 -- there is no threshold-tuning problem here.
+    // ---------------- 旋转退化数据的焦距初始化（D48）----------------
+    // 所有相机近同向时，沿视轴拉伸场景并调整焦距可重现相同图像，纯平移使焦距不可观，畸变仅弱打破退化。
+    // 实测直行 KITTI 姿态跨度 8.5 度，而 18 个基准场景均约 180 度。
     double rotationSpreadDeg() const {
         std::vector<const Mat3*> Rs;
         for (const auto& kv : rec_.images)
             if (kv.second.registered) Rs.push_back(&kv.second.pose.R);
-        // Sampled: this is O(n^2) in a pass that runs per focal hypothesis, and
-        // the *maximum* of a 60-camera sample is within a degree of the true
-        // maximum on every capture we have -- it is a yes/no question.
+        // 最大姿态差本为 O(n²)，采样约 60 相机即可在现有数据上接近真实最大值一度以内，足以判定退化。
         const size_t kMax = 60;
         const size_t stride = std::max<size_t>(1, Rs.size() / kMax);
         double worst = 0;
@@ -2600,7 +1917,7 @@ private:
             for (size_t j = i + stride; j < Rs.size(); j += stride) {
                 const Mat3& A = *Rs[i];
                 const Mat3& B = *Rs[j];
-                // trace(A^T B), i.e. sum of the columnwise dot products.
+                // trace(A^T B)，等于对应列点积之和。
                 double tr = 0;
                 for (int r = 0; r < 3; r++)
                     for (int c = 0; c < 3; c++) tr += A[r * 3 + c] * B[r * 3 + c];
@@ -2610,9 +1927,7 @@ private:
         return worst;
     }
 
-    // The distortion the camera setup started this group at: zero, or whatever
-    // --distortion supplied. What a focal trial resets to -- the trials must
-    // discard each other's fitted coefficients, not the user's calibration.
+    // 焦距试探恢复用户初始畸变，不能继承其他试探拟合系数，也不能丢弃用户标定。
     void resetExtraParams(Camera& c) const {
         Camera src;
         auto it = opt_.initial_cameras.find(c.id);
@@ -2630,14 +1945,8 @@ private:
         double rot_spread = 0;
     };
 
-    // Build a small model from `pm` with every guessed camera group set to
-    // `focal`, and report how much mutually consistent structure it supports.
-    // The score is the observation count, not the reprojection residual: a
-    // wrong focal in a degenerate capture fits its own reconstruction just as
-    // tightly (0.29 px either way on KITTI) but cannot make as many
-    // correspondences agree with one another, so tracks break and the filters
-    // take them out. Measured on 25 KITTI frames, 73.5k observations at the
-    // right focal against 52k at 1.9x it, with the residual flat throughout.
+    // 同种子构建小模型，以共同一致观测数而非重投影残差评分焦距；退化场景错误焦距也可拟合自身模型。
+    // 25 帧 KITTI 正确焦距得到 7.35 万观测，1.9 倍焦距为 5.2 万，而两者残差均约 0.29 px。
     FocalTrial focalTrial(const TwoViewMatches& pm, const std::vector<uint32_t>& cams,
                           double focal, uint32_t cap) {
         for (uint32_t cid : cams) {
@@ -2655,42 +1964,27 @@ private:
         t.registered = rec_.numRegistered();
         t.observations = countObservations();
         t.rot_spread = rotationSpreadDeg();
-        // The trial refined the focal itself; report where it landed, since
-        // that is the value worth carrying forward.
+        // 试探已通过 BA 精化焦距，返回实际收敛值。
         if (!cams.empty() && rec_.cameras.count(cams[0])) t.focal = rec_.cameras[cams[0]].focal();
         return t;
     }
 
-    // Cameras whose focal is still the geometric guess -- nothing measured it,
-    // so nothing is lost by searching it. A camera an earlier model already
-    // published intrinsics for (cam_consensus_) counts as measured: those were
-    // fitted over that model's images, and resetModel starts every later model
-    // from them, so a trial could not depart from them anyway (D45).
+    // 仅搜索仍为几何猜测且未获相机共识的焦距；先前模型发布的内参视为测量，不应由新试探替换。
     std::vector<uint32_t> guessedFocalCameras() const {
         std::vector<uint32_t> out;
         for (const auto& kv : rec_.cameras)
             if (!opt_.given_focal_cameras.count(kv.first) && !cam_consensus_.count(kv.first) &&
-                !kv.second.isSpherical())  // no focal to search for (D49)
+                !kv.second.isSpherical())  // 球面模型没有可搜索焦距（D49）
                 out.push_back(kv.first);
         return out;
     }
 
-    // Pick the starting focal by trial reconstruction whenever nothing measured
-    // it. Runs before the primary model and leaves nothing behind but a focal.
-    //
-    // The search is a descent rather than a grid, because that is what makes it
-    // cheap enough to always run: halve the focal, and keep halving only while
-    // each step makes materially more of the correspondences agree. A capture
-    // whose guess is already in the right basin pays one extra trial model and
-    // stops. Everything is grown from the *same* seed pair, so the trials'
-    // scores differ only by the focal.
+    // 无测量时从同一种子按焦距减半下降，只有一致观测显著增加才继续；已在正确收敛区的初值仅多付出一次小模型试探。
     void bootstrapFocalLength() {
         if (opt_.focal_trials <= 0) return;
         std::vector<uint32_t> cams = guessedFocalCameras();
         if (cams.empty()) return;
-        // The trials are thrown away, but the bar counts the capture: a probe
-        // registering `focal_model_size` images jumped it to 30% of a 70-image
-        // capture and froze. A fifth of the stage there, hence a stage to name.
+        // 试探结果会丢弃，不能计入正式配准进度；单独命名阶段，避免小数据进度提前跳高后停滞。
         struct SeedPhase {
             bool& report;
             const bool was;
@@ -2703,16 +1997,11 @@ private:
                 if (was) events::stage_end(Stage::Seed);
             }
         } phase(opt_.report_progress);
-        // One camera group only. With several, a single scalar hypothesis would
-        // be applied to lenses that need different answers, and the score
-        // cannot say which one was wrong -- exactly the reason bootstrapFocal
-        // works per group (D46). Two guessed groups means a rig or a mixed
-        // collection, and there the per-group EXIF prior or the calibration is
-        // the answer.
+        // 仅对单相机组执行全局比例试探，多组镜头需要不同答案，单一得分无法定位出错组，应依赖组级测量或标定（D46）。
         if (cams.size() > 1) return;
         const double f0 = rec_.cameras.at(cams[0]).focal();
 
-        // Probe: the ordinary seed, grown just far enough to have an opinion.
+        // 用普通种子增长到足以评分的小模型。
         const uint32_t cap = (uint32_t)std::max<size_t>(
             8, std::min<size_t>(opt_.focal_model_size, db_.images.size()));
         size_t from = 0;
@@ -2739,10 +2028,7 @@ private:
         FocalTrial best = base;
         bool moved = false;
         int used = 0;
-        // A measured focal has already been placed in the right basin; the
-        // probe's own refinement above is the improvement, and the ladder below
-        // would only be trading it for whichever trial happened to register
-        // more images.
+        // 测量焦距已在合理范围，仅接受试探 BA 精化，不执行按配准数择优的减半搜索。
         if (opt_.measured_focal_cameras.count(cams[0])) {
             if (opt_.verbose)
                 slog::diag(slog::Tag::Map,
@@ -2751,12 +2037,7 @@ private:
             restoreAfterBootstrap(best.focal, cams, f0);
             return;
         }
-        // Descend. The direction is not symmetric: a too-short focal splays the
-        // bearings, which leaves a model BA can walk back up (every KITTI start
-        // from 0.36x to 1.0x of the truth converged on it), while a too-long one
-        // flattens the model into a self-consistent pancake it cannot climb out
-        // of. So the search only ever needs to look down, and overshooting down
-        // costs little.
+        // 优先向下搜索：过短焦距扩散视线，BA 可回升，KITTI 从真实值 0.36–1.0 倍均能收敛；过长焦距易形成自洽扁平模型而无法摆脱。
         double f = f0;
         while (used < opt_.focal_trials) {
             f *= 0.5;
@@ -2773,8 +2054,7 @@ private:
             best = t;
             moved = true;
         }
-        // Nothing below the guess helped. Look once above it, in case the guess
-        // is the short one -- a telephoto capture, where the guess is 2-4x low.
+        // 向下无改善时向上试一次，覆盖初始猜测低于真实值 2–4 倍的长焦数据。
         if (!moved && used < opt_.focal_trials) {
             FocalTrial t = focalTrial(pm, cams, f0 * 1.6, cap);
             const bool better = t.ok && (double)t.observations >
@@ -2786,10 +2066,7 @@ private:
                            !t.ok ? " (failed)" : better ? " (better)" : " (no better)");
             if (better) { best = t; moved = true; }
         }
-        // Either way the probe's *refined* focal is what carries forward, not the
-        // raw guess: the probe is a real reconstruction of `cap` images and its
-        // bundle adjustment has already had a say. That matters where the guess
-        // is far out but the descent finds no decisive gain.
+        // 无论搜索是否有显著提升，均保留试探 BA 精化后的焦距，而非原始猜测。
         if (opt_.verbose)
             slog::diag(slog::Tag::Map,
                        "[map] focal %.0f -> %.0f (%s; %zu observations vs %zu at the "
@@ -2799,19 +2076,8 @@ private:
         restoreAfterBootstrap(best.focal, cams, f0);
     }
 
-    // Put back everything the trials disturbed, keeping only the focal. The
-    // primary model must be built exactly as it would have been with that focal
-    // supplied on the command line -- no trial's seed choice, relaxation level
-    // or cached geometry may leak into it.
-    //
-    // The one thing worth keeping is the memoized two-view geometry, and only
-    // when the focal did *not* move: those RANSACs are the cost of the candidate
-    // scan, and on a dataset that seeds at no level at all (where the scan is
-    // exhaustive and the probe learned nothing) throwing them away would make
-    // the pipeline pay for the whole ladder twice to reach the same verdict.
-    // `probe_focal` is the focal the memoized geometry was computed at (the
-    // trials never write the cache), so the cache survives exactly when the
-    // committed focal is that same value.
+    // 恢复试探扰动的种子、放宽阶梯和模型状态，仅保留焦距；只有最终焦距等于缓存生成时值，才保留可复用双视图几何。
+    // 否则缓存失效，避免试探结果泄漏；完全无法播种且焦距未变时保留缓存可省去整套重复 RANSAC。
     void restoreAfterBootstrap(double focal, const std::vector<uint32_t>& cams,
                                double probe_focal) {
         for (uint32_t cid : cams) {
@@ -2827,25 +2093,8 @@ private:
         resetModel();
     }
 
-    // `from` is an in/out cursor into the ranked candidate list, so a retry
-    // resumes after the seed that just produced too small a model. COLMAP's
-    // thresholds (16 deg median angle, 100 inliers) are demanding on purpose:
-    // everything is built on the seed. When no pair on the dataset can meet
-    // them, halving stepwise is strictly better than not reconstructing (D36).
-    //
-    // The ladder has two rungs (D48). The first four levels relax the angle and
-    // inlier demands with the forward-motion cap in force, which is every
-    // dataset that has any sideways pair at all -- they behave exactly as
-    // before. The next four repeat the sequence with the cap lifted, for
-    // captures where *no* pair is sideways: a dashcam, a dolly shot, a drone
-    // flying down a corridor. For those, the cap is not a quality filter but a
-    // veto on the whole dataset, and lifting it last means a sideways seed is
-    // always preferred when one exists, however weak.
-    //   Lifting it is safe only because the criterion the cap approximates --
-    // is this pair well enough conditioned to build a model on? -- is measured
-    // directly by the seed's median triangulation angle, which is still
-    // enforced at every level. A forward pair with 16 deg of median parallax is
-    // a better seed than a sideways pair with 2.
+    // 种子游标继续上次尝试之后的位置；先四级逐步放宽 16 度中位视差和 100 内点要求，再四级解除前向运动限制。
+    // 始终优先侧向种子，直行数据最终也可尝试；各级仍检查真实三角化角度，不能把运动方向当作唯一质量判据。
     struct InitLevel { double angle; int inliers; bool allow_forward; };
 
     InitLevel initLevel(int level) const {
@@ -2859,9 +2108,7 @@ private:
 
     bool initialize(size_t& from) {
         init_tally_ = InitTally();
-        // The relaxation level and, with sequences, the phase (neighbour pairs
-        // first, every pair once those are exhausted, D79) are sticky across
-        // seed retries, which keeps the `from` cursor's indexing valid (D19).
+        // 种子重试间保留放宽等级及序列阶段，先邻居后全部图像对，保证游标索引含义稳定（D19/D79）。
         const int levels = opt_.init_max_forward_motion >= 1.0 ? 4 : 8;
         const int phases = seq_ ? 2 : 1;
         for (; seed_phase_ < phases; seed_phase_++, init_relax_ = 0, from = 0) {
@@ -2883,12 +2130,7 @@ private:
 
     bool initializeAttempt(size_t& from, double min_ang_deg, int min_inliers,
                            bool allow_forward) {
-        // Candidate pairs: verified, non-planar, most inliers first. Built once
-        // per restriction and reused: the relaxation ladder only ever *lowers*
-        // min_inliers, so every level's candidate set is a prefix of this one
-        // ordering, and rebuilding it per level per attempt meant scanning and
-        // sorting the whole pair list (74k of them on a 5400-image capture)
-        // once per cluster -- a quarter of a bottom-up run's mapper time.
+        // 已验证非平面候选按内点数排序，每个限制子集只构建一次；放宽仅降低阈值，无需每级重复扫描排序整个匹配列表。
         if (!seed_cand_valid_) {
             seed_cand_.clear();
             seed_cand_far_.clear();
@@ -2896,7 +2138,7 @@ private:
                 if (p.config != (int)TwoViewConfig::Uncalibrated || !allowed(p.image1) ||
                     !allowed(p.image2))
                     continue;
-                // Sequence neighbours seed first; the rest wait for phase 1.
+                // 优先序列邻居，其他候选等到第二阶段。
                 (!seq_ || nearby(p.image1, p.image2) ? seed_cand_ : seed_cand_far_).push_back(&p);
             }
             auto by_inliers = [](auto* a, auto* b) {
@@ -2910,27 +2152,8 @@ private:
         }
         const std::vector<const TwoViewMatches*>& cand = seed_phase_ ? seed_cand_far_ : seed_cand_;
 
-        // The scan is serial by construction -- the first candidate that clears
-        // the level's thresholds wins, and each trial mutates rec_ -- but the
-        // expensive part of a trial is `seedGeometry`, a pure function of the
-        // pair (D38's memoization already relies on that). So the candidates
-        // ahead of the cursor are precomputed a block at a time on all cores
-        // and the serial loop below then only reads the cache. Same answer,
-        // same order; a rejected candidate's RANSAC just no longer costs wall
-        // clock. On a capture where the seed search rejects hundreds of pairs
-        // this is the difference between minutes and seconds of dead GPU.
-        // The block doubles rather than starting at full width. Speculating a
-        // core's worth of RANSACs ahead is free only when the search is going
-        // to reject that many candidates; on a small restricted graph -- a
-        // bottom-up atom -- the first candidate usually seeds, and every other
-        // pair in the block was computed for nothing, once per atom.
-        //
-        // With one thread it is not speculation at all, only extra work: the
-        // block would be computed on this very thread, in order, and the loop
-        // below computes exactly what it needs on demand (trySeedPair fills the
-        // same cache). That is the atom case -- the parallelism there is over
-        // atoms, so each mapper runs single-threaded -- and leaving the
-        // prefetch on cost 2578 two-view RANSACs where 34 atoms needed 84.
+        // 候选接受顺序仍串行，但可并行预计算无状态 seedGeometry，按原顺序读取缓存；预取块逐步加倍，避免小原子首候选即成功时浪费计算。
+        // 单线程完全禁用预取，34 原子只需 84 次 RANSAC，启用预取曾执行 2578 次。
         const unsigned hc = std::thread::hardware_concurrency();
         const size_t max_block =
             std::max<size_t>(1, opt_.threads > 0 ? (size_t)opt_.threads : (hc ? hc : 1));
@@ -2939,21 +2162,12 @@ private:
 
         for (size_t ci = from; ci < cand.size(); ci++) {
             const TwoViewMatches* p = cand[ci];
-            // Sorted by inlier count, so the first pair under this level's
-            // threshold ends the level.
+            // 候选已按内点数降序，首个不足当前阈值的候选即可结束本级。
             if ((int)p->matches.size() < min_inliers) break;
             uint32_t a = p->image1, b = p->image2;
-            // Relaxation levels re-scan the (re-sorted) candidate list, so the
-            // cursor alone cannot prevent rebuilding a seed a previous attempt
-            // already grew and rejected -- burning retry budget on duplicates.
+            // 放宽级别会重新扫描，须额外记录已用种子，防止重复消耗重试预算。
             if (used_seeds_.count({a, b})) continue;
-            // A further model must start somewhere no kept model reached, or it
-            // would just rebuild the model that is already written (COLMAP
-            // FindFirstInitialImage's `num_registrations == 0` rule, D41).
-            // Inert while the primary model is being built -- but the same
-            // argument applies between that model's own seed attempts, where
-            // nothing is claimed yet: a retry that starts inside what the last
-            // attempt registered rebuilds it (D58).
+            // 子模型仅从未覆盖处起步；主模型重试虽尚未认领，也须避开前一次已到达区域（D41/D58）。
             if (claimed(a) || claimed(b) || seedBlocked(a) || seedBlocked(b)) continue;
             if (ci >= prefetched) {
                 prefetched = std::min(cand.size(), ci + block);
@@ -2968,31 +2182,21 @@ private:
         return false;
     }
 
-    // Two-view geometry for a seed candidate. Pure: it reads the pristine
-    // cameras and the features, and touches no reconstruction state -- which is
-    // what lets it be memoized (D38) and precomputed off-thread.
+    // 种子几何只依赖原始相机与特征，不修改重建，可缓存并在线程外预计算。
     TwoViewGeometry seedGeometry(const TwoViewMatches& pm) const {
         ProfTimer pt(g_map_prof.seed_geom);
         g_map_prof.n_seed_geom++;
         const uint32_t a = pm.image1, b = pm.image2;
         TwoViewOptions tvo;
         tvo.recover_pose = true;
-        // Whether to re-derive planar-or-panoramic here. `pm.matches` are
-        // verification's surviving inliers and `pm.config` is its verdict on
-        // the pair; only Uncalibrated ones reach here (initializeAttempt filters
-        // on it). Re-deriving it costs a homography RANSAC, which is ~90% of the
-        // seed search on a 550-image capture -- H's inlier ratio on a
-        // non-planar pair is low, so its trial count adapts into the hundreds
-        // where F, fed its own inliers, converges in a handful.
+        // 可在验证保留的内点上重判平面/全景；非平面 H 的内点率低，RANSAC 试验多，550 图测量中约占种子搜索 90%。
         tvo.estimate_homography = opt_.seed_homography;
         const Camera& ca = camOf(a);
         const Camera& cb = camOf(b);
         Mat3 Rp;
         double sig;
         if (priors_ && priors_->relativeRotation(a, b, Rp, sig)) {
-            // The gyro's rotation, with the translation from the two-point
-            // fit, when it explains what the free estimate did: a seed whose
-            // rotation is measured rather than fitted.
+            // 陀螺旋转配合两点平移若可解释自由估计的支持，则使用测量旋转建立种子。
             std::vector<Vec3> b1(pm.matches.size()), b2(pm.matches.size());
             for (size_t k = 0; k < pm.matches.size(); k++) {
                 b1[k] = ca.bearing(kp(a, pm.matches[k].idx1));
@@ -3020,10 +2224,7 @@ private:
             return g;
         }
         if (ca.wideFov() || cb.wideFov()) {
-            // Same reason verification works on bearings (D45): a pinhole seed
-            // throws away every wide correspondence, and the seed is what the
-            // whole model is built on. The thresholds move from pixels to
-            // radians with the focal.
+            // 鱼眼种子使用单位视线，避免丢弃宽角对应；像素阈值按焦距换成弧度（D45）。
             std::vector<Vec3> b1(pm.matches.size()), b2(pm.matches.size());
             for (size_t k = 0; k < pm.matches.size(); k++) {
                 b1[k] = ca.bearing(kp(a, pm.matches[k].idx1));
@@ -3043,8 +2244,7 @@ private:
         return estimateTwoView(q1, q2, tvo);
     }
 
-    // Fill seed_geom_ for cand[lo, hi) on a thread pool. Candidates already
-    // cached are skipped; the map itself is only written on this thread.
+    // 线程池预计算候选几何，跳过缓存项，缓存 map 本身仅由调用线程写入。
     void prefetchSeedGeometry(const std::vector<const TwoViewMatches*>& cand, size_t lo,
                               size_t hi) {
         std::vector<const TwoViewMatches*> todo;
@@ -3055,7 +2255,7 @@ private:
             if (seed_geom_.count(key)) continue;
             todo.push_back(p);
         }
-        if (todo.size() < 2) return;  // one pair is not worth a pool
+        if (todo.size() < 2) return;  // 单个图像对不值得启动线程池
         std::vector<TwoViewGeometry> out(todo.size());
         std::atomic<size_t> next{0};
         const unsigned hc = std::thread::hardware_concurrency();
@@ -3073,22 +2273,12 @@ private:
             seed_geom_[{todo[i]->image1, todo[i]->image2}] = std::move(out[i]);
     }
 
-    // Build the two-camera seed on one candidate pair and keep it if it clears
-    // the level's thresholds; otherwise roll the model back to empty. Split out
-    // of the candidate scan so the focal bootstrap can rebuild *the same* pair
-    // under a different focal -- comparing hypotheses on one pair is what makes
-    // its scores comparable.
+    // 构建双相机种子，通过当前阈值则保留，否则回滚为空；焦距试探复用同一候选对以保证得分可比。
     bool trySeedPair(const TwoViewMatches& pm, double min_ang_deg, int min_inliers,
                      bool allow_forward, bool memoize) {
         const TwoViewMatches* p = &pm;
         const uint32_t a = p->image1, b = p->image2;
-        // Memoized (D38): relaxation levels and later seed attempts rescan
-        // the candidate list, and estimateTwoView (full two-view RANSAC) is by
-        // far its cost. The result is identical on every rescan -- cameras are
-        // pristine defaults whenever initialize() runs (resetModel precedes
-        // it), and the estimator is deterministic. The focal bootstrap passes
-        // memoize=false because it is *changing* the cameras between calls,
-        // which is exactly the assumption the cache rests on.
+        // 固定原始相机与确定性估计器下，重扫种子的 RANSAC 结果可缓存；焦距试探改变相机，必须关闭 memoize。
         TwoViewGeometry g;
         auto cached = memoize ? seed_geom_.find({a, b}) : seed_geom_.end();
         if (cached != seed_geom_.end()) {
@@ -3102,19 +2292,10 @@ private:
         if (g.config != TwoViewConfig::Uncalibrated) { init_tally_.config++; return false; }
         if (g.num_inliers < min_inliers) { init_tally_.few_inliers++; return false; }
 
-        // Near-pure forward motion: the baseline is parallel to the
-        // viewing directions, points triangulate on needle-thin cones
-        // around the epipole (COLMAP init_max_forward_motion).
-        //
-        // The veto is about what the *image* covers, not about the motion:
-        // a narrow lens pointed along its own baseline sees only the pencil of
-        // rays around the epipole. A spherical camera sees the whole sphere, so
-        // the points abeam have full parallax and driving straight forward is
-        // as well conditioned as any other motion -- the cap would be measuring
-        // a degeneracy that is not there (D49).
+        // 近纯前向运动使窄视场射线围绕极点退化；球面相机侧向仍有充分视差，不应应用此上限（D49）。
         double fwd;
         {
-            Vec3 c2 = cameraCenter(g.pose).normalized();  // cam1 is at origin
+            Vec3 c2 = cameraCenter(g.pose).normalized();  // 相机 1 位于原点
             fwd = std::max(std::fabs(c2.z),
                            std::fabs(c2.x * g.pose.R[6] + c2.y * g.pose.R[7] +
                                      c2.z * g.pose.R[8]));
@@ -3126,7 +2307,7 @@ private:
             }
         }
 
-        // Set up the two cameras and triangulate the inliers.
+        // 建立两个相机并三角化内点。
         rec_.images[a].pose = {mat3Identity(), {0, 0, 0}};
         rec_.images[a].registered = true;
         rec_.images[b].pose = g.pose;
@@ -3154,13 +2335,10 @@ private:
         if (created < std::max(30, min_inliers / 2)) init_tally_.few_points++;
         else if (medAng < min_ang_deg) init_tally_.low_angle++;
         if (created >= std::max(30, min_inliers / 2) && medAng >= min_ang_deg) {
-            // The seed cameras are about to be refined by the first global
-            // BA; do not let a later focal search overwrite that.
+            // 种子相机即将由首次全局 BA 精化，禁止后续焦距扫描覆盖。
             focal_known_.insert(rec_.images[a].camera_id);
             focal_known_.insert(rec_.images[b].camera_id);
-            // Only now: a rolled-back candidate is not progress, and the scan
-            // tries dozens. Counting each one that merely had a pose put 120 of
-            // a 120-image capture on the bar before the model existed.
+            // 种子正式接受后才计入进度，回滚候选不能虚增配准数量。
             if (opt_.report_progress) {
                 events::map_placed(a);
                 events::map_placed(b);
@@ -3176,14 +2354,12 @@ private:
                                      : spirula::i18n::msg::sfm::baseline_sideways).get()});
             return true;
         }
-        // Roll back and let the caller try the next candidate.
+        // 回滚并尝试下一候选。
         rollbackInit(a, b);
         return false;
     }
 
-    // Candidates are tried on a reset model (resetModel precedes initialize) and
-    // touch only their two images: sweeping every image cost a 3000-frame video,
-    // which rejects every neighbour pair, 80 MB of stores per candidate.
+    // 种子候选只修改两张图，回滚不扫描全数据库；3000 帧视频逐候选清理全部图像曾产生约 80 MB 写入。
     void rollbackInit(uint32_t a, uint32_t b) {
         rec_.points3D.clear();
         rec_.next_point3D_id = 1;
@@ -3194,10 +2370,8 @@ private:
         }
     }
 
-    // ---- registration ----
-    // Count 2D-3D correspondences an unregistered image has to the model.
-    // Reference implementation: score_cache_ maintains exactly this value
-    // incrementally (SS_SFM_SCORE_CHECK=1 cross-checks them on every ranking).
+    // ---------------- 图像配准 ----------------
+    // 此函数作为二维、三维支持计数的参考实现，增量 score_cache 保持同值，SS_SFM_SCORE_CHECK 可逐次核对。
     int score(uint32_t img) const {
         if (rec_.images.at(img).registered) return -1;
         int n = 0;
@@ -3206,20 +2380,13 @@ private:
                 if (rec_.images.at(c.image_id).registered &&
                     rec_.images.at(c.image_id).point3D_ids[c.feature_idx] != kInvalidPoint3D) {
                     n++;
-                    break;  // count the feature once
+                    break;  // 每个特征只计一次
                 }
         return n;
     }
 
-    // Incremental next-image scoring (D37). Rescoring every unregistered image
-    // after every registration was 1/3 of kitchen279's map time, and almost
-    // all of it recomputed unchanged values. Bookkeeping instead:
-    // support_[i][f] = number of (registered image, triangulated feature)
-    // correspondences of (i, f); score_cache_[i] = #features with support > 0
-    // == score(i). attachObservation() updates it when a feature of a
-    // registered image joins a 3D point (the only mutation on the pure growth
-    // path); everything wholesale (refine, undo, reseed) triggers
-    // rebuildScores() instead of being tracked piecemeal.
+    // support_[i][f] 记录通向已配准三维特征的对应数，score_cache 计支持非零的特征；添加观测增量更新，精化、撤销、重播种后整体重建。
+    // 避免每次配准重复评分全部未配准图像，此开销曾占 279 图数据建图时间三分之一（D37）。
     void rebuildScores() {
         ProfTimer pt(g_map_prof.choose);
         if (support_.size() != db_.images.size()) {
@@ -3251,8 +2418,7 @@ private:
         }
     }
 
-    // Feature f of registered image img just joined a 3D point: every
-    // correspondence of (img, f) gains one unit of support.
+    // 已配准特征关联三维点后，其所有对应各增加一单位支持。
     void attachObservation(uint32_t img, uint32_t f) {
         for (const Correspondence& c : graph_.at(img, f)) {
             if (++support_[c.image_id][c.feature_idx] == 1) {
@@ -3264,36 +2430,23 @@ private:
         }
     }
 
-    // ---- sequences (D79) --------------------------------------------------
-    // A duplicate verifies against the wrong copy of itself; correspondences to
-    // sequence neighbours cannot, so they come first (README, "Sequences").
+    // ---------------- 序列（D79）----------------
+    // 重复结构可能错误匹配到另一副本，优先采用时序邻居提供的对应。
     bool nearby(uint32_t a, uint32_t b) const {
         return seq_ && seq_->nearby(a, b, opt_.sequence_window);
     }
 
-    // Whether a candidate's neighbours alone could register it: the near score
-    // of its frame when the rig places frames whole, else its own.
+    // 检查仅邻居支持是否足以配准，rig 可整帧定位时使用帧级支持。
     bool nearReady(uint32_t img) const {
         if (!seq_) return false;
         return frameScoreOf(img, near_score_) >= opt_.min_num_pnp_inliers;
     }
 
-    // ---- visibility pyramid (D52) -----------------------------------------
-    //
-    // A candidate image's rank is not how *many* of its features see
-    // triangulated structure but how well those features are spread over the
-    // frame: a hundred correspondences in one corner condition a pose far worse
-    // than fifty across the whole image, and a pose that starts badly
-    // conditioned is what later turns into a misplacement. COLMAP ranks by the
-    // same quantity (its default MIN_UNCERTAINTY /
-    // ObservationManager::Point3DVisibilityScore) over the same pyramid.
-    //
-    // Levels are 2x2 .. 32x32; a cell becoming occupied adds that level's cell
-    // count to the score, so a coarse cell is worth as much as the whole finer
-    // level under it and spread beats density at every scale. The counts are
-    // maintained incrementally beside support_, from the same 0 -> 1 event.
+    // ---------------- 可见性金字塔（D52）----------------
+    // 按支持特征覆盖范围而非数量评分，避免大量角落特征产生病态位姿；采用 2×2 至 32×32 金字塔，与 COLMAP 的 MIN_UNCERTAINTY 一致。
+    // 单元首次占用按层权重加分，与 support 的 0->1 事件一起增量维护。
     static constexpr int kPyrLevels = 5;
-    static constexpr int kPyrDim = 1 << kPyrLevels;             // finest grid
+    static constexpr int kPyrDim = 1 << kPyrLevels;             // 最细网格
     static constexpr int kPyrCells = (4 * ((1 << (2 * kPyrLevels)) - 1)) / 3;  // 4+16+..+1024
 
     void pyramidSet(uint32_t img, uint32_t f) {
@@ -3304,7 +2457,7 @@ private:
         int cy = (int)(kPyrDim * (double)k.y / fs.height);
         cx = std::min(std::max(cx, 0), kPyrDim - 1);
         cy = std::min(std::max(cy, 0), kPyrDim - 1);
-        uint16_t* level = pyramid_[img].data() + kPyrCells;  // walk levels finest first
+        uint16_t* level = pyramid_[img].data() + kPyrCells;  // 从最细层开始遍历
         uint32_t score = 0;
         for (int i = kPyrLevels - 1; i >= 0; i--) {
             const int dim = 2 << i;
@@ -3316,16 +2469,10 @@ private:
         pyramid_score_[img] += score;
     }
 
-    // Candidates for the next registration, best first: unregistered, still
-    // within their trial budget, and seeing at least min_num_pnp_inliers
-    // triangulated points. The gate is the correspondence count; the *order* is
-    // the visibility-pyramid score, which prefers structure spread across the
-    // frame over structure piled in one corner. Images that already failed once
-    // sort behind every untried one, as in COLMAP: a retry is worth having but
-    // not worth delaying a fresh candidate for.
+    // 候选须未配准、未耗尽重试且对应数达标；按空间覆盖排序，失败过的图像排在所有未尝试图像之后。
     std::vector<uint32_t> chooseNextImages() const {
         static const bool score_check = spirula::env("SFM_SCORE_CHECK") != nullptr;
-        // Registered images per sequence position, for the frontier distance.
+        // 逐序列位置的已配准数量，用于计算前沿距离。
         std::vector<std::vector<uint16_t>> at_pos;
         if (seq_) {
             at_pos.resize(seq_->length.size());
@@ -3335,7 +2482,7 @@ private:
                     at_pos[seq_->seq[kv.first]][seq_->pos[kv.first]]++;
         }
         auto frontier = [&](uint32_t i) {
-            if (!seq_->has(i)) return opt_.sequence_window + 1;  // a rig-mate outside it
+            if (!seq_->has(i)) return opt_.sequence_window + 1;  // 位于范围外的 rig 伙伴
             const int32_t sq = seq_->seq[i], p = seq_->pos[i];
             for (int d = 0; d <= opt_.sequence_window; d++) {
                 if (p - d >= 0 && at_pos[sq][p - d]) return d;
@@ -3355,14 +2502,10 @@ private:
             }
             s = frameScore(i);
             if (s < opt_.min_num_pnp_inliers) continue;
-            // Off: the raw correspondence count, every candidate in one bucket.
-            // On: COLMAP's policy -- spread-based rank, and an image that has
-            // already failed once sorts behind every untried one.
+            // 关闭时统一按对应数量排序，开启时按空间分布并优先未尝试候选。
             uint64_t rank = opt_.rank_by_visibility ? (uint64_t)pyramid_score_[i] : (uint64_t)s;
             if (opt_.rank_by_visibility && !reg_trials_[i]) rank |= 1ull << 48;
-            // The sequence frontier -- images whose neighbours alone could
-            // place them -- ahead of everything, nearest to the model first,
-            // so growth is a sweep and each image meets its full support (D79).
+            // 仅靠邻居即可定位的序列前沿优先，且越近现有模型越先，使增长沿时序推进并获得完整支持（D79）。
             if (nearReady(i)) {
                 const uint64_t closeness = (uint64_t)std::min(
                     65535, std::max(0, opt_.sequence_window + 1 - frontier(i)));
@@ -3372,7 +2515,7 @@ private:
         }
         std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
             if (a.first != b.first) return a.first > b.first;
-            return a.second < b.second;  // stable, index-ordered tie-break
+            return a.second < b.second;  // 平局按索引稳定排序
         });
         std::vector<uint32_t> out;
         out.reserve(ranked.size());
@@ -3380,9 +2523,7 @@ private:
         return out;
     }
 
-    // The 2D-3D correspondences an unregistered image has to the model, one 3D
-    // point per feature: the first a sequence neighbour sees, else the first
-    // seen. `nearf`, when asked for, says which came from a neighbour.
+    // 每特征选择一个三维对应，优先序列邻居，否则首个可见点；nearf 标记邻居来源。
     void gatherCorrespondences(uint32_t img, std::vector<Vec3>& X, std::vector<Vec3>& br,
                                std::vector<uint32_t>& feat, std::vector<uint64_t>& pid,
                                std::vector<char>* nearf = nullptr) const {
@@ -3409,9 +2550,7 @@ private:
         }
     }
 
-    // `r` comes in as the whole pool's pose and leaves as the winner against
-    // the one the near correspondences (`nearf`) support on their own, judged
-    // by near inliers first (D79). True when it changed.
+    // 比较全池位姿与仅邻居支持位姿，优先邻居内点数；r 写回胜者，返回是否改变（D79）。
     bool preferNearPose(uint32_t img, const std::vector<Vec3>& X, const std::vector<Vec3>& br,
                         const std::vector<char>& nearf, PnPResult& r) {
         std::vector<Vec3> Xn, bn;
@@ -3431,7 +2570,7 @@ private:
         return true;
     }
 
-    // Inliers of `r.pose` over the pool, at the image's own radius.
+    // 按图像自身半径统计 r.pose 的全池内点。
     void classify(uint32_t img, const std::vector<Vec3>& X, const std::vector<Vec3>& br,
                   PnPResult& r) const {
         double thr = camOf(img).errRad(opt_.max_reproj_error);
@@ -3444,7 +2583,7 @@ private:
         }
     }
 
-    // SS_SFM_SEQ_DUMP=1: one line per registration attempt under a sequence.
+    // SS_SFM_SEQ_DUMP=1 逐次输出序列配准诊断。
     void seqDump(uint32_t img, const std::vector<Vec3>& X, const std::vector<char>& nearf,
                  const PnPResult& r, const PnPResult& rival, const char* verdict) const {
         if (!seq_dump_ || !seq_) return;
@@ -3459,9 +2598,7 @@ private:
                    rival_inl, verdict);
     }
 
-    // The ratio gate with a rival (the whole pool's pose the neighbours
-    // overruled): what the rival explains and this pose does not is the
-    // duplicate's evidence and leaves the denominator; noise stays (D79).
+    // 邻居推翻全池位姿后，将竞争解解释而当前解不解释的重复结构证据移出比例分母，普通噪声保留（D79）。
     bool ratioOkRival(uint32_t img, const std::vector<Vec3>& X, const std::vector<Vec3>& br,
                       const PnPResult& r, const PnPResult& rival, bool count = true) {
         std::vector<char> vis;
@@ -3475,8 +2612,7 @@ private:
         return true;
     }
 
-    // Commit a pose: register, continue the tracks its inliers belong to, and
-    // report. Shared by PnP and by the rig completion.
+    // 统一提交位姿、延续内点轨迹并报告，供 PnP 与 rig 补全共用。
     void commitPose(uint32_t img, const Pose& pose, const std::vector<uint32_t>& feat,
                     const std::vector<uint64_t>& pid, const std::vector<char>& inlier,
                     int num_inliers, size_t pool) {
@@ -3496,9 +2632,7 @@ private:
             slog::out(slog::Tag::Map, spirula::i18n::msg::sfm::map_registered,
                      {(long long)img, (long long)num_inliers, (long long)pool,
                       (long long)rec_.numRegistered()});
-        // Rate-limited inside, and a no-op without --progress-dir: this is the
-        // one point at which the model visibly grows. The colouring is a
-        // callback so it runs only over the points a snapshot writes.
+        // 模型增长处更新限流快照；颜色通过回调仅为实际输出点计算。
         if (opt_.report_progress) {
             progress::model(rec_, false,
                             [this](const Point3D& p, uint8_t rgb[3]) {
@@ -3511,19 +2645,16 @@ private:
             ev.images = (int64_t)db_.images.size();
             ev.points = (int64_t)rec_.points3D.size();
             events::emit(ev);
-            // The bar, which counts the capture and not this attempt: a seed
-            // retry resets the model, so `numRegistered` falls back to nothing.
+            // 进度按整次采集累计，不能使用种子重试时会归零的当前模型数量。
             events::map_placed(img);
         }
     }
 
     bool registerImage(uint32_t img) {
-        // A frame another lens already placed says where this one is; a frame
-        // with no lens placed yet registers as one thing.
+        // 已有成员放置的帧可预测当前镜头，否则整帧联合注册。
         Pose rig_pose;
         if (rigPredictedPose(img, rig_pose)) {
-            // The rest of the frame comes with it, and is placed on the same
-            // pose rather than a lens at a time.
+            // 其余成员使用同一帧位姿一起放置。
             const uint32_t placed = completeFrame(rigs_->slot(img), img);
             const bool self = rec_.images.at(img).registered;
             frame_regs_ += placed - (self ? 1 : 0);
@@ -3531,7 +2662,7 @@ private:
         }
         if (registerFrame(img)) return true;
         std::vector<Vec3> X;
-        std::vector<Vec3> br;   // observed unit bearings
+        std::vector<Vec3> br;   // 观测单位视线
         std::vector<uint32_t> feat;
         std::vector<uint64_t> pid;
         std::vector<char> nearf;
@@ -3540,16 +2671,9 @@ private:
 
         const uint32_t cid = rec_.images[img].camera_id;
         PnPResult r;
-        double swept_f = 0;  // focal chosen by the search, 0 = no search ran
-        // A supplied focal does *not* switch the sweep off, though the argument
-        // for switching it off is tempting (it is a measurement, and a sweep on
-        // one image's correspondences once took a dataset's camera
-        // from 549 to 5493 px). Measured, gating on it cost that dataset 75
-        // images of the primary model and 39 of total coverage: the sweep also
-        // lets a second camera group depart from a focal that was measured
-        // over the first. The runaway is caught by sanitizeCameras and by the
-        // joint refinement (D45), so the sweep stays.
-        PnPResult rival;  // the whole pool's answer, when the neighbours overruled it
+        double swept_f = 0;  // 搜索选出的焦距，0 表示未搜索
+        // 全局给定焦距仍允许其他组扫描，完全禁用曾少配主模型 75 图、总计 39 图；扫描发散由相机检查与联合优化限制（D45）。
+        PnPResult rival;  // 邻居推翻后保留的全池竞争位姿
         if (focal_known_.count(cid) || opt_.focal_search_samples <= 0) {
             r = ransacPnP(X, br, camOf(img).focal(), errPx(img));
             if (seq_) {
@@ -3557,10 +2681,7 @@ private:
                 if (preferNearPose(img, X, br, nearf, r)) rival = whole;
             }
         } else {
-            // First image of this camera: its focal is still the no-EXIF guess,
-            // and P3P consumes *calibrated* bearings, so a wrong focal fails
-            // outright rather than degrading. Sweep hypotheses log-uniformly
-            // and keep the one with the most inliers; BA refines from there.
+            // 组内首次图像且仍为无 EXIF 猜测时，按对数网格搜索焦距，取内点最多者；PnP 依赖标定视线，错误焦距可能直接失败。
             const Camera& c0 = camOf(img);
             const int N = opt_.focal_search_samples;
             for (int s = 0; s < N; s++) {
@@ -3576,10 +2697,7 @@ private:
                 if (t_r.success && t_r.num_inliers > r.num_inliers) { r = t_r; swept_f = trial.focal(); }
             }
         }
-        // Acceptance gates (COLMAP's): enough inliers *and* enough of the
-        // offered correspondences agreeing. An image whose hundreds of 2D-3D
-        // candidates yield a bare-minimum consensus is a misregistration
-        // waiting to bend the model (D36).
+        // 同时要求足够内点数量和比例，避免数百候选中偶然最小共识扭曲模型（D36）。
         if (!r.success || r.num_inliers < opt_.min_num_pnp_inliers) {
             reg_fail_.few_inliers++;
             return false;
@@ -3592,13 +2710,7 @@ private:
             return false;
         }
 
-        // Commit the searched focal only after the gates pass, then refine the
-        // pose on the inlier set (COLMAP refines every accepted PnP pose; the
-        // raw P3P/DLT pose is what the next triangulations would build on).
-        // A swept focal is only a coarse grid hypothesis, so it is refined
-        // jointly with the pose -- a 20% focal error passes RANSAC fine but
-        // locks bad intrinsics into the group, and BA then papers over the
-        // mismatch with runaway distortion (D36).
+        // 门限通过后才提交搜索焦距，并在内点上联合精化位姿与焦距；网格残余 20% 焦距误差也可能通过 RANSAC，不能留给畸变补偿。
         if (swept_f > 0) {
             const double f0 = camOf(img).focal();
             rec_.cameras[cid].setFocal(swept_f);
@@ -3619,16 +2731,14 @@ private:
         } else {
             const Pose held = r.pose;
             refinePose(X, br, r.inlier_mask, r.pose);
-            // The free refinement may walk off the gyro's rotation again; the
-            // constrained pose then stands.
+            // 自由精化再次偏离陀螺时，保留受约束位姿。
             Mat3 Rp;
             double sig;
             if (prior_held && priorRotation(img, Rp, sig) &&
                 rotationAngleDeg(mul(r.pose.R, transpose(Rp))) > priorTolDeg(sig))
                 r.pose = held;
         }
-        // Re-classify against the refined pose; the gates apply to the final
-        // consensus, not the RANSAC one.
+        // 按精化后位姿重判内点，接受门限作用于最终共识。
         classify(img, X, br, r);
         if (r.num_inliers < opt_.min_num_pnp_inliers) { reg_fail_.refined_out++; return false; }
         const size_t pool = visiblePool(img, X, br, r.pose);
@@ -3648,11 +2758,9 @@ private:
         return true;
     }
 
-    // ---- rigs -------------------------------------------------------------
+    // ---------------- 相机装置 ----------------
 
-    // The calibration a model starts from: the user's extrinsics where given
-    // (a translation as given when zero, from zero when only part of it is
-    // free, else once the frames measure it); the rest estimated from frames.
+    // 模型优先使用用户外参；零平移直接保留，部分平移自由时从零开始，其余由共同帧估计。
     void initRigCalib(Reconstruction& rec) const {
         rec.rigs.resize(rigs_->rigs.size());
         for (size_t r = 0; r < rigs_->rigs.size(); r++) {
@@ -3684,8 +2792,7 @@ private:
         }
     }
 
-    // Estimate the members nothing has established yet, from the frames whose
-    // images the model registered independently. Returns how many were.
+    // 利用独立注册的共同帧估计尚未建立的成员外参，返回新增标定数。
     size_t calibrateRigs(Reconstruction& rec) const {
         if (!rigs_) return 0;
         initRigCalib(rec);
@@ -3700,9 +2807,7 @@ private:
                 return it != rec.images.end() && it->second.registered;
             };
             if (c.ref < 0) {
-                // The reference: the member registered in the most frames
-                // alongside another member, so every other extrinsic has the
-                // most frames to be estimated from.
+                // 选择与其他成员共同配准帧最多的成员为参考，最大化其余外参的估计支持。
                 std::vector<size_t> co(nm, 0);
                 for (const auto& fr : spec.frames) {
                     size_t n = 0;
@@ -3738,7 +2843,7 @@ private:
                 if (inl < opt_.rig_calib.min_frames ||
                     (double)inl < opt_.rig_calib.min_inlier_frac * (double)rel.size() ||
                     spread > opt_.rig_calib.max_spread_deg) {
-                    // Said once, then again each time the evidence doubles.
+                    // 首次报告后，仅证据量翻倍时再次报告。
                     if (opt_.verbose && (int)rel.size() >= opt_.rig_calib.min_frames &&
                         rel.size() >= 2 * (size_t)c.declined_at[m]) {
                         c.declined_at[m] = (uint32_t)rel.size();
@@ -3760,8 +2865,7 @@ private:
         return newly;
     }
 
-    // Where the rig puts the whole frame, from a registered member whose
-    // extrinsic is calibrated (the one with the most points, when several are).
+    // 从已标定、已配准且观测最多的成员推算整帧位姿。
     bool rigPredictedFrame(const RigSlot& sl, Pose& out,
                            uint32_t exclude = UINT32_MAX) const {
         if (!rigs_ || !sl.valid() || sl.rig >= rec_.rigs.size()) return false;
@@ -3782,7 +2886,7 @@ private:
         return true;
     }
 
-    // ... and where that puts one of its lenses.
+    // 再由帧位姿推算单镜头位置。
     bool rigPredictedPose(uint32_t img, Pose& out) const {
         if (!rigs_ || rec_.rig_detached.count(img)) return false;
         const RigSlot sl = rigs_->slot(img);
@@ -3795,9 +2899,7 @@ private:
         return true;
     }
 
-    // A frame none of whose lenses is placed yet, registered as one thing:
-    // ransacRigPnP draws its sample from every member's correspondences and
-    // scores it on all of them, so lenses too weak alone still place it (D78).
+    // 尚无成员放置的帧联合全部镜头做 ransacRigPnP，以所有对应评分，使单镜头不足的支持也可共同定位（D78）。
     bool registerFrame(uint32_t img) {
         if (!rigs_ || rec_.rig_detached.count(img)) return false;
         const RigSlot sl = rigs_->slot(img);
@@ -3810,7 +2912,7 @@ private:
             std::vector<uint32_t> feat;
             std::vector<uint64_t> pid;
             std::vector<char> inl, nearf;
-            std::vector<Vec3> Xn, bn;   // the sequence neighbours' share of X, br
+            std::vector<Vec3> Xn, bn;   // X 与 br 中来自序列邻居的部分
             int n = 0;
             size_t pool = 0;
         };
@@ -3865,8 +2967,7 @@ private:
         const RigPnPResult r = ransacRigPnP(gm);
         bool have = r.success && r.num_inliers >= opt_.min_num_pnp_inliers;
         Pose best = r.rig_from_world;
-        // The neighbours' pose against the whole pool's, as preferNearPose;
-        // the whole pool's then stands as the rival, as in ratioOkRival.
+        // 比较邻居位姿与全池位姿，保留全池结果作为竞争解，规则与 preferNearPose/ratioOkRival 一致。
         std::vector<std::vector<char>> rival;
         if (seq_ && (int)total_near >= opt_.min_num_pnp_inliers) {
             const RigPnPResult rn = ransacRigPnP(gm_near);
@@ -3882,8 +2983,7 @@ private:
             }
         }
         if (!have) return false;
-        // The gyro's word on the frame: predicted through any placed
-        // neighbour of any lens, checked on the lens with the tightest prior.
+        // 由任一镜头已放置邻居预测帧旋转，并用最紧镜头先验检查。
         if (priors_) {
             Mat3 Rp;
             double sig = 0;
@@ -3898,9 +2998,7 @@ private:
                 got = true;
             }
             if (got && rotationAngleDeg(mul(best.R, transpose(Rp))) > priorTolDeg(sig)) {
-                // As priorCheckPose: a loose radius for the held rotation, a
-                // free refinement from there kept within the tolerance, and
-                // the strict consensus below to judge it.
+                // 固定旋转时放宽半径求解，再在容差内自由精化，最终按严格共识判断。
                 const double tol = priorTolDeg(sig);
                 std::vector<RigPnPMember> gl = gm;
                 for (RigPnPMember& e : gl) e.max_error += tol * M_PI / 180.0;
@@ -3991,8 +3089,7 @@ private:
         return true;
     }
 
-    // What a candidate is worth to try: its own correspondences, or its
-    // frame's when the rig can place the frame as one thing.
+    // 候选尝试价值取自身支持，或可联合定位时的整帧支持。
     int frameScore(uint32_t img) const { return frameScoreOf(img, score_cache_); }
 
     int frameScoreOf(uint32_t img, const std::vector<int>& scores) const {
@@ -4012,9 +3109,7 @@ private:
         return std::max(s, sum);
     }
 
-    // Every lens of a frame the rig reaches and nothing has placed, put down
-    // together: one frame pose refined on all their correspondences at once,
-    // then a bounded correction for a lens with enough of its own (D78).
+    // 将 rig 可推断但尚未放置的所有成员一起补齐，先用全部对应精化一个帧位姿，再允许有充分观测的镜头做受限修正（D78）。
     uint32_t completeFrame(const RigSlot& sl, uint32_t caller_triangulates) {
         if (!rigs_ || !sl.valid() || sl.rig >= rec_.rigs.size()) return 0;
         const RigCalib& c = rec_.rigs[sl.rig];
@@ -4053,9 +3148,7 @@ private:
         }
         if (ps.empty()) return 0;
 
-        // `scale` widens every lens's radius by the same factor, which is how
-        // the prediction is judged: it carries the placed lens's error plus the
-        // calibration's, and that is more than a lens's own inlier radius.
+        // scale 统一放宽各镜头半径，因预测同时包含已放置镜头误差与外参标定误差。
         auto consensus = [&](const Pose& F, double scale) {
             int sum = 0;
             for (Pending& e : ps) {
@@ -4111,9 +3204,7 @@ private:
         uint32_t placed = 0;
         for (Pending& e : ps) {
             Pose pose = c.camFromWorld(e.m, frame);
-            // A lens with enough of its own refines on top of the frame's pose,
-            // bounded by what the calibration is worth: the extrinsics are
-            // estimated, and a lens that sees better than they know may say so.
+            // 支持充分的镜头可在帧位姿上精化，但修正受标定不确定度限制。
             std::vector<char> mask(e.X.size(), 0);
             int wide = 0;
             for (size_t k = 0; k < e.X.size(); k++)
@@ -4151,8 +3242,7 @@ private:
         return placed;
     }
 
-    // How far a refined pose may move from the rig's prediction and still be
-    // the same pose: the calibration's own spread, with a floor, in degrees.
+    // 精化可偏离 rig 预测的角度为标定离散度与下限的较大者，单位度。
     double rigMoveTolDeg(uint32_t img) const {
         const RigSlot sl = rigs_->slot(img);
         const RigCalib& c = rec_.rigs[sl.rig];
@@ -4161,12 +3251,12 @@ private:
         return std::max(1.0, 3.0 * spread);
     }
 
-    // Register the unregistered rig-mates of `img`'s frame. Returns how many.
+    // 补齐 img 同帧未配准成员，返回新增数量。
     uint32_t completeFrameOf(uint32_t img) {
         return rigs_ ? completeFrame(rigs_->slot(img), kNoImage) : 0;
     }
 
-    // ... of every registered frame, once a calibration is there to do it with.
+    // 标定建立后补齐所有已配准帧的成员。
     uint32_t completeRigFrames() {
         if (!rigs_) return 0;
         uint32_t n = 0;
@@ -4177,8 +3267,7 @@ private:
         return n;
     }
 
-    // The registered images of `img`'s frame that the rig ties to it, `img`
-    // included; just `img` when nothing does.
+    // 返回 rig 约束绑定的已配准同帧图像，包含 img；无绑定时仅返回自身。
     std::vector<uint32_t> frameMates(uint32_t img) const {
         std::vector<uint32_t> out{img};
         if (!rigs_ || rec_.rig_detached.count(img)) return out;
@@ -4195,8 +3284,7 @@ private:
         return out;
     }
 
-    // Poses of the registered rig images a bundle adjustment left out (no
-    // observations), from a rig-mate it solved.
+    // 对因无观测而未进入 BA 的 rig 图像，使用已求解同帧成员恢复位姿。
     void snapRigFrames() {
         if (!rigs_) return;
         for (auto& kv : rec_.images) {
@@ -4206,10 +3294,7 @@ private:
         }
     }
 
-    // Join this image's features to 3D points the model already has, wherever
-    // its pose explains them: registerImage's track-continuation step, split
-    // out so a pose set from outside (the audit's repair) can use it too.
-    // Returns the number of observations attached.
+    // 将图像特征连接到位姿可解释的现有三维点，供普通配准与外部审查修复共用，返回新增观测数。
     uint32_t attachExisting(uint32_t img) {
         uint32_t attached = 0;
         Image& im = rec_.images[img];
@@ -4224,7 +3309,7 @@ private:
                 auto pt = rec_.points3D.find(pid);
                 if (pt == rec_.points3D.end()) continue;
                 if (reprojErr(img, f, pt->second.xyz) > errPx(img)) continue;
-                bool dup = false;  // one observation per image on a track
+                bool dup = false;  // 每条轨迹每张图像最多一个观测
                 for (const TrackElement& e : pt->second.track)
                     if (e.image_id == img) { dup = true; break; }
                 if (dup) continue;
@@ -4238,22 +3323,21 @@ private:
         return attached;
     }
 
-    // ---- triangulation of new points seen by a freshly registered image ----
+    // ---------------- 新配准图像的三维点三角化 ----------------
     void triangulateForImage(uint32_t img, double err_scale = 1.0) {
         ModelIndex mi = indexModel();
         triangulateForImageAt(mi, img, err_scale);
     }
 
-    using WorldRays = std::vector<std::vector<float>>;  // by image id, 3 per feature
+    using WorldRays = std::vector<std::vector<float>>;  // 按图像 ID，每特征三个分量
 
     struct NewTrack {
         Vec3 X;
-        uint32_t f = 0;  // the feature of the image it was made for
+        uint32_t f = 0;  // 候选所属图像的特征索引
         std::vector<TrackElement> track;
     };
 
-    // The index is a whole-model scan, so a caller that runs this over every
-    // registered image (completeAndRetriangulate) builds it once.
+    // 索引构建需扫描全模型，逐图重三角化时只构建一次并共用。
     void triangulateForImageAt(const ModelIndex& mi, uint32_t img, double err_scale) {
         const uint32_t n = feats_[img].count();
         const size_t kBlock = 256;
@@ -4268,8 +3352,7 @@ private:
         commitCollected(mi, img, made, err_scale);
     }
 
-    // Commit tracks featureTrack collected against an earlier state, in order;
-    // one whose elements a commit since has taken is made again from now.
+    // 按顺序提交先前状态收集的轨迹；若元素已被更早提交占用，则按当前状态重算。
     void commitCollected(const ModelIndex& mi, uint32_t img,
                          const std::vector<std::vector<NewTrack>>& made, double err_scale) {
         std::vector<Correspondence> obs;
@@ -4284,15 +3367,13 @@ private:
             }
     }
 
-    // The point triangulateForImageAt makes for feature f of img, if any. Read
-    // only: a later claim changes the answer only by taking one of `out`'s
-    // elements (the best pair's is among them), so a snapshot's answer checks.
+    // 只读计算图像特征可能生成的点；后续变化只会占用候选元素，包含最佳图像对，因此可检查快照答案是否仍有效。
     bool featureTrack(const ModelIndex& mi, uint32_t img, uint32_t f, double err_scale,
                       std::vector<Correspondence>& obs, NewTrack& out,
                       const WorldRays* rays = nullptr) const {
         const Image& me = *mi.img[img];
         if (me.point3D_ids[f] != kInvalidPoint3D) return false;
-        // candidate observations: registered, feature not yet on a 3D point
+        // 候选观测须已配准且尚未关联三维点
         obs.clear();
         for (const Correspondence& c : graph_.at(img, f))
             if (mi.img[c.image_id]->registered &&
@@ -4308,9 +3389,7 @@ private:
             return bo[k];
         };
 
-        // Triangulate with the correspondence of maximum parallax. Rays closer
-        // than the minimum angle less both reprojection tolerances cannot:
-        // 94% of a dual-fisheye video's candidates, frames 1/30 s apart.
+        // 选择最大视差对应三角化，先按最小角度减两侧误差容差排除不可能候选；30 Hz 双鱼眼视频可提前排除约 94%。
         Vec3 ra = mul(transpose(me.pose.R), bf);
         ra = ra * (1.0 / ra.norm());
         const double tol_a = rayTolerance(mi, img, err_scale);
@@ -4342,7 +3421,7 @@ private:
         }
         if (!bestC) return false;
 
-        // Build the track: this obs + every candidate that reprojects well.
+        // 轨迹包含当前观测及所有重投影合格候选。
         std::vector<TrackElement>& track = out.track;
         track.clear();
         track.push_back({img, f});
@@ -4353,7 +3432,7 @@ private:
                 track.push_back({c.image_id, c.feature_idx});
         }
         if (track.size() < 2) return false;
-        // Guard against two features from the same image on one track.
+        // 禁止同一图像的两个特征进入同一轨迹。
         std::sort(track.begin(), track.end(),
                   [](const TrackElement& a, const TrackElement& b) {
                       return a.image_id < b.image_id;
@@ -4369,9 +3448,7 @@ private:
         return true;
     }
 
-    // Registered images' feature rays, world frame, unit, float: a fisheye bearing
-    // is an iterative inversion and the filter wanted 166M a pass. Float error is
-    // far inside rayTolerance's slack; what passes is decided on exact bearings.
+    // 缓存已配准特征的世界单位视线为 float，避免过滤每轮约 1.66 亿次鱼眼反解；粗筛误差包含于余量，最终接受仍用精确视线。
     WorldRays worldRays(const ModelIndex& mi) {
         WorldRays out(db_.images.size());
         std::vector<uint32_t> imgs;
@@ -4396,14 +3473,13 @@ private:
         return out;
     }
 
-    // The angle a reprojection tolerance can move a ray by: twice the tolerance
-    // over the focal, for a lens whose rim compresses the pixel scale.
+    // 视线角度余量取两倍像素容差除焦距，覆盖镜头边缘压缩像素尺度的情况。
     double rayTolerance(const ModelIndex& mi, uint32_t img, double err_scale) const {
         const Camera& c = *mi.cam[img];
         return 2.0 * err_scale * opt_.max_reproj_error * mi.pixel_scale[img] / std::min(c.fx, c.fy);
     }
 
-    // featureTrack's candidate bearings; each worker thread sizes and uses its own.
+    // featureTrack 候选视线临时区，每线程独立定尺寸并使用。
     static std::vector<Vec3>& obs_bearing_scratch() {
         static thread_local std::vector<Vec3> v;
         return v;
@@ -4411,31 +3487,19 @@ private:
 
     void commitNewTrack(const NewTrack& t) {
         rec_.addPoint3D(t.X, t.track);
-        // Each element joins a point. Completion's direct track edits leave these
-        // counts behind -- harmless: nothing ranks before rebuildScores().
+        // 添加观测更新支持计数；轨迹补全的直接修改可暂不更新，因为下次排序前会 rebuildScores。
         for (const TrackElement& e : t.track) attachObservation(e.image_id, e.point2D_idx);
     }
 
 
-    // ---- global refinement: BA + filtering + image de-registration ----
-    //
-    // COLMAP's IterativeGlobalRefinement in miniature: bundle-adjust, filter,
-    // and repeat while the model keeps changing, then de-register images the
-    // filtering hollowed out. De-registration is the mapper's undo: a
-    // registration that passed its PnP gates but stopped agreeing with the
-    // refined model exits (and may re-register later, better) instead of
-    // staying and bending everything around it (D36).
+    // ---------------- 全局精化：BA、过滤与撤销配准 ----------------
+    // 迭代求解和过滤直到模型稳定，再撤销失去支持的图像，允许后续重新配准，避免坏位姿持续拉偏模型（D36）。
     void globalRefine(bool final_pass) {
         if (rec_.numRegistered() < 2 || rec_.points3D.size() < 10) return;
         const bool tight = final_pass && opt_.ba_final_tight;
         int rounds = tight ? opt_.ba_max_refinements : 2;
         for (int i = 0; i < rounds; i++) {
-            // Observations shredded by the previous round's filtering (or
-            // never triangulated because the poses were still rough) get a
-            // second chance against the refined geometry -- COLMAP's
-            // Retriangulate + CompleteTracks. Without it refinement can only
-            // ever LOSE observations, and on sparse match graphs the model
-            // starves right after bootstrap (D36).
+            // 精化后补全轨迹并重三角化，为先前被过滤或位姿太粗的观测重新提供机会，避免稀疏匹配模型只能不断失去结构。
             if (i > 0 && opt_.retri_scale > 0) {
                 ProfTimer pt(g_map_prof.retri);
                 completeAndRetriangulate();
@@ -4452,24 +3516,8 @@ private:
             bo.refine_principal_point = opt_.refine_principal_point || final_.pp;
             bo.refine_extra_params = opt_.refine_extra_params || final_.extra;
             bo.pp_min_images = opt_.pp_min_images;
-            // Convergence-adaptive iterations (D38): the first round of a
-            // growth refine runs to a loose tolerance -- most refines stop
-            // there because the model barely changed. A round beyond the
-            // first only happens when the previous one moved >ba_refine_change
-            // of the observations (retriangulation just rebuilt structure, or
-            // filtering shredded it), and those rounds run to the solver's
-            // full tolerance: the filters that follow are about to make
-            // kill/keep decisions against this geometry, and judging them
-            // against a half-converged model is what cost a dataset
-            // its tail under D37's fixed cap. Final passes are always tight.
-            //
-            // The scalar follows the *tolerance*, not the pass: fp32 belongs
-            // exactly where the stopping threshold is one it can reach. A round
-            // past the first runs to the solver's full tolerance even in a
-            // growth refine, and asking fp32 for that means the LM loop spends
-            // its whole iteration budget on a threshold below its noise floor.
-            // Measured on a 1194-image capture, getting this pairing wrong took
-            // the finishing passes from 48 s to 260 s.
+            // 增长精化首轮采用宽松容差，观测变化较大才追加严格轮次，最终精化始终严格。
+            // 标量配置须匹配容差；fp32 无法达到低于噪声底的要求，1194 图数据错误配对曾使收尾从 48 s 增至 260 s（D38）。
             const bool loose = !tight && i == 0 && opt_.ba_growth_rtol > 0;
             if (loose) {
                 bo.rtol = opt_.ba_growth_rtol;
@@ -4491,14 +3539,8 @@ private:
             double cost = runGlobalBA(rec_, bo);
             if (rigs_ && !final_.no_rig) snapRigFrames();
             ProfTimer pt(g_map_prof.filter);
-            // Runs after every mapping BA, and it is load-bearing: without it
-            // a capture whose distortion terms drift lands in a self-consistent
-            // pancake it cannot climb out of. Measured on an 811-image object
-            // capture, disabling it took AUC@10 from 84.3 to 0.0 and the focal
-            // to 25219 from a 2813 default. It was once disabled as breaking
-            // internet image collections; on the only such collection here
-            // (1363 images, one camera each) it is the other way round --
-            // AUC@10 83.2 with, 68.7 without.
+            // 每次建图 BA 后约束相机到物理合理范围；811 图数据关闭后 AUC@10 从 84.3 降至 0，焦距由默认 2813 发散至 25219。
+            // 1363 图网络集合开启为 83.2，关闭为 68.7，因此同样保留。
             if (!final_.no_sanitize) sanitizeCameras();
             int removedObs = 0, removedPts = 0;
             filterPoints(removedObs, removedPts);
@@ -4523,32 +3565,15 @@ private:
         if (rigs_ && !final_.no_rig) completeRigFrames();
     }
 
-    // Fuse two 3D points that a correspondence says are the same feature
-    // (COLMAP's IncrementalTriangulator::MergeTracks). Track *creation* only
-    // ever gathers features that are still free, so a point triangulated from
-    // images A,B and one triangulated from C,D stay separate for good once the
-    // pose that connects them arrives -- every later pass sees both features
-    // already assigned and leaves them alone. Fusing them is what turns a
-    // revisit into a loop closure: one long track constrains the two ends of
-    // the loop against each other, two short ones constrain nothing.
-    //
-    // A merge is accepted only if *every* element of the union reprojects
-    // within `err` of the track-length-weighted average position -- the same
-    // all-inliers rule COLMAP uses -- if the union keeps at most one
-    // observation per image, the invariant the rest of the mapper relies on,
-    // and if it still subtends the minimum triangulation angle (D54).
+    // 合并对应图指向同一点的重复轨迹，使回访形成真正闭环；仅创建自由特征无法连接已分别三角化的两半。
+    // 联合轨迹须每图最多一个观测，所有观测均能解释按轨迹长度加权的位置，且保留最小三角化角度（D54）。
     size_t mergeTracks(const ModelIndex& mi, double err_scale) {
         const double err = err_scale * opt_.max_reproj_error;
         size_t merged = 0;
         std::vector<uint64_t> ids;
         ids.reserve(rec_.points3D.size());
         for (const auto& kv : rec_.points3D) ids.push_back(kv.first);
-        // Pairs already judged, so a pair reached from both of its ends costs
-        // one test rather than two. Keyed by the two ids packed into one word:
-        // this set takes a lookup per (observation, correspondence) over the
-        // whole model, which is millions per pass, and a tree node each was
-        // most of the cost. Point ids are handed out one per triangulation, so
-        // the 32-bit halves are not a practical limit.
+        // 用打包的两点 ID 记录已判定点对，避免从两端重复测试；哈希替代树节点降低数百万次查询开销。
         std::unordered_set<uint64_t> tried;
         tried.reserve(4 * rec_.points3D.size());
         std::vector<uint8_t> on_track(db_.images.size(), 0);
@@ -4556,8 +3581,7 @@ private:
         for (uint32_t i = 0; i < db_.images.size(); i++)
             if (mi.img[i] && mi.img[i]->registered) centers[i] = cameraCenter(mi.img[i]->pose);
         for (uint64_t pid : ids) {
-            // The loop below may absorb a point into another and erase it, so
-            // the id is re-checked and the walk restarted from the survivor.
+            // 合并可能删除当前点，重新检查 ID 并从幸存点继续遍历。
             for (int hop = 0; hop < 8; hop++) {
                 auto pit = rec_.points3D.find(pid);
                 if (pit == rec_.points3D.end()) break;
@@ -4569,9 +3593,7 @@ private:
         return merged;
     }
 
-    // One merge attempt over every correspondence of `pid`'s track; returns the
-    // number of observations absorbed (0 if nothing merged).
-    // Observations a merged track may reach; see the note in mergeOne.
+    // 对 pid 轨迹的全部对应尝试一次合并，返回吸收观测数，0 表示没有成功合并。
     static constexpr size_t kMergeMaxTrack = 20;
 
     size_t mergeOne(const ModelIndex& mi, uint64_t pid, double err,
@@ -4591,16 +3613,10 @@ private:
                 if (qit == rec_.points3D.end()) continue;
                 Point3D& q = qit->second;
 
-                // The reduced camera system the solver builds has an entry per
-                // image *pair* on a track, so a track of length t costs
-                // t(t+1)/2 -- fusing two length-10 tracks into one costs three
-                // times what the two cost apart, for a twentieth observation
-                // that constrains a point nineteen views already pin down. On a
-                // 1194-image fisheye capture, unbounded fusion took the mean
-                // track from 3.5 to 7.2 observations and the bundle adjustment
-                // from 0.03 to 0.36 seconds per iteration.
+                // 轨迹长 t 时 Schur 图像对数为 t(t+1)/2，合并长轨迹收益递减而成本平方增长。
+                // 1194 图鱼眼中无界融合使平均轨迹 3.5->7.2，BA 每轮 0.03->0.36 s，因此限制长度。
                 if (pt.track.size() + q.track.size() > kMergeMaxTrack) continue;
-                // One observation per image, or the union is not a track.
+                // 每图最多一个观测，否则不是合法轨迹。
                 bool clash = false;
                 for (const TrackElement& a : pt.track) on_track[a.image_id] = 1;
                 for (const TrackElement& b : q.track)
@@ -4618,13 +3634,7 @@ private:
                     if (!ok) break;
                 }
                 if (!ok) continue;
-                // The union must still be a triangulation. Without this a merge
-                // can produce a point whose views all sit on one line -- every
-                // observation reprojects, so the test above passes -- and the
-                // very next filterPoints kills it for lost parallax. The two
-                // halves are then retriangulated and merged again on the next
-                // round: churn that costs a bundle adjustment each time and
-                // ends where it started.
+                // 联合轨迹必须保持足够视差；仅重投影合格仍可能变成共线退化点，被下一轮删除后又重建，引发无收益 BA 震荡。
                 if (!wellTriangulated(pt.track, q.track, x, centers)) continue;
 
                 const size_t absorbed = q.track.size();
@@ -4640,16 +3650,11 @@ private:
         return 0;
     }
 
-    // Does some pair of views of `a` + `b` see `x` from far enough apart to fix
-    // its depth? Same criterion filterPoints applies, so a merge this accepts
-    // is one the filter will keep.
+    // 检查联合轨迹是否有足够基线约束深度，与 filterPoints 使用相同判据。
     bool wellTriangulated(const std::vector<TrackElement>& a, const std::vector<TrackElement>& b,
                           const Vec3& x, const std::vector<Vec3>& centers) const {
         const double min_ang = opt_.min_tri_angle_deg * M_PI / 180.0;
-        // A long track is the case where the pairwise scan would be quadratic
-        // and where it is also least needed, so it is sampled with a stride
-        // rather than truncated -- the widest baseline of a dolly capture is
-        // between its two ends, and a prefix would never see it.
+        // 长轨迹按步长分散采样，避免二次扫描且覆盖首尾最大基线，不能仅截取前缀。
         constexpr size_t kMaxScan = 12;
         std::vector<uint32_t> imgs;
         imgs.reserve(2 * kMaxScan);
@@ -4664,18 +3669,10 @@ private:
         return false;
     }
 
-    // Extend existing tracks to unassigned features that reproject well
-    // (transitively: added elements are sources for further completion), then
-    // re-run triangulation for every registered image so features whose
-    // earlier points were filtered can rebuild them from the refined poses, and
-    // finally fuse the tracks that turn out to be the same point.
-    //
-    // Everything re-added must clear a *stricter* bar (0.75x) than the filter
-    // kills at: without the hysteresis, junk in the borderline band churns --
-    // filtered at >4 px, immediately re-created at <=4 px -- and every BA
-    // round drags the poses toward it again (D36).
+    // 先传递补全现有轨迹，再重三角化各已配准图像，最后融合重复点。
+    // 新加观测使用比删除阈值更严格的 0.75 倍门限，防止边界噪声反复删除、重建并拉偏 BA（D36）。
     void completeAndRetriangulate() {
-        const double err = opt_.retri_scale * opt_.max_reproj_error;  // x pixel_scale below
+        const double err = opt_.retri_scale * opt_.max_reproj_error;  // 下方再乘 pixel_scale
         ModelIndex mi = indexModel();
         std::vector<std::pair<uint64_t, Point3D*>> pts;
         pts.reserve(rec_.points3D.size());
@@ -4684,9 +3681,7 @@ private:
         for (const auto& kv : rec_.images)
             if (kv.second.registered) imgs.push_back(kv.first);
 
-        // Collected in parallel against the pass's starting state, committed in
-        // the serial order; an item whose claims an earlier commit took is redone
-        // then, so the result is the serial pass's (src/sfm/README.md, "Retriangulation").
+        // 按初始状态并行收集，再按串行顺序提交；被更早提交占用的候选重算，保证与串行结果一致。
         std::vector<std::vector<TrackElement>> added(pts.size());
         parallelFor(pts.size(), 256, [&](size_t lo, size_t hi, std::vector<uint8_t>& on_track) {
             for (size_t i = lo; i < hi; i++) collectCompletion(mi, *pts[i].second, err, on_track,
@@ -4728,9 +3723,7 @@ private:
         }
     }
 
-    // The observations track completion adds to `pt`: every correspondence of
-    // an element, transitively, that is free, on an image the track lacks, and
-    // reprojects within `err`. `on_track` is all zero on entry and on return.
+    // 递归收集自由、尚未出现在轨迹且重投影误差小于 err 的对应，on_track 进入与返回时均清零。
     void collectCompletion(const ModelIndex& mi, const Point3D& pt, double err,
                            std::vector<uint8_t>& on_track, std::vector<TrackElement>& add) const {
         add.clear();
@@ -4754,8 +3747,7 @@ private:
         for (const TrackElement& e : add) on_track[e.image_id] = 0;
     }
 
-    // fn(lo, hi, scratch) over [0, n) in blocks, on the mapper's threads; each
-    // worker gets a zeroed flag buffer the size of the image table.
+    // 按块在工作线程调用 fn，每线程获得与图像表同大小的独立零标记缓冲。
     template <class F>
     void parallelFor(size_t n, size_t block, F&& fn) {
         const unsigned hc = std::thread::hardware_concurrency();
@@ -4778,28 +3770,16 @@ private:
         return n;
     }
 
-    // Drop observations that reproject badly and points whose track lost its
-    // parallax: a track whose best view pair subtends less than min_tri_angle
-    // sits on a near-degenerate cone and feeds PnP unstable geometry (COLMAP
-    // filters on both criteria; the old code only checked reprojection).
+    // 删除重投影不合格观测和失去视差的点，避免近退化轨迹向 PnP 提供不稳定三维结构。
     void filterPoints(int& removedObs, int& removedPts) {
-        // This pass touches every observation in the model on every global
-        // refinement round, so it goes through the flat index rather than
-        // reprojErr()/errPx()'s five std::map lookups per observation.
+        // 逐轮遍历全部观测，通过平铺索引避免每观测约五次 map 查找。
         ModelIndex mi = indexModel();
         std::vector<Vec3> centers(db_.images.size());
         for (uint32_t i = 0; i < db_.images.size(); i++)
             if (mi.img[i] && mi.img[i]->registered) centers[i] = cameraCenter(mi.img[i]->pose);
         const double min_ang = opt_.min_tri_angle_deg * M_PI / 180.0;
 
-        // Points are independent here: each one reads its own track and the
-        // shared pose/camera table, and the only shared write is clearing
-        // point3D_ids[image][feature], which exactly one point owns. So the
-        // pass fans out over the point list. It is the mapper's largest host
-        // cost on a fisheye capture -- reprojErr's cheirality test inverts the
-        // distortion for every observation, and this runs after every one of
-        // dozens of bundle adjustments. Results do not depend on the split:
-        // each point's verdict is a pure function of its own track.
+        // 各点独立读轨迹与共享相机表，唯一共享写入是该点独占的图像特征关联，因此可按点并行且结果不依赖任务划分。
         std::vector<std::pair<uint64_t, Point3D*>> pts;
         pts.reserve(rec_.points3D.size());
         for (auto& kv : rec_.points3D) pts.emplace_back(kv.first, &kv.second);
@@ -4822,7 +3802,7 @@ private:
                 const size_t e = std::min(b + kBlock, pts.size());
                 for (size_t pi = b; pi < e; pi++) {
                     Point3D& pt = *pts[pi].second;
-                    size_t keep = 0;  // compact in place; surviving order unchanged
+                    size_t keep = 0;  // 原地压缩，保持幸存顺序
                     for (size_t r = 0; r < pt.track.size(); r++) {
                         const TrackElement el = pt.track[r];
                         if (reprojErrAt(mi, el.image_id, el.point2D_idx, pt.xyz) <=
@@ -4870,10 +3850,7 @@ private:
         for (uint64_t id : drop) { rec_.points3D.erase(id); removedPts++; }
     }
 
-    // Undo a registration: detach every observation, drop tracks that fall
-    // below two views, unregister. reg_trials_ already counted the attempt,
-    // so the image can be retried until its budget runs out (D15's ranking
-    // naturally re-offers it once more of the scene exists).
+    // 撤销配准时解除全部观测，删除少于两视图的轨迹；已消耗试验计数保留，剩余预算允许后续重试。
     void deregisterImage(uint32_t img) {
         Image& im = rec_.images[img];
         for (uint32_t f = 0; f < (uint32_t)im.point3D_ids.size(); f++) {
@@ -4895,14 +3872,7 @@ private:
         im.registered = false;
     }
 
-    // A camera that left the physically plausible regime is pulled back in
-    // rather than getting its images de-registered (where COLMAP kills the
-    // images, fatal when a camera group covers many of them). If the wild
-    // parameters were benign -- high-order distortion terms unconstrained
-    // outside the data's radial support -- residuals barely move and
-    // everything survives; if they were absorbing bad geometry, the very next
-    // reprojection filter exposes exactly the observations that depended on
-    // them, and de-registration proceeds from evidence (D36).
+    // 相机参数超出合理范围时先拉回，不直接撤销整个组；若异常系数只反映未约束区域则残差变化小，若在掩盖坏几何，后续过滤会暴露对应问题（D36）。
     void sanitizeCameras() {
         for (auto& kv : rec_.cameras) {
             Camera& c = kv.second;
@@ -4913,14 +3883,11 @@ private:
                 c.setFocal(d.focal());
                 fixed++;
             }
-            // FullOpenCV's k4..k6 are the rational denominator, but in the same
-            // normalized-radius units as k1..k3, so one threshold covers both.
+            // FullOpenCV 分母 k4..k6 与分子 k1..k3 使用相同归一化半径单位，共用阈值。
             for (double* k : {&c.k1, &c.k2, &c.k3, &c.k4, &c.k5, &c.k6, &c.p1, &c.p2,
                               &c.sx1, &c.sy1})
                 if (std::fabs(*k) > opt_.max_extra_param) { *k = 0; fixed++; }
-            // The mapper never has evidence to move the principal point far
-            // from the center (COLMAP does not refine it at all during
-            // mapping); a large excursion is BA absorbing something else.
+            // 建图中主点不应远离中心，大幅偏移通常是 BA 在补偿其他错误。
             if (std::fabs(c.cx - d.cx) > 0.2 * c.width) { c.cx = d.cx; fixed++; }
             if (std::fabs(c.cy - d.cy) > 0.2 * c.height) { c.cy = d.cy; fixed++; }
             if (fixed && opt_.verbose)
@@ -4929,12 +3896,10 @@ private:
         }
     }
 
-    // COLMAP's FilterImages, minus the bogus-camera criterion (cameras are
-    // sanitized in place instead): de-register images whose observations
-    // collapsed under filtering.
+    // 撤销过滤后观测不足的图像；异常相机已原地修正，不按相机异常直接删除整组。
     int filterImages() {
         if (rec_.numRegistered() <= 2) return 0;
-        // A rig frame is judged, and dropped, as one thing.
+        // rig 帧作为整体判断与撤销。
         std::vector<uint32_t> drop;
         std::set<uint32_t> seen;
         for (auto& kv : rec_.images) {
@@ -4953,8 +3918,7 @@ private:
         return (int)drop.size();
     }
 
-    // Give every registered image its own camera, copied from the group it was
-    // in. Returns how many were made; 0 when the images already have one each.
+    // 为每已配准图像复制独立相机，返回创建数；已逐图独立时为 0。
     size_t splitCamerasPerImage() {
         std::set<uint32_t> used;
         size_t registered = 0;
@@ -4979,9 +3943,7 @@ private:
         return made;
     }
 
-    // A camera whose registered images all went away starts over from the
-    // pristine default: its focal search / BA state was fit to registrations
-    // that have been rejected, and a retry must not inherit that.
+    // 相机组全部图像被撤销后恢复原始默认，避免重试继承已被否定配准拟合出的坏内参。
     void resetOrphanCameras() {
         std::set<uint32_t> used;
         for (const auto& kv : rec_.images)
@@ -4989,9 +3951,7 @@ private:
         for (auto& kv : rec_.cameras)
             if (!used.count(kv.first) && focal_known_.count(kv.first)) {
                 kv.second = default_cams_.at(kv.first);
-                // A prior is a measurement of the lens, not of the
-                // registrations that were just rejected: it stays known, and
-                // default_cams_ already holds it.
+                // 镜头先验独立于失败配准，保持已知，default_cams_ 中已保存。
                 if (!opt_.known_focal_cameras.count(kv.first)) focal_known_.erase(kv.first);
             }
     }
@@ -4999,58 +3959,47 @@ private:
     const MatchesDatabase& db_;
     const std::vector<FeatureSet>& feats_;
     MapperOptions opt_;
-    std::vector<uint32_t> cam_ids_;   // per image, 1-based camera id
-    std::set<uint32_t> focal_known_;  // cameras whose focal is no longer a guess
-    // What a finishing pass frees beyond the mapping-time settings, and what it
-    // skips. Set for the duration of one call; empty everywhere else.
+    std::vector<uint32_t> cam_ids_;   // 逐图像相机 ID，从 1 开始
+    std::set<uint32_t> focal_known_;  // 焦距不再是猜测的相机集合
+    // 收尾释放或跳过的临时配置仅在单次调用期间生效。
     struct FinalRelease {
-        bool pp = false;           // the principal point (D51)
-        bool extra = false;        // the distortion coefficients (D72)
-        bool no_sanitize = false;  // per-image intrinsics: no group to clamp to (D73)
-        bool no_rig = false;       // every image on its own pose (releaseRigs)
+        bool pp = false;           // 释放主点（D51）
+        bool extra = false;        // 释放畸变系数（D72）
+        bool no_sanitize = false;  // 逐图独立内参，无共享组可用于钳位（D73）
+        bool no_rig = false;       // 各图像独立位姿，解除 rig 约束
     };
     FinalRelease final_;
-    std::map<uint32_t, Camera> default_cams_;  // pristine per-group defaults
-    // Best intrinsics any admitted model has produced for each camera group,
-    // with the number of images that constrained them (D45; recordCameras).
+    std::map<uint32_t, Camera> default_cams_;  // 原始组默认内参
+    // 下项保存已接纳模型发布的最佳内参与支持图像数（D45）。
     std::map<uint32_t, std::pair<Camera, double>> cam_consensus_;
     bool setup_done_ = false;
-    // SS_SFM_AUDIT_DUMP=1 prints the support ratio of every audited image,
-    // which is how the threshold above was chosen against a rig capture.
+    // SS_SFM_AUDIT_DUMP=1 输出逐图审查支持比例，用于在 rig 数据上选择阈值。
     const bool audit_dump_ = spirula::env("SFM_AUDIT_DUMP") != nullptr;
-    // SS_SFM_RIG_DUMP=1 prints every rig placement's verdict and by how much
-    // the refinement moved it, which is how the tolerance above was set.
+    // SS_SFM_RIG_DUMP=1 输出各 rig 放置判定和精化偏移，用于选择容差。
     const bool rig_dump_ = spirula::env("SFM_RIG_DUMP") != nullptr;
-    const bool seq_dump_ = spirula::env("SFM_SEQ_DUMP") != nullptr;  // seqDump()
-    mutable double scale_cache_ = 0;  // modelScale(), reset by resetModel()
-    int init_relax_ = 0;              // reached seed-threshold relaxation level
-    InitTally init_tally_;            // why the last initialize() found nothing
-    const TwoViewMatches* seed_pair_ = nullptr;  // pair the last seed was built on
-    double seed_forward_ = 0;         // its |baseline . viewing dir|
-    std::set<std::pair<uint32_t, uint32_t>> used_seeds_;  // seeds already grown
-    std::map<std::pair<uint32_t, uint32_t>, TwoViewGeometry> seed_geom_;  // memoized (D38)
+    const bool seq_dump_ = spirula::env("SFM_SEQ_DUMP") != nullptr;  // seqDump 使用的开关
+    mutable double scale_cache_ = 0;  // modelScale 缓存，由 resetModel 重置
+    int init_relax_ = 0;              // 已达到的种子阈值放宽等级
+    InitTally init_tally_;            // 最近 initialize 未找到种子的原因
+    const TwoViewMatches* seed_pair_ = nullptr;  // 最近成功种子的图像对
+    double seed_forward_ = 0;         // 对应的 |基线·视线方向|
+    std::set<std::pair<uint32_t, uint32_t>> used_seeds_;  // 已增长过的种子
+    std::map<std::pair<uint32_t, uint32_t>, TwoViewGeometry> seed_geom_;  // 双视图几何缓存（D38）
     Reconstruction rec_;
     CorrespondenceGraph graph_;
-    std::vector<std::vector<uint16_t>> support_;  // per (image, feature), see rebuildScores
-    std::vector<int> score_cache_;                // == score(i) for every image
-    std::vector<std::vector<uint16_t>> pyramid_;  // per image, kPyrCells occupancy counts
-    std::vector<uint32_t> pyramid_score_;         // per image, see pyramidSet
+    std::vector<std::vector<uint16_t>> support_;  // 逐（图像，特征），见 rebuildScores
+    std::vector<int> score_cache_;                // 每图像均等于 score(i)
+    std::vector<std::vector<uint16_t>> pyramid_;  // 逐图像 kPyrCells 个占用计数
+    std::vector<uint32_t> pyramid_score_;         // 逐图像金字塔分数，见 pyramidSet
     std::vector<int> reg_trials_;
-    // Per image, how many *kept* models registered it (D41). Empty until the
-    // first model is kept, which is what makes the whole multi-model path inert
-    // while the primary model is being built.
-    // Why registerImage() turned an attempt down, summed over the run.
-    // Does this consensus clear the ratio gate, or stand on its own without it?
-    // See strong_pnp_inliers. Used for the *second* look, after the pose has
-    // been refined: the ambiguity test below has already run on the same image.
+    // 逐图像被保留模型配准的次数，首模型保留前为空；另累计本次运行的配准拒绝原因。
+    // 精化后的第二次比例检查沿用已做过的歧义判定，绝对支持策略见 strong_pnp_inliers。
     bool ratioOk(int inliers, size_t pool) const {
         if ((double)inliers >= opt_.min_pnp_inlier_ratio * (double)pool) return true;
         return opt_.strong_pnp_inliers > 0 && inliers >= opt_.strong_pnp_inliers;
     }
 
-    // How many of the offered correspondences this pose could explain at all:
-    // the point in front of the camera and projecting inside the frame. See
-    // pnp_ratio_visible_only -- this is the ratio's denominator.
+    // 统计位于相机前方且投影在图内的可解释对应，作为 visible-only 内点比例分母。
     size_t visibleMask(uint32_t img, const std::vector<Vec3>& X, const std::vector<Vec3>& br,
                        const Pose& pose, std::vector<char>& vis) const {
         vis.assign(X.size(), 1);
@@ -5083,15 +4032,12 @@ private:
         const Camera& cam = camOf(img);
         const double w = cam.width > 0 ? (double)cam.width : 1e9;
         const double h = cam.height > 0 ? (double)cam.height : 1e9;
-        // A margin, because a point just outside the frame would have been seen
-        // by a pose a pixel away and the gate must not turn on that.
+        // 图像边界留余量，避免一像素级位姿差改变刚出界点的门限判定。
         const double mx = 0.05 * w, my = 0.05 * h;
         size_t n = 0;
         for (size_t k = 0; k < X.size(); k++) {
             const Vec3 pc = mul(pose.R, X[k]) + pose.t;
-            // Cheirality as the rest of the mapper does it (D33): a pinhole
-            // tests z, a camera that sees past 90 deg tests the sign along the
-            // ray the keypoint was measured on.
+            // 针孔按 z，宽角按关键点实际射线方向判断正深度，与其他建图路径一致（D33）。
             if (cam.wideFov()) {
                 if (k < br.size() && pc.dot(br[k]) <= 0) continue;
             } else if (pc.z < 1e-8) {
@@ -5105,10 +4051,7 @@ private:
         return n;
     }
 
-    // Is a consensus that failed the ratio gate both large enough to stand
-    // without it and the only one on offer? See strong_pnp_max_rival: the rival
-    // is searched for among the correspondences this pose rejected, which is
-    // where the other place's would be.
+    // 比例未通过时检查绝对支持是否充分且无竞争位姿；在最佳解拒绝的对应中搜索其他位置。
     bool strongUnambiguous(uint32_t img, const std::vector<Vec3>& X,
                            const std::vector<Vec3>& br, const PnPResult& r) {
         if (opt_.strong_pnp_inliers <= 0 || r.num_inliers < opt_.strong_pnp_inliers) return false;
@@ -5119,13 +4062,11 @@ private:
         for (size_t k = 0; k < X.size(); k++)
             if (!r.inlier_mask[k]) { X2.push_back(X[k]); b2.push_back(br[k]); }
         const int need = (int)std::ceil(opt_.strong_pnp_max_rival * (double)r.num_inliers);
-        if ((int)X2.size() < need) return true;  // not enough left to host a rival
+        if ((int)X2.size() < need) return true;  // 剩余对应不足以形成竞争解
         PnPResult alt = ransacPnP(X2, b2, camOf(img).focal(), errPx(img), 0,
                                   opt_.audit_ransac_trials);
         if (!alt.success || alt.num_inliers < need) return true;
-        // A rival that is the *same* pose is the inlier threshold speaking, not
-        // a second place. Scale-free: the centres are compared against how far
-        // the winning pose stands from what it sees.
+        // 竞争解若与原位姿相同，仅表示内点阈值差异，不算另一位置；中心差按相机到可见结构距离归一化。
         Mat3 D = mul(alt.pose.R, transpose(r.pose.R));
         const double tr = std::max(-1.0, std::min(1.0, (D[0] + D[4] + D[8] - 1) * 0.5));
         if (std::acos(tr) * 180.0 / M_PI > opt_.audit_min_rotation_deg) {
@@ -5146,57 +4087,47 @@ private:
 
     struct RegFail {
         uint32_t few_corr = 0, few_inliers = 0, low_ratio = 0, refined_out = 0;
-        uint32_t strong = 0;     // admitted on absolute support with the ratio failed (D69)
-        uint32_t ambiguous = 0;  // ... refused instead because a rival pose fit the leftovers
-        uint32_t occluded = 0;   // correspondences the accepted pose could not see at all
+        uint32_t strong = 0;     // 比例失败但按绝对支持接纳的次数（D69）
+        uint32_t ambiguous = 0;  // 因剩余对应存在竞争位姿而拒绝的次数
+        uint32_t occluded = 0;   // 接受位姿完全不可见的候选对应数
     } reg_fail_;
-    const RigTable* rigs_ = nullptr;  // null = no rigs, or --no-use-rigs
-    const SequenceTable* seq_ = nullptr;  // null = no sequences
-    PriorSource* priors_ = nullptr;   // null = no sensor priors, or --no-sensor-map
+    const RigTable* rigs_ = nullptr;  // 空值表示没有 rig 或已禁用
+    const SequenceTable* seq_ = nullptr;  // 空值表示没有序列
+    PriorSource* priors_ = nullptr;   // 空值表示无传感器先验或禁用 sensor-map
     PriorStats prior_stats_;
-    // Counted from const passes that fan out over threads (the audit, the
-    // seed prefetch).
+    // 审查和种子预取等 const 并行阶段的原子统计。
     mutable std::atomic<uint32_t> prior_vouched_{0}, prior_seeds_{0};
-    // SS_SFM_PRIOR_DUMP=1 prints every registration the gyro overruled.
+    // SS_SFM_PRIOR_DUMP=1 输出每次被陀螺推翻的配准。
     const bool prior_dump_ = spirula::env("SFM_PRIOR_DUMP") != nullptr;
-    std::vector<std::vector<uint16_t>> near_support_;  // support_ over sequence neighbours only
-    std::vector<int> near_score_;                      // per image, features with near support
-    uint32_t reg_vouched_ = 0;   // registrations the neighbours carried past the pool's ratio
-    uint32_t reg_near_won_ = 0;  // ... where the neighbours' pose beat the whole pool's
-    int seed_phase_ = 0;         // 0: seed among neighbour pairs, 1: among every pair
-    uint32_t reg_by_rig_ = 0;         // registrations the rig placed, summed over the run
-    uint32_t reg_rig_word_ = 0;       // ... of them with no inlier of their own
-    uint32_t frame_regs_ = 0;         // rig-mates placed beside the candidate
-    uint32_t rig_refined_at_ = 0;     // model size at the last extrinsic refinement
+    std::vector<std::vector<uint16_t>> near_support_;  // 仅包含序列邻居的 support_
+    std::vector<int> near_score_;                      // 逐图像具有邻居支持的特征数
+    uint32_t reg_vouched_ = 0;   // 依靠邻居支持越过全池比例门限的配准数
+    uint32_t reg_near_won_ = 0;  // 其中邻居位姿胜过全池位姿的数量
+    int seed_phase_ = 0;         // 0 仅从邻居对播种，1 使用全部候选
+    uint32_t reg_by_rig_ = 0;         // 整次运行由 rig 放置的图像数
+    uint32_t reg_rig_word_ = 0;       // 其中自身没有内点的图像数
+    uint32_t frame_regs_ = 0;         // 随候选共同放置的 rig 伙伴数
+    uint32_t rig_refined_at_ = 0;     // 上次外参精化时的模型规模
 
-    // A refined member costs every one of its observations six more columns,
-    // so growth refines hold the extrinsics and let them move only each time
-    // the model has doubled; a tight pass refines them in its first round.
+    // 每个可优化成员为各观测增加六列，因此增长期仅在模型规模翻倍时释放外参；严格精化首轮则允许优化。
     bool rigRefineDue(bool tight) {
         const uint32_t n = rec_.numRegistered();
         if (!tight && n < 2 * rig_refined_at_) return false;
         rig_refined_at_ = n;
         return true;
     }
-    std::vector<uint8_t> allow_;      // restrictTo(); empty = every image
-    size_t allow_count_ = 0;          // ... and how many are set
+    std::vector<uint8_t> allow_;      // restrictTo 的限制集合，空值为全部图像
+    size_t allow_count_ = 0;          // 限制集合中选中的图像数
     std::vector<uint32_t> model_count_;
-    std::vector<uint8_t> seeded_;     // blockSeeds(); images an attempt reached
-    // Seed candidates for the current restriction, most inliers first; with
-    // sequences, the neighbour pairs and then every other pair (D79).
+    std::vector<uint8_t> seeded_;     // 种子尝试已到达的图像
+    // 当前限制内候选按内点数排序，有序列时先邻居对再其他对。
     std::vector<const TwoViewMatches*> seed_cand_, seed_cand_far_;
     bool seed_cand_valid_ = false;
-    // Persistent BA context (D38): device + pipelines survive across the
-    // mapper's many global BAs; each solve only creates/frees its own
-    // problem-sized buffers. Uninitialized until the first BA initializes it.
-    // One per scalar configuration in use: a context holds the shader module it
-    // was built from, and that module is compiled for one Real. So a coarse
-    // solve in float and a tight one in double cannot share a context -- ba_ctx_[1]
-    // exists only when the two differ, and a caller-supplied context serves
-    // every solve when they do not (which is the atom workers' case).
+    // 持久 BA 上下文复用设备与流水线，每次求解仅分配问题缓冲。
+    // 每种标量配置独立上下文，float 与 double 模块不能混用；两阶段配置相同时可共用调用方上下文（D38）。
     VkContext ba_ctx_[2];
-    VkContext* ext_ba_ctx_ = nullptr;  // useBaContext(); null = ba_ctx_ above
-    bool ba_over_budget_throws_ = false;  // refineIfItFits() only
+    VkContext* ext_ba_ctx_ = nullptr;  // 外部上下文，空值使用内部 ba_ctx_
+    bool ba_over_budget_throws_ = false;  // 仅 refineIfItFits 使用
     RealCfg baReal(bool coarse) const {
         return realCfgFromName(coarse ? opt_.ba_real_coarse : opt_.ba_real);
     }
@@ -5205,7 +4136,7 @@ private:
         if (ext_ba_ctx_ && !second) return *ext_ba_ctx_;
         return ba_ctx_[second];
     }
-    std::vector<uint32_t> recent_regs_;  // registered since the last refinement
+    std::vector<uint32_t> recent_regs_;  // 上次精化后新增的配准图像
 };
 
-}  // namespace sfm
+}  // 命名空间 sfm

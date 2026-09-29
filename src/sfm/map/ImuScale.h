@@ -1,8 +1,5 @@
-// Metric scale from the accelerometer: the velocity-free constraint over two
-// consecutive pre-integrated intervals (Mur-Artal and Tardos 2017, sec. IV),
-// s L = Q + g Gs, linear in the scale, the biases and gravity. Shared by the
-// gauge fit that runs on a finished model (SensorGauge.h) and the priors a
-// bundle adjustment takes while the model is built (SensorPriors.h).
+// 由加速度计恢复公制尺度：相邻两个预积分区间的无速度约束 s L = Q + g Gs，对尺度、偏置和重力均为线性（Mur-Artal 与 Tardos，2017，第 IV 节）。
+// SensorGauge.h 在完整模型上拟合规范，SensorPriors.h 在建图期间提供 BA 先验，两者共用此实现。
 #pragma once
 
 #include <algorithm>
@@ -14,20 +11,20 @@
 
 namespace sfm {
 
-// Consecutive frames j < k of one group, with the IMU integrated between them.
+// 同组的连续帧 j < k，以及两帧之间的 IMU 预积分。
 struct ImuPair {
-    int j = 0, k = 0;    // frame indices
+    int j = 0, k = 0;    // 帧索引
     Preintegration P;
-    Mat3 B;              // attitude-only captures: R_i(j) <- i(k)
+    Mat3 B;              // 仅姿态数据：R_i(j) <- i(k)
     bool has_preint = false;
 };
 
 struct ImuTriple {
     int j = 0, k = 0, l = 0;
-    int p1 = 0, p2 = 0;   // pair indices
+    int p1 = 0, p2 = 0;   // 帧对索引
 };
 
-// s * L = Q + Gs * g_w in the model frame; `Ja`, `Jg` are d Q / d bias.
+// 模型坐标系中 s * L = Q + Gs * g_w；Ja、Jg 为 d Q / d bias。
 struct ImuTripleTerms {
     Vec3 L;
     double Gs = 0;
@@ -35,7 +32,7 @@ struct ImuTripleTerms {
     Mat3 Ja, Jg;
 };
 
-// Two pre-integrated pairs sharing a frame make one triple.
+// 共享一帧的两个预积分帧对构成三帧组。
 inline std::vector<ImuTriple> imuTriples(const std::vector<ImuPair>& pairs) {
     std::vector<ImuTriple> tr;
     for (size_t p = 1; p < pairs.size(); p++) {
@@ -46,8 +43,7 @@ inline std::vector<ImuTriple> imuTriples(const std::vector<ImuPair>& pairs) {
     return tr;
 }
 
-// `X` is camera <- IMU; `lever` where the IMU sits from the lens (camera
-// frame, metres).
+// X 表示相机 <- IMU；lever 是从镜头到 IMU 的位移，使用相机坐标系，单位为米。
 inline ImuTripleTerms imuTripleTerms(const std::vector<SensorFrame>& frames,
                                      const std::vector<ImuPair>& pairs, const ImuTriple& t,
                                      const Mat3& X, const Vec3& bg, const Vec3& ba,
@@ -74,14 +70,13 @@ inline ImuTripleTerms imuTripleTerms(const std::vector<SensorFrame>& frames,
     return T;
 }
 
-// Variance of one component of a triple's pre-integrated position for white
-// accelerometer noise of density q: (q^2/3) d1^2 d2^2 (d1 + d2).
+// 加速度计白噪声密度为 q 时，三帧组预积分位置单分量的方差为 (q^2/3) d1^2 d2^2 (d1 + d2)。
 inline double imuTripleNoise(double q, const std::vector<ImuPair>& pairs, const ImuTriple& t) {
     const double d1 = pairs[(size_t)t.p1].P.dt, d2 = pairs[(size_t)t.p2].P.dt;
     return q * q * d1 * d1 * d2 * d2 * (d1 + d2) / 3.0;
 }
 
-// x = pseudo-inverse solve of the normal equations N x = b (n <= 16).
+// 通过伪逆求正规方程 N x = b 的解 x，n <= 16。
 inline std::vector<double> solveNormalPinv(std::vector<double> N, const std::vector<double>& b,
                                            int n) {
     std::vector<double> ev, V, x((size_t)n, 0.0);
@@ -97,8 +92,7 @@ inline std::vector<double> solveNormalPinv(std::vector<double> N, const std::vec
     return x;
 }
 
-// One lens's share of a scale fit: its frames, pairs and triples, its
-// extrinsic and its accelerometer's noise density.
+// 单镜头参与尺度拟合所需的帧、帧对、三帧组、外参与加速度计噪声密度。
 struct ImuGroupView {
     const std::vector<SensorFrame>* frames = nullptr;
     const std::vector<ImuPair>* pairs = nullptr;
@@ -108,26 +102,24 @@ struct ImuGroupView {
 };
 
 struct ImuScaleFit {
-    double s = 0, sigma = 0;   // metres per model unit; sigma absolute
+    double s = 0, sigma = 0;   // 米/模型单位；sigma 为绝对不确定度
     int triples = 0, inliers = 0;
     Vec3 ba, bg;
-    double g_norm = 0, g_angle_deg = 0;   // gravity refitted free, as the check
-    double res_scale = 0;                 // robust residual scale, model units
-    std::vector<double> residual;         // per triple over the groups, model units
+    double g_norm = 0, g_angle_deg = 0;   // 自由重拟合重力，作为检查
+    double res_scale = 0;                 // 稳健残差尺度，单位为模型单位
+    std::vector<double> residual;         // 跨组的逐三帧组残差，单位为模型单位
 };
 
-// Solved for the INVERSE scale with the centres as the response: noise in a
-// regressor attenuates a slope (a 360 rig's views scatter 5 cm about their
-// frame and came out 10-50% low), in the response it only widens it.
+// 以相机中心为响应变量求逆尺度，避免自变量噪声导致斜率衰减；360 装置的视图中心偏离帧中心约 5 cm 时曾低估 10–50%，响应变量噪声只增大方差。
 inline ImuScaleFit solveImuScale(const std::vector<ImuGroupView>& groups, const Vec3& up_w) {
     ImuScaleFit fit;
-    std::vector<std::pair<size_t, size_t>> ids;   // (group, triple)
+    std::vector<std::pair<size_t, size_t>> ids;   // （分组，三帧组）
     for (size_t g = 0; g < groups.size(); g++)
         for (size_t i = 0; i < groups[g].triples->size(); i++) ids.push_back({g, i});
     fit.triples = (int)ids.size();
     if (ids.size() < 5) return fit;
 
-    // Gyro bias from the rotation pairs alone.
+    // 仅用旋转对估计陀螺偏置。
     Vec3 bg{0, 0, 0};
     {
         std::vector<double> N(9, 0.0), rhs(3, 0.0);
@@ -159,7 +151,7 @@ inline ImuScaleFit solveImuScale(const std::vector<ImuGroupView>& groups, const 
     };
     std::vector<double> w(ids.size(), 1.0);
     double k = 1.0, var_k = 0;
-    Vec3 bak{0, 0, 0};   // accel bias times k
+    Vec3 bak{0, 0, 0};   // 加速度计偏置乘以 k
     auto solve = [&](bool with_g, Vec3& g_out) {
         const int n = with_g ? 7 : 4;
         std::vector<double> N((size_t)n * n, 0.0), rhs((size_t)n, 0.0);
@@ -183,11 +175,9 @@ inline ImuScaleFit solveImuScale(const std::vector<ImuGroupView>& groups, const 
             const ImuGroupView& gv = groups[ids[i].first];
             noise_n00 += w[i] * 3.0 * imuTripleNoise(gv.noise, *gv.pairs, (*gv.triples)[ids[i].second]);
         }
-        // The pre-integrated regressor carries the accelerometer's own noise,
-        // which attenuates k -- 10% on the DJI's 30 Hz stream over 1 s pairs.
-        // Corrected least squares takes that variance back out.
+        // 预积分自变量中的加速度计噪声会衰减 k；DJI 30 Hz 数据按 1 s 帧对积分时可达 10%。修正最小二乘需扣除此方差。
         N[0] = std::max(N[0] - noise_n00, 0.5 * N[0]);
-        const double prior = 0.2 * std::max(k, 0.05);   // 0.2 m/s^2 on the bias itself
+        const double prior = 0.2 * std::max(k, 0.05);   // 偏置自身的先验标准差为 0.2 m/s^2
         for (int c = 0; c < 3; c++) {
             double row[7] = {0, 0, 0, 0, 0, 0, 0};
             row[1 + c] = 1;
@@ -231,7 +221,7 @@ inline ImuScaleFit solveImuScale(const std::vector<ImuGroupView>& groups, const 
     fit.sigma = std::sqrt(var_k * var_r) / (k * k);
     fit.ba = bak * (1.0 / k);
     fit.bg = bg;
-    // Gravity check: the same solve with the gravity vector free.
+    // 放开重力向量重新求解，用于检查重力。
     Vec3 gk;
     const double k_fixed = k;
     const Vec3 bak_fixed = bak;
@@ -244,4 +234,4 @@ inline ImuScaleFit solveImuScale(const std::vector<ImuGroupView>& groups, const 
     return fit;
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

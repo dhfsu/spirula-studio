@@ -1,4 +1,4 @@
-// Log.cpp -- see Log.h.
+// 日志实现，参见 Log.h。
 
 #include "sfm/core/Log.h"
 
@@ -33,7 +33,7 @@ const spirula::i18n::Msg& tag_msg(Tag t) {
 
 constexpr int kNumTags = 7;
 
-// The padded prefixes for one language, built once.
+// 每种语言仅构建一次补齐宽度的标签前缀。
 struct TagTable {
     spirula::i18n::Lang lang{};
     bool valid = false;
@@ -64,9 +64,7 @@ const TagTable& table() {
 }
 
 Sink g_sink;
-// Serializes whole lines. Separate from g_mu, which guards the tag table and
-// the sink pointer: holding that across a sink would deadlock the moment the
-// sink asked for prefix(), which is exactly what a front end does.
+// 逐行输出锁独立于保护标签表和接收端指针的 g_mu；接收端可能调用 prefix，持有 g_mu 回调会死锁。
 std::mutex g_out_mu;
 
 void print(const std::string& pfx, Level lv, const std::string& text) {
@@ -80,8 +78,7 @@ void print(const std::string& pfx, Level lv, const std::string& text) {
         std::fprintf(f, "%s%s%s%s\n", pfx.c_str(), word ? word : "",
                      word ? " " : "", text.c_str());
     }
-    // Unbuffered enough to interleave correctly with the other stream when a
-    // parent process is reading both: the GUI shows one terminal, not two.
+    // 及时刷新以保持 stdout/stderr 在父进程合并终端中的正确顺序。
     std::fflush(f);
 }
 
@@ -98,7 +95,7 @@ void emit(Tag t, Level lv, const std::string& text) {
     else print(pfx, lv, text);
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 
 int display_width(const char* s) { return spirula::i18n::display_width(s); }
@@ -158,5 +155,5 @@ void diag(Tag t, const char* fmt, ...) {
     emit(t, Level::Diag, text);
 }
 
-}  // namespace slog
-}  // namespace sfm
+}  // 命名空间 slog
+}  // 命名空间 sfm

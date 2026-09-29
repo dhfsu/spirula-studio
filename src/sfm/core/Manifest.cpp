@@ -1,4 +1,4 @@
-// Manifest.cpp -- see Manifest.h.
+// 数据清单实现，参见 Manifest.h。
 
 #include "sfm/core/Manifest.h"
 
@@ -30,15 +30,14 @@ std::string str_of(const JsonValue& v, const std::string& path, const char* key)
     return v.str;
 }
 
-// Relative to the manifest, so a capture and the file describing it move
-// together; absolute paths are left alone.
+// 相对路径以清单目录为基准，使清单与采集可共同移动；绝对路径保留。
 std::string resolve(const std::string& p, const fs::path& base) {
     if (p.empty()) return p;
     const fs::path f(p);
     return f.is_absolute() ? p : (base / f).lexically_normal().string();
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 Manifest manifest_read(const std::string& path) {
     JsonValue root;
@@ -338,8 +337,7 @@ std::string manifest_apply(const Manifest& m, SfmConfig& cfg,
         cfg.image_is_linear = m.image_linear != 0;
 
     for (const ManifestCamera& c : m.cameras) {
-        // The dataset-wide entry is the same thing --camera-model sets, so it
-        // goes to the same field rather than becoming an override of everything.
+        // 全局相机模型写入与 --camera-model 相同的默认字段，不创建覆盖全部图像的覆盖项。
         if (c.prefix.empty()) {
             if (!c.model.empty() && !seen.count("camera-model")) cfg.camera_model = c.model;
             if (c.focal > 0 && !seen.count("focal")) cfg.focal = c.focal;
@@ -364,9 +362,7 @@ std::string manifest_apply(const Manifest& m, SfmConfig& cfg,
             o.has_extra = true;
             o.extra = c.distortion;
         }
-        // Among equal-length prefixes the earliest entry wins
-        // (cameraOverrideFor), and the command line's were pushed while argv
-        // was parsed -- so appending here is what lets a flag beat the file.
+        // 同长度前缀以先出现者为准；命令行项已加入，因此将清单项追加到末尾，保证命令行优先。
         cfg.camera.overrides.push_back(o);
     }
     for (const ManifestCapture& c : m.captures)
@@ -376,4 +372,4 @@ std::string manifest_apply(const Manifest& m, SfmConfig& cfg,
     return {};
 }
 
-}  // namespace sfm
+}  // 命名空间 sfm

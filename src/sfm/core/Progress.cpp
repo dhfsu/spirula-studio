@@ -1,4 +1,4 @@
-// Progress.cpp -- see Progress.h.
+// 进度快照实现，参见 Progress.h。
 
 #include "sfm/core/Progress.h"
 
@@ -27,28 +27,20 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// Long enough that a fast mapper does not spend its time serializing, short
-// enough that a screen looks live. Registration on a small capture is
-// milliseconds apart, so without this the file would be rewritten thousands of
-// times a second.
+// 按时间限制快照频率，兼顾实时预览与序列化成本，避免快速配准时每秒改写数千次。
 constexpr double kInterval = 1.5;
 
-// A capture with 700k verified pairs would append 1.4 GB here, beside the
-// matches.bin that is the actual output. Past this the file simply stops
-// growing: a reader already treats what is not there as a pair it cannot draw.
+// 70 万验证对可能额外产生 1.4 GB 实时匹配文件；达到上限后停止增长，读取方将缺失内容视为无法预览。
 constexpr uint64_t kLiveCap = 256ull << 20;
 
-// A thumbnail on its way to disk: already downscaled, so a queued one is
-// ~1 MB rather than the working copy it came from.
+// 排队写入的缩略图已缩小，单项约 1 MB，避免持有完整工作图。
 struct ThumbJob {
     fs::path dst;
     std::vector<uint8_t> rgb;
     int w = 0, h = 0;
 };
 
-// A JPEG per image cost a sixth of the extraction stage on the consumer
-// thread, which is the one the GPU runs on. The bounded queue drops its oldest
-// rather than stall it: without a thumbnail a reel decodes the source frame.
+// 在 GPU 消费线程编码 JPEG 曾占提取阶段六分之一；有界写入队列满时丢最旧预览而不阻塞，查看器可回退解码原图。
 class ThumbWriter {
 public:
     ~ThumbWriter() { stop(); }
@@ -65,7 +57,7 @@ public:
         cv_.notify_one();
     }
 
-    // Everything pushed so far is on disk when this returns.
+    // 返回时此前提交的缩略图全部写入磁盘。
     void drain() {
         std::unique_lock<std::mutex> lk(mu_);
         if (!worker_.joinable()) return;
@@ -88,14 +80,14 @@ private:
     static constexpr size_t kQueue = 8;
 
     void run() {
-        fs::path made;   // last directory created, which every stem but the
-        std::error_code ec;   // first of a folder shares
+        fs::path made;   // 最近创建的目录
+        std::error_code ec;   // 同一文件夹内后续文件共用该目录
         for (;;) {
             ThumbJob j;
             {
                 std::unique_lock<std::mutex> lk(mu_);
                 cv_.wait(lk, [this] { return quit_ || !q_.empty(); });
-                if (q_.empty()) return;   // quit_, with nothing left
+                if (q_.empty()) return;   // 已请求退出且队列为空
                 j = std::move(q_.front());
                 q_.pop_front();
                 busy_ = true;
@@ -131,13 +123,12 @@ struct State {
     Clock::time_point pairs_at{};
     bool model_started = false, pairs_started = false;
 
-    // The pair matrix, binned down to kMatrixBins per side.
+    // 图像对矩阵每边聚合为 kMatrixBins 个桶。
     uint32_t n_images = 0, bins = 0;
     std::vector<uint32_t> counts, planned, verified;
     bool pairs_dirty = false;
 
-    // Appended by the verification workers, so it carries its own lock and
-    // stays open for the stage rather than reopening per pair.
+    // 验证线程并发追加，因此使用独立锁，整个阶段保持文件打开。
     std::mutex live_mu;
     std::ofstream live;
     Clock::time_point live_at{};
@@ -148,7 +139,7 @@ struct State {
 
     Clock::time_point status_at{};
     bool status_started = false;
-    Event last;                  // what the next unforced write would say
+    Event last;                  // 下一次非强制写入将记录的状态
 
     ThumbWriter thumbs;
 };
@@ -158,8 +149,7 @@ State& state() {
     return s;
 }
 
-// Whole file, then rename: a reader polling the directory either sees the
-// previous snapshot or this one, never a prefix of one.
+// 先完整写文件再重命名，轮询读取者只能看到旧快照或完整新快照。
 void write_atomic(const std::string& name, const std::string& bytes) {
     State& s = state();
     const fs::path dst = fs::path(s.dir) / name;
@@ -184,7 +174,7 @@ void put_f32(std::string& b, float v) { put(b, &v, 4); }
 void put_i64(std::string& b, int64_t v) { put(b, &v, 8); }
 void put_f64(std::string& b, double v) { put(b, &v, 8); }
 
-// True when `last` is far enough behind now, and stamps it if so.
+// 距 last 达到间隔时返回 true 并更新时间。
 bool due(Clock::time_point& last, bool& started) {
     const auto now = Clock::now();
     if (started &&
@@ -211,7 +201,7 @@ void write_pairs_locked() {
     s.pairs_dirty = false;
 }
 
-// Which cell of the matrix a pair of images falls in.
+// 图像对对应的矩阵单元。
 size_t cell_of(const State& s, uint32_t image1, uint32_t image2, size_t& mirror) {
     const uint32_t a = (uint32_t)((uint64_t)image1 * s.bins / s.n_images);
     const uint32_t b = (uint32_t)((uint64_t)image2 * s.bins / s.n_images);
@@ -219,15 +209,14 @@ size_t cell_of(const State& s, uint32_t image1, uint32_t image2, size_t& mirror)
     return (size_t)a * s.bins + b;
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 void set_dir(const std::string& dir) {
     State& s = state();
-    // Before the directory moves: what is queued was addressed to the old one.
+    // 改变目录前清空队列，已有任务仍指向旧目录。
     s.thumbs.stop();
     {
-        // Closed here, not left to the process: a second run in the same
-        // process must not append to the first one's file.
+        // 立即关闭旧文件，避免同进程下一任务继续追加到前一任务。
         std::lock_guard<std::mutex> live(s.live_mu);
         s.live.close();
         s.live.clear();
@@ -252,7 +241,7 @@ void model(const Reconstruction& rec, bool force, const PointColor& color) {
     if (s.dir.empty()) return;
     if (!due(s.model_at, s.model_started) && !force) return;
 
-    // Registered images only: an unregistered one has no pose to draw.
+    // 只输出已配准图像，未配准图像没有可绘制位姿。
     std::vector<const Image*> imgs;
     for (const auto& kv : rec.images)
         if (kv.second.registered) imgs.push_back(&kv.second);
@@ -270,25 +259,20 @@ void model(const Reconstruction& rec, bool force, const PointColor& color) {
     put_u64(b, n_pts);
     for (const Image* im : imgs) {
         put_u32(b, im->id);
-        // COLMAP world->camera (R, t) to nerfstudio/OpenGL camera->world:
-        // R^T with columns 1 and 2 negated, translation -R^T t. Same
-        // conversion ColmapParser does, done here so the reader needs none.
-        const Mat3& R = im->pose.R;      // row-major, world -> camera
+        // COLMAP 世界到相机转为 OpenGL 相机到世界：R^T 的第 1、2 列取负，平移为 -R^T t，供读取方直接绘制。
+        const Mat3& R = im->pose.R;      // 行主序，世界 -> 相机
         const Vec3& t = im->pose.t;
         const double C[3] = {
             -(R[0] * t.x + R[3] * t.y + R[6] * t.z),
             -(R[1] * t.x + R[4] * t.y + R[7] * t.z),
             -(R[2] * t.x + R[5] * t.y + R[8] * t.z)};
         for (int r = 0; r < 3; r++) {
-            put_f32(b, (float)R[r]);            // R^T row r, column 0
-            put_f32(b, (float)-R[3 + r]);       // ... column 1, negated
-            put_f32(b, (float)-R[6 + r]);       // ... column 2, negated
+            put_f32(b, (float)R[r]);            // R^T 的第 r 行、第 0 列
+            put_f32(b, (float)-R[3 + r]);       // 第 1 列取负
+            put_f32(b, (float)-R[6 + r]);       // 第 2 列取负
             put_f32(b, (float)C[r]);
         }
-        // The camera as cameras.bin would hold it: a COLMAP model id and its
-        // parameters. The reader hands them to the dataset parser's own
-        // mapping rather than keeping a second copy of it, which is what makes
-        // a fisheye frustum draw as a fisheye.
+        // 按 cameras.bin 形式携带 COLMAP 模型 ID 与参数，读取方复用相机解析映射，使鱼眼视锥保持正确形状。
         const auto cam = rec.cameras.find(im->camera_id);
         const Camera c = cam == rec.cameras.end() ? Camera{} : cam->second;
         put_u32(b, (uint32_t)c.width);
@@ -301,7 +285,7 @@ void model(const Reconstruction& rec, bool force, const PointColor& color) {
         for (uint32_t k = 0; k < np; k++) put(b, &ps[k], 8);
     }
 
-    // Count first, so the reader can size its buffers before the loop.
+    // 先写数量，便于读取方预分配缓冲。
     uint32_t written = 0;
     for (uint64_t i = 0; i < n_pts; i += stride) written++;
     put_u32(b, written);
@@ -369,11 +353,9 @@ void status(const Event& e) {
     std::lock_guard<std::mutex> lk(s.mu);
     if (s.dir.empty()) return;
     using K = Event::Kind;
-    // Nothing here is keyed on a pair, and matching emits one per pair from
-    // its workers: taking the lock for it would serialize the stage on this.
+    // 此处状态不依赖图像对，忽略逐对事件以免验证线程争锁而串行化。
     if (e.kind == K::PairVerified) return;
-    // A stage boundary and the verdict are the two things a screen must not
-    // miss; a fraction can wait for the clock.
+    // 阶段切换与最终结果必须立即写出，普通进度可等待限流间隔。
     const bool force = e.kind == K::StageBegin || e.kind == K::StageEnd ||
                        e.kind == K::Result;
     if (e.kind == K::Progress || e.kind == K::ImageExtracted) {
@@ -381,8 +363,7 @@ void status(const Event& e) {
         s.last.done = e.done;
         s.last.total = e.total;
     } else if (e.kind == K::ModelUpdated) {
-        // Model size, not the bar: mapping's fraction comes from
-        // events::map_placed, because this count falls back on a seed retry.
+        // 这里是当前模型大小，阶段进度由 map_placed 统计，避免种子重试时回退。
         s.last.stage = e.stage;
         s.last.registered = e.registered;
         s.last.images = e.images;
@@ -449,9 +430,7 @@ void live_matches_begin(const std::vector<std::string>& names,
     s.live.flush();
 }
 
-// Packed before the lock and written once: this is the verification workers'
-// inner loop, and a stream write per index queued them behind each other.
-// Flushed on a clock -- a reader already has to stop at a torn tail.
+// 锁外打包并一次写入，避免验证线程逐索引流写入而排队；按时间刷新，读取方允许尚未写完的尾部。
 void live_pair(uint32_t a, uint32_t b, int32_t config,
                const uint32_t* idx1, const uint32_t* idx2, size_t stride,
                uint32_t count) {
@@ -473,9 +452,7 @@ void live_pair(uint32_t a, uint32_t b, int32_t config,
     if (due(s.live_at, s.live_started)) s.live.flush();
 }
 
-// Box-filtered, which is enough for a preview and avoids pulling a resampler
-// in. The downscale happens here because it reads the caller's buffer, which
-// is gone by the time the writer runs; everything after it is the writer's.
+// 预览使用区域均值缩小；在调用方缓冲仍有效时完成缩放，随后数据由写入线程独占。
 void thumbnail(const std::string& rel_stem, const uint8_t* rgb, int w, int h) {
     State& s = state();
     std::string dir;
@@ -526,5 +503,5 @@ void flush() {
     write_pairs_locked();
 }
 
-}  // namespace progress
-}  // namespace sfm
+}  // 命名空间 progress
+}  // 命名空间 sfm

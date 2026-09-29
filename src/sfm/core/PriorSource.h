@@ -1,10 +1,5 @@
-// What a sensor tells the reconstruction about its images, behind one seam:
-// a relative rotation between two images, which images were taken next to
-// each other, a position in a metric frame, and the factors a bundle
-// adjustment may add for a set of posed images. The mapper and the verifier
-// see only this; the video's IMU and GPS implement it (map/SensorPriors.h),
-// and a LiDAR or wheel odometry would implement it the same way.
-// docs/notes/sensor-priors.md.
+// 传感器先验统一接口，提供图像间相对旋转、邻接关系、公制位置及给定模型位姿下的 BA 因子。
+// 建图与验证仅依赖此接口，IMU/GPS 由 SensorPriors 实现，也可接入其他里程计。
 #pragma once
 
 #include <cstdint>
@@ -16,8 +11,7 @@
 
 namespace sfm {
 
-// One registered image as a source sees it: its id, its camera group and its
-// pose (world -> camera) in the model's own gauge.
+// 先验源所见的已配准图像：ID、相机组及模型坐标中的世界到相机位姿。
 struct PosedImage {
     uint32_t image = 0;
     uint32_t camera = 0;
@@ -27,19 +21,15 @@ struct PosedImage {
 class PriorSource {
 public:
     virtual ~PriorSource() = default;
-    // Whether the source has anything at all to say about an image.
+    // 判断来源是否能为图像提供任何信息。
     virtual bool has(uint32_t img) const = 0;
-    // R_j <- R_i between two images' camera frames (world -> camera
-    // rotations: R_j ~ R_ji R_i), with its 1-sigma in radians.
+    // 相机间相对旋转 R_j ~ R_ji R_i，并提供以弧度表示的 1-sigma 不确定度。
     virtual bool relativeRotation(uint32_t i, uint32_t j, Mat3& R_ji, double& sigma) const = 0;
-    // Images the source relates to `img` directly, nearest first.
+    // 与 img 直接相关的图像，最近者优先。
     virtual std::vector<uint32_t> neighbours(uint32_t img) const = 0;
-    // Everything the source can state about these images, in their own
-    // gauge: the source fits whatever it needs for that (an up axis, a scale,
-    // a metric frame) from the poses it is handed. Image ids as given.
+    // 在图像当前坐标规范中生成约束，按给定位姿拟合所需向上轴、尺度或公制坐标，保持输入图像 ID。
     virtual PosePriors factors(const std::vector<PosedImage>& imgs) = 0;
-    // A position in the source's metric frame (GPS in east-north-up), for
-    // pairing images by where they were taken.
+    // 来源公制坐标中的位置，GPS 使用东、北、上，供按拍摄位置配对。
     virtual bool position(uint32_t img, Vec3& p) const {
         (void)img;
         (void)p;
@@ -47,8 +37,7 @@ public:
     }
 };
 
-// A source over a database seen through a renumbering (map/Atoms.h): local
-// ids in, local ids out, the wrapped source only ever sees global ones.
+// 子数据库的先验适配：输入输出均为局部 ID，内部封装源仅使用全局 ID，供原子重建使用。
 class RemappedPriorSource : public PriorSource {
 public:
     RemappedPriorSource(PriorSource& inner, std::vector<uint32_t> to_global)
@@ -105,4 +94,4 @@ private:
     std::unordered_map<uint32_t, uint32_t> to_local_;
 };
 
-}  // namespace sfm
+}  // 命名空间 sfm
